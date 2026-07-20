@@ -10,18 +10,34 @@ use std::{
 use serde::{Deserialize, Serialize};
 use tracing::trace;
 
-pub static DEFAULT_OUTBOUND_INTERFACE: LazyLock<
+static DEFAULT_OUTBOUND_INTERFACE: LazyLock<
     Arc<tokio::sync::RwLock<Option<OutboundInterface>>>,
 > = LazyLock::new(Default::default);
-pub static TUN_SOMARK: LazyLock<tokio::sync::RwLock<Option<u32>>> =
+static TUN_SOMARK: LazyLock<tokio::sync::RwLock<Option<u32>>> =
     LazyLock::new(Default::default);
+
+/// Return an owned snapshot of the current outbound interface.
+///
+/// Callers must not retain the global [`RwLock`] guard across network I/O. A
+/// long-lived TUN UDP session used to do exactly that, permanently blocking
+/// `init_net_config()` during a live config reload.
+pub async fn outbound_interface_snapshot() -> Option<OutboundInterface> {
+    DEFAULT_OUTBOUND_INTERFACE.read().await.clone()
+}
 
 /// Initialize network configuration
 /// globally manage default outbound interface
 /// This function should be called as early as possible
 /// so that other config initialization can use the default outbound interface
-pub async fn init_net_config(tun_somark: Option<u32>) {
-    *DEFAULT_OUTBOUND_INTERFACE.write().await = get_outbound_interface();
+pub async fn init_net_config(
+    configured: Option<&Interface>,
+    tun_somark: Option<u32>,
+) {
+    *DEFAULT_OUTBOUND_INTERFACE.write().await = match configured {
+        Some(Interface::Name(name)) => get_interface_by_name(name),
+        Some(Interface::IpAddr(ip)) => get_interface_by_ip(*ip),
+        None => get_outbound_interface(),
+    };
     *TUN_SOMARK.write().await = tun_somark;
 
     trace!(
@@ -29,6 +45,18 @@ pub async fn init_net_config(tun_somark: Option<u32>) {
         *DEFAULT_OUTBOUND_INTERFACE.read().await,
         *TUN_SOMARK.read().await
     );
+}
+
+pub async fn set_outbound_interface(name: Option<&str>) -> Result<(), String> {
+    let interface = match name.filter(|name| !name.is_empty()) {
+        Some(name) => Some(
+            get_interface_by_name(name)
+                .ok_or_else(|| format!("outbound interface `{name}` not found"))?,
+        ),
+        None => None,
+    };
+    *DEFAULT_OUTBOUND_INTERFACE.write().await = interface;
+    Ok(())
 }
 
 /// Represents a parsed outbound interface for use in runtime.
@@ -128,6 +156,14 @@ pub fn get_interface_by_name(name: &str) -> Option<OutboundInterface> {
     );
 
     Some(outbound)
+}
+
+fn get_interface_by_ip(ip: IpAddr) -> Option<OutboundInterface> {
+    network_interface::NetworkInterface::show()
+        .ok()?
+        .into_iter()
+        .find(|interface| interface.addr.iter().any(|address| address.ip() == ip))
+        .map(Into::into)
 }
 
 pub fn get_outbound_interface() -> Option<OutboundInterface> {
@@ -240,5 +276,25 @@ impl Interface {
             Interface::IpAddr(_) => None,
             Interface::Name(name) => Some(name),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DEFAULT_OUTBOUND_INTERFACE, outbound_interface_snapshot};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn outbound_snapshot_releases_the_global_read_lock() {
+        let snapshot = outbound_interface_snapshot().await;
+        let write_guard = tokio::time::timeout(
+            Duration::from_millis(100),
+            DEFAULT_OUTBOUND_INTERFACE.write(),
+        )
+        .await
+        .expect("an owned interface snapshot must not retain the read lock");
+
+        drop(write_guard);
+        drop(snapshot);
     }
 }

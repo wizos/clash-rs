@@ -18,6 +18,7 @@ pub mod resolver;
 mod rule_dispatch;
 mod runtime;
 mod server;
+mod system_dns;
 
 pub use config::{Config, EdnsClientSubnet};
 
@@ -26,9 +27,8 @@ pub use rule_dispatch::{PendingOutboundManager, PendingRouter, RuleDispatch};
 
 pub use resolver::{EnhancedResolver, SystemResolver, new as new_resolver};
 
-pub use server::DnsRunner;
-#[cfg(feature = "tun")]
-pub use server::exchange_with_resolver;
+pub use server::{DnsRunner, exchange_with_resolver};
+pub use system_dns::update_system_dns_servers;
 
 #[async_trait]
 pub trait Client: Sync + Send + Debug {
@@ -81,6 +81,8 @@ pub trait ClashResolver: Sync + Send {
 
     fn ipv6(&self) -> bool;
     fn set_ipv6(&self, enable: bool);
+
+    async fn flush_cache(&self) {}
 
     fn kind(&self) -> ResolverKind;
 }

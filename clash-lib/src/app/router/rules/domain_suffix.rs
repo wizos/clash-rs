@@ -1,7 +1,4 @@
-use crate::{
-    app::router::rules::RuleMatcher,
-    session::{Session, SocksAddr},
-};
+use crate::{app::router::rules::RuleMatcher, session::Session};
 
 #[derive(Clone)]
 pub struct DomainSuffix {
@@ -17,13 +14,11 @@ impl std::fmt::Display for DomainSuffix {
 
 impl RuleMatcher for DomainSuffix {
     fn apply(&self, sess: &Session) -> bool {
-        match &sess.destination {
-            SocksAddr::Ip(_) => false,
-            SocksAddr::Domain(domain, _) => {
-                domain.ends_with((String::from(".") + self.suffix.as_str()).as_str())
-                    || domain == &self.suffix
-            }
-        }
+        sess.rule_host().is_some_and(|domain| {
+            let domain = domain.to_ascii_lowercase();
+            let suffix = self.suffix.to_ascii_lowercase();
+            domain == suffix || domain.ends_with(&format!(".{suffix}"))
+        })
     }
 
     fn target(&self) -> &str {

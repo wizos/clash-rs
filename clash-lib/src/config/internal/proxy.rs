@@ -53,11 +53,33 @@ pub enum OutboundProxyProtocol {
     Direct(OutboundDirect),
     #[serde(rename = "reject")]
     Reject(OutboundReject),
+    #[serde(rename = "dns")]
+    Dns(OutboundDns),
+    #[serde(rename = "gost-relay")]
+    GostRelay(OutboundGostRelay),
+    #[serde(rename = "snell")]
+    Snell(OutboundSnell),
+    #[serde(rename = "trusttunnel")]
+    TrustTunnel(OutboundTrustTunnel),
+    #[cfg(feature = "masque")]
+    #[serde(rename = "masque")]
+    Masque(OutboundMasque),
+    #[cfg(feature = "mieru")]
+    #[serde(rename = "mieru")]
+    Mieru(OutboundMieru),
+    #[cfg(feature = "sudoku")]
+    #[serde(rename = "sudoku")]
+    Sudoku(OutboundSudoku),
     #[cfg(feature = "shadowsocks")]
     #[serde(rename = "ss")]
     Ss(OutboundShadowsocks),
+    #[cfg(feature = "shadowsocks")]
+    #[serde(rename = "ssr")]
+    Ssr(OutboundShadowsocksR),
     #[serde(rename = "socks5")]
     Socks5(OutboundSocks5),
+    #[serde(rename = "http")]
+    Http(OutboundHttp),
     #[serde(rename = "anytls")]
     Anytls(OutboundAnytls),
     #[serde(rename = "trojan")]
@@ -69,6 +91,9 @@ pub enum OutboundProxyProtocol {
     #[cfg(feature = "wireguard")]
     #[serde(rename = "wireguard")]
     Wireguard(OutboundWireguard),
+    #[cfg(feature = "openvpn")]
+    #[serde(rename = "openvpn")]
+    Openvpn(OutboundOpenvpn),
     #[cfg(feature = "onion")]
     #[serde(rename = "tor")]
     Tor(OutboundTor),
@@ -77,6 +102,8 @@ pub enum OutboundProxyProtocol {
     Tuic(OutboundTuic),
     #[serde(rename = "hysteria2")]
     Hysteria2(OutboundHysteria2),
+    #[serde(rename = "hysteria")]
+    Hysteria(OutboundHysteria),
     #[serde(rename = "ssh")]
     #[cfg(feature = "ssh")]
     Ssh(OutboundSsh),
@@ -93,9 +120,22 @@ impl OutboundProxyProtocol {
         match &self {
             OutboundProxyProtocol::Direct(direct) => &direct.name,
             OutboundProxyProtocol::Reject(reject) => &reject.name,
+            OutboundProxyProtocol::Dns(dns) => &dns.name,
+            OutboundProxyProtocol::GostRelay(relay) => &relay.common_opts.name,
+            OutboundProxyProtocol::Snell(snell) => &snell.common_opts.name,
+            OutboundProxyProtocol::TrustTunnel(tunnel) => &tunnel.common_opts.name,
+            #[cfg(feature = "masque")]
+            OutboundProxyProtocol::Masque(masque) => &masque.common_opts.name,
+            #[cfg(feature = "mieru")]
+            OutboundProxyProtocol::Mieru(mieru) => &mieru.name,
+            #[cfg(feature = "sudoku")]
+            OutboundProxyProtocol::Sudoku(sudoku) => &sudoku.common_opts.name,
             #[cfg(feature = "shadowsocks")]
             OutboundProxyProtocol::Ss(ss) => &ss.common_opts.name,
+            #[cfg(feature = "shadowsocks")]
+            OutboundProxyProtocol::Ssr(ssr) => &ssr.common_opts.name,
             OutboundProxyProtocol::Socks5(socks5) => &socks5.common_opts.name,
+            OutboundProxyProtocol::Http(http) => &http.common_opts.name,
             OutboundProxyProtocol::Anytls(anytls) => &anytls.common_opts.name,
             OutboundProxyProtocol::Trojan(trojan) => &trojan.common_opts.name,
             OutboundProxyProtocol::Vmess(vmess) => &vmess.common_opts.name,
@@ -104,11 +144,14 @@ impl OutboundProxyProtocol {
             OutboundProxyProtocol::Wireguard(wireguard) => {
                 &wireguard.common_opts.name
             }
+            #[cfg(feature = "openvpn")]
+            OutboundProxyProtocol::Openvpn(openvpn) => &openvpn.common_opts.name,
             #[cfg(feature = "onion")]
             OutboundProxyProtocol::Tor(tor) => &tor.name,
             #[cfg(feature = "tuic")]
             OutboundProxyProtocol::Tuic(tuic) => &tuic.common_opts.name,
             OutboundProxyProtocol::Hysteria2(hysteria2) => &hysteria2.name,
+            OutboundProxyProtocol::Hysteria(hysteria) => &hysteria.name,
             #[cfg(feature = "ssh")]
             OutboundProxyProtocol::Ssh(ssh) => &ssh.common_opts.name,
             #[cfg(feature = "shadowquic")]
@@ -140,20 +183,36 @@ impl Display for OutboundProxyProtocol {
         match self {
             #[cfg(feature = "shadowsocks")]
             OutboundProxyProtocol::Ss(_) => write!(f, "Shadowsocks"),
+            #[cfg(feature = "shadowsocks")]
+            OutboundProxyProtocol::Ssr(_) => write!(f, "ShadowsocksR"),
             OutboundProxyProtocol::Socks5(_) => write!(f, "Socks5"),
+            OutboundProxyProtocol::Http(_) => write!(f, "Http"),
             OutboundProxyProtocol::Anytls(_) => write!(f, "AnyTLS"),
             OutboundProxyProtocol::Direct(_) => write!(f, "{PROXY_DIRECT}"),
             OutboundProxyProtocol::Reject(_) => write!(f, "{PROXY_REJECT}"),
+            OutboundProxyProtocol::Dns(_) => write!(f, "Dns"),
+            OutboundProxyProtocol::GostRelay(_) => write!(f, "GostRelay"),
+            OutboundProxyProtocol::Snell(_) => write!(f, "Snell"),
+            OutboundProxyProtocol::TrustTunnel(_) => write!(f, "TrustTunnel"),
+            #[cfg(feature = "masque")]
+            OutboundProxyProtocol::Masque(_) => write!(f, "Masque"),
+            #[cfg(feature = "mieru")]
+            OutboundProxyProtocol::Mieru(_) => write!(f, "Mieru"),
+            #[cfg(feature = "sudoku")]
+            OutboundProxyProtocol::Sudoku(_) => write!(f, "Sudoku"),
             OutboundProxyProtocol::Trojan(_) => write!(f, "Trojan"),
             OutboundProxyProtocol::Vmess(_) => write!(f, "Vmess"),
             OutboundProxyProtocol::Vless(_) => write!(f, "Vless"),
             #[cfg(feature = "wireguard")]
             OutboundProxyProtocol::Wireguard(_) => write!(f, "Wireguard"),
+            #[cfg(feature = "openvpn")]
+            OutboundProxyProtocol::Openvpn(_) => write!(f, "OpenVPN"),
             #[cfg(feature = "onion")]
             OutboundProxyProtocol::Tor(_) => write!(f, "Tor"),
             #[cfg(feature = "tuic")]
             OutboundProxyProtocol::Tuic(_) => write!(f, "Tuic"),
             OutboundProxyProtocol::Hysteria2(_) => write!(f, "Hysteria2"),
+            OutboundProxyProtocol::Hysteria(_) => write!(f, "Hysteria"),
             #[cfg(feature = "ssh")]
             OutboundProxyProtocol::Ssh(_) => write!(f, "Ssh"),
             #[cfg(feature = "shadowquic")]
@@ -192,6 +251,190 @@ pub struct OutboundReject {
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
 #[serde(rename_all = "kebab-case")]
+pub struct OutboundDns {
+    pub name: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct OutboundGostRelay {
+    #[serde(flatten)]
+    pub common_opts: CommonConfigOptions,
+    #[serde(default)]
+    pub forward: bool,
+    #[serde(default)]
+    pub udp: bool,
+    #[serde(default)]
+    pub tls: bool,
+    #[serde(default)]
+    pub mux: bool,
+    pub sni: Option<String>,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    #[serde(default)]
+    pub skip_cert_verify: bool,
+    pub fingerprint: Option<String>,
+    pub certificate: Option<String>,
+    pub private_key: Option<String>,
+    pub client_fingerprint: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct OutboundSnell {
+    #[serde(flatten)]
+    pub common_opts: CommonConfigOptions,
+    pub psk: String,
+    #[serde(default)]
+    pub udp: bool,
+    #[serde(default)]
+    pub version: u8,
+    #[serde(default)]
+    pub reuse: bool,
+    pub obfs_opts: Option<OutboundSnellObfsOpts>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct OutboundSnellObfsOpts {
+    #[serde(default)]
+    pub mode: String,
+    pub host: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub struct EchOptions {
+    #[serde(default)]
+    pub enable: bool,
+    pub config: Option<String>,
+    pub query_server_name: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct OutboundTrustTunnel {
+    #[serde(flatten)]
+    pub common_opts: CommonConfigOptions,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub alpn: Option<Vec<String>>,
+    pub sni: Option<String>,
+    pub ech_opts: Option<EchOptions>,
+    pub client_fingerprint: Option<String>,
+    #[serde(default)]
+    pub skip_cert_verify: bool,
+    pub fingerprint: Option<String>,
+    pub certificate: Option<String>,
+    pub private_key: Option<String>,
+    #[serde(default)]
+    pub udp: bool,
+    #[serde(default)]
+    pub health_check: bool,
+    #[serde(default)]
+    pub quic: bool,
+    pub congestion_controller: Option<String>,
+    #[serde(default)]
+    pub cwnd: u64,
+    pub bbr_profile: Option<String>,
+    #[serde(default)]
+    pub max_connections: usize,
+    #[serde(default)]
+    pub min_streams: usize,
+    #[serde(default)]
+    pub max_streams: usize,
+}
+
+#[cfg(feature = "masque")]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct OutboundMasque {
+    #[serde(flatten)]
+    pub common_opts: CommonConfigOptions,
+    pub private_key: String,
+    pub public_key: String,
+    pub ip: Option<String>,
+    pub ipv6: Option<String>,
+    pub uri: Option<String>,
+    pub sni: Option<String>,
+    #[serde(default)]
+    pub mtu: u16,
+    #[serde(default)]
+    pub udp: bool,
+    #[serde(default)]
+    pub skip_cert_verify: bool,
+    pub network: Option<String>,
+    pub congestion_controller: Option<String>,
+    #[serde(default)]
+    pub cwnd: u64,
+    pub bbr_profile: Option<String>,
+    #[serde(default)]
+    pub remote_dns_resolve: bool,
+    pub dns: Option<Vec<String>>,
+}
+
+#[cfg(feature = "mieru")]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct OutboundMieru {
+    pub name: String,
+    pub server: String,
+    #[serde(default)]
+    pub port: u16,
+    pub port_range: Option<String>,
+    pub transport: String,
+    #[serde(default)]
+    pub udp: bool,
+    pub username: String,
+    pub password: String,
+    pub multiplexing: Option<String>,
+    pub handshake_mode: Option<String>,
+    pub traffic_pattern: Option<String>,
+    #[serde(alias = "dialer-proxy")]
+    pub connect_via: Option<String>,
+}
+
+#[cfg(feature = "sudoku")]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct OutboundSudoku {
+    #[serde(flatten)]
+    pub common_opts: CommonConfigOptions,
+    pub key: String,
+    pub aead_method: Option<String>,
+    pub padding_min: Option<u32>,
+    pub padding_max: Option<u32>,
+    pub table_type: Option<String>,
+    pub enable_pure_downlink: Option<bool>,
+    pub http_mask: Option<bool>,
+    pub http_mask_mode: Option<String>,
+    #[serde(default)]
+    pub http_mask_tls: bool,
+    pub http_mask_host: Option<String>,
+    pub path_root: Option<String>,
+    pub http_mask_multiplex: Option<String>,
+    pub httpmask: Option<OutboundSudokuHttpMask>,
+    pub custom_table: Option<String>,
+    #[serde(default)]
+    pub custom_tables: Vec<String>,
+}
+
+#[cfg(feature = "sudoku")]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct OutboundSudokuHttpMask {
+    #[serde(default)]
+    pub disable: bool,
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub tls: bool,
+    pub host: Option<String>,
+    pub path_root: Option<String>,
+    pub multiplex: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+#[serde(rename_all = "kebab-case")]
 pub struct OutboundShadowsocks {
     #[serde(flatten)]
     pub common_opts: CommonConfigOptions,
@@ -201,6 +444,26 @@ pub struct OutboundShadowsocks {
     pub udp: bool,
     pub plugin: Option<String>,
     pub plugin_opts: Option<HashMap<String, serde_yaml::Value>>,
+    #[serde(default)]
+    pub udp_over_tcp: bool,
+    #[serde(default)]
+    pub udp_over_tcp_version: u8,
+    pub client_fingerprint: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct OutboundShadowsocksR {
+    #[serde(flatten)]
+    pub common_opts: CommonConfigOptions,
+    pub cipher: String,
+    pub password: String,
+    pub obfs: String,
+    pub obfs_param: Option<String>,
+    pub protocol: String,
+    pub protocol_param: Option<String>,
+    #[serde(default = "default_bool_true")]
+    pub udp: bool,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
@@ -221,6 +484,27 @@ pub struct OutboundSocks5 {
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
 #[serde(rename_all = "kebab-case")]
+pub struct OutboundHttp {
+    #[serde(flatten)]
+    pub common_opts: CommonConfigOptions,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    #[serde(default)]
+    pub tls: bool,
+    pub sni: Option<String>,
+    #[serde(default)]
+    pub skip_cert_verify: bool,
+    pub headers: Option<HashMap<String, String>>,
+    /// File path or inline PEM client certificate for mTLS.
+    pub certificate: Option<String>,
+    /// File path or inline PEM client private key for mTLS.
+    pub private_key: Option<String>,
+    /// SHA-256 certificate fingerprint used for TLS certificate pinning.
+    pub fingerprint: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+#[serde(rename_all = "kebab-case")]
 pub struct WsOpt {
     pub path: Option<String>,
     pub headers: Option<HashMap<String, String>>,
@@ -228,10 +512,108 @@ pub struct WsOpt {
     pub early_data_header_name: Option<String>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+#[serde(untagged)]
+pub enum StringList {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl StringList {
+    pub fn to_vec(&self) -> Vec<String> {
+        match self {
+            Self::One(value) => vec![value.clone()],
+            Self::Many(values) => values.clone(),
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct HttpOpt {
+    pub method: Option<String>,
+    pub path: Option<StringList>,
+    pub headers: Option<HashMap<String, StringList>>,
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
 pub struct H2Opt {
     pub host: Option<Vec<String>>,
     pub path: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct XHttpReuseSettings {
+    #[serde(default, deserialize_with = "deserialize_optional_string_or_int")]
+    pub max_concurrency: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_string_or_int")]
+    pub max_connections: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_string_or_int")]
+    pub c_max_reuse_times: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_string_or_int")]
+    pub h_max_request_times: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_string_or_int")]
+    pub h_max_reusable_secs: Option<String>,
+    pub h_keep_alive_period: Option<i64>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct XHttpDownloadSettings {
+    pub path: Option<String>,
+    pub host: Option<String>,
+    pub headers: Option<HashMap<String, String>>,
+    pub reuse_settings: Option<XHttpReuseSettings>,
+    pub server: Option<String>,
+    pub port: Option<u16>,
+    pub tls: Option<bool>,
+    pub alpn: Option<Vec<String>>,
+    pub ech_opts: Option<EchOptions>,
+    pub reality_opts: Option<RealityOpt>,
+    pub skip_cert_verify: Option<bool>,
+    pub fingerprint: Option<String>,
+    #[serde(alias = "certificate")]
+    pub tls_cert: Option<String>,
+    #[serde(alias = "private-key")]
+    pub tls_key: Option<String>,
+    #[serde(alias = "servername")]
+    pub server_name: Option<String>,
+    pub client_fingerprint: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct XHttpOpt {
+    pub path: Option<String>,
+    pub host: Option<String>,
+    pub mode: Option<String>,
+    pub headers: Option<HashMap<String, String>>,
+    #[serde(default)]
+    pub no_grpc_header: bool,
+    #[serde(default, deserialize_with = "deserialize_optional_string_or_int")]
+    pub x_padding_bytes: Option<String>,
+    #[serde(default)]
+    pub x_padding_obfs_mode: bool,
+    pub x_padding_key: Option<String>,
+    pub x_padding_header: Option<String>,
+    pub x_padding_placement: Option<String>,
+    pub x_padding_method: Option<String>,
+    pub uplink_http_method: Option<String>,
+    pub session_placement: Option<String>,
+    pub session_key: Option<String>,
+    pub seq_placement: Option<String>,
+    pub seq_key: Option<String>,
+    pub uplink_data_placement: Option<String>,
+    pub uplink_data_key: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_string_or_int")]
+    pub uplink_chunk_size: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_string_or_int")]
+    pub sc_max_each_post_bytes: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_string_or_int")]
+    pub sc_min_posts_interval_ms: Option<String>,
+    pub reuse_settings: Option<XHttpReuseSettings>,
+    pub download_settings: Option<XHttpDownloadSettings>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
@@ -244,6 +626,7 @@ pub struct GrpcOpt {
 #[serde(rename_all = "kebab-case")]
 pub struct RealityOpt {
     pub public_key: String,
+    #[serde(default, deserialize_with = "deserialize_string_or_int")]
     pub short_id: String,
 }
 
@@ -256,22 +639,20 @@ pub struct OutboundAnytls {
     pub alpn: Option<Vec<String>>,
     pub sni: Option<String>,
     pub skip_cert_verify: Option<bool>,
-    /// Parsed for config compatibility; currently not applied by the runtime.
     pub fingerprint: Option<String>,
-    /// Parsed for config compatibility; currently not applied by the runtime.
     pub client_fingerprint: Option<String>,
+    pub ech_opts: Option<EchOptions>,
     pub udp: Option<bool>,
-    /// Parsed for config compatibility; currently not applied by the runtime.
     pub idle_session_check_interval: Option<u64>,
-    /// Parsed for config compatibility; currently not applied by the runtime.
     pub idle_session_timeout: Option<u64>,
-    /// Parsed for config compatibility; currently not applied by the runtime.
     pub min_idle_session: Option<u64>,
     /// File path or inline PEM client certificate for mTLS.
     /// Must be set together with `tls-key`.
+    #[serde(alias = "certificate")]
     pub tls_cert: Option<String>,
     /// File path or inline PEM client private key for mTLS.
     /// Must be set together with `tls-cert`.
+    #[serde(alias = "private-key")]
     pub tls_key: Option<String>,
 }
 
@@ -284,16 +665,32 @@ pub struct OutboundTrojan {
     pub alpn: Option<Vec<String>>,
     pub sni: Option<String>,
     pub skip_cert_verify: Option<bool>,
+    pub fingerprint: Option<String>,
+    pub client_fingerprint: Option<String>,
+    pub ech_opts: Option<EchOptions>,
+    pub reality_opts: Option<RealityOpt>,
+    pub ss_opts: Option<TrojanSsOpt>,
     pub udp: Option<bool>,
     pub network: Option<String>,
     pub grpc_opts: Option<GrpcOpt>,
     pub ws_opts: Option<WsOpt>,
     /// File path or inline PEM client certificate for mTLS.
     /// Must be set together with `tls-key`.
+    #[serde(alias = "certificate")]
     pub tls_cert: Option<String>,
     /// File path or inline PEM client private key for mTLS.
     /// Must be set together with `tls-cert`.
+    #[serde(alias = "private-key")]
     pub tls_key: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct TrojanSsOpt {
+    #[serde(default)]
+    pub enabled: bool,
+    pub method: Option<String>,
+    pub password: Option<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
@@ -302,23 +699,36 @@ pub struct OutboundVmess {
     #[serde(flatten)]
     pub common_opts: CommonConfigOptions,
     pub uuid: String,
-    #[serde(alias = "alterId")]
+    #[serde(alias = "alterId", deserialize_with = "utils::deserialize_u64")]
     pub alter_id: u16,
     pub cipher: Option<String>,
     pub udp: Option<bool>,
+    pub packet_addr: Option<bool>,
+    pub xudp: Option<bool>,
+    pub packet_encoding: Option<String>,
+    pub global_padding: Option<bool>,
+    pub authenticated_length: Option<bool>,
     pub tls: Option<bool>,
+    pub alpn: Option<Vec<String>>,
     pub skip_cert_verify: Option<bool>,
+    pub fingerprint: Option<String>,
+    pub client_fingerprint: Option<String>,
+    pub ech_opts: Option<EchOptions>,
+    pub reality_opts: Option<RealityOpt>,
     #[serde(alias = "servername")]
     pub server_name: Option<String>,
     pub network: Option<String>,
+    pub http_opts: Option<HttpOpt>,
     pub ws_opts: Option<WsOpt>,
     pub h2_opts: Option<H2Opt>,
     pub grpc_opts: Option<GrpcOpt>,
     /// File path or inline PEM client certificate for mTLS.
     /// Must be set together with `tls-key`.
+    #[serde(alias = "certificate")]
     pub tls_cert: Option<String>,
     /// File path or inline PEM client private key for mTLS.
     /// Must be set together with `tls-cert`.
+    #[serde(alias = "private-key")]
     pub tls_key: Option<String>,
 }
 
@@ -329,22 +739,33 @@ pub struct OutboundVless {
     pub common_opts: CommonConfigOptions,
     pub uuid: String,
     pub udp: Option<bool>,
+    pub packet_addr: Option<bool>,
+    pub xudp: Option<bool>,
+    pub packet_encoding: Option<String>,
+    pub encryption: Option<String>,
     pub tls: Option<bool>,
+    pub alpn: Option<Vec<String>>,
     pub skip_cert_verify: Option<bool>,
+    pub fingerprint: Option<String>,
     #[serde(alias = "servername")]
     pub server_name: Option<String>,
     pub network: Option<String>,
+    pub http_opts: Option<HttpOpt>,
     pub ws_opts: Option<WsOpt>,
     pub h2_opts: Option<H2Opt>,
+    pub xhttp_opts: Option<XHttpOpt>,
     pub grpc_opts: Option<GrpcOpt>,
     pub reality_opts: Option<RealityOpt>,
     pub flow: Option<String>,
     pub client_fingerprint: Option<String>,
+    pub ech_opts: Option<EchOptions>,
     /// File path or inline PEM client certificate for mTLS.
     /// Must be set together with `tls-key`.
+    #[serde(alias = "certificate")]
     pub tls_cert: Option<String>,
     /// File path or inline PEM client private key for mTLS.
     /// Must be set together with `tls-cert`.
+    #[serde(alias = "private-key")]
     pub tls_key: Option<String>,
 }
 
@@ -366,6 +787,31 @@ pub struct OutboundWireguard {
     pub dns: Option<Vec<String>>,
     pub allowed_ips: Option<Vec<String>>,
     pub reserved_bits: Option<Vec<u8>>,
+}
+
+#[cfg(feature = "openvpn")]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub struct OutboundOpenvpn {
+    #[serde(flatten)]
+    pub common_opts: CommonConfigOptions,
+    pub proto: Option<String>,
+    pub dev: Option<String>,
+    pub cipher: Option<String>,
+    pub auth: Option<String>,
+    pub comp_lzo: Option<String>,
+    pub ca: String,
+    pub cert: Option<String>,
+    pub key: Option<String>,
+    pub tls_crypt: Option<String>,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub ping: Option<u64>,
+    pub ping_restart: Option<u64>,
+    pub mtu: Option<u16>,
+    pub udp: Option<bool>,
+    pub remote_dns_resolve: Option<bool>,
+    pub dns: Option<Vec<String>>,
 }
 
 #[cfg(feature = "onion")]
@@ -399,6 +845,7 @@ pub struct OutboundTuic {
     pub skip_cert_verify: Option<bool>,
     pub max_open_stream: Option<u64>,
     pub sni: Option<String>,
+    pub ech_opts: Option<EchOptions>,
     /// millis
     pub gc_interval: Option<u64>,
     /// millis
@@ -407,9 +854,11 @@ pub struct OutboundTuic {
     pub receive_window: Option<u64>,
     /// File path or inline PEM client certificate for mTLS.
     /// Must be set together with `tls-key`.
+    #[serde(alias = "certificate")]
     pub tls_cert: Option<String>,
     /// File path or inline PEM client private key for mTLS.
     /// Must be set together with `tls-cert`.
+    #[serde(alias = "private-key")]
     pub tls_key: Option<String>,
 }
 
@@ -514,11 +963,16 @@ pub struct OutboundHysteria2 {
     pub obfs_password: Option<String>,
     pub alpn: Option<Vec<String>>,
     /// set brutal congestion control, need compare with tx which is received by
-    /// auth request
+    /// auth request (bytes per second, or bandwidth string like "200 Mbps")
+    #[serde(default, deserialize_with = "deserialize_bandwidth_bps")]
     pub up: Option<u64>,
-    /// receive_bps: send by auth request
+    /// receive_bps: send by auth request (bytes per second, or bandwidth
+    /// string)
+    #[serde(default, deserialize_with = "deserialize_bandwidth_bps")]
     pub down: Option<u64>,
     pub sni: Option<String>,
+    pub ech_opts: Option<EchOptions>,
+    #[serde(default)]
     pub skip_cert_verify: bool,
     pub ca: Option<String>,
     pub ca_str: Option<String>,
@@ -529,9 +983,11 @@ pub struct OutboundHysteria2 {
     pub cwnd: Option<u64>,
     /// File path or inline PEM client certificate for mTLS.
     /// Must be set together with `tls-key`.
+    #[serde(alias = "certificate")]
     pub tls_cert: Option<String>,
     /// File path or inline PEM client private key for mTLS.
     /// Must be set together with `tls-cert`.
+    #[serde(alias = "private-key")]
     pub tls_key: Option<String>,
 }
 
@@ -539,6 +995,48 @@ pub struct OutboundHysteria2 {
 #[serde(rename_all = "lowercase")]
 pub enum Hysteria2Obfs {
     Salamander,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize, Debug)]
+#[serde(rename_all = "kebab-case")]
+pub struct OutboundHysteria {
+    pub name: String,
+    pub server: String,
+    pub port: u16,
+    /// port hopping
+    pub ports: Option<String>,
+    /// bandwidth for upload, e.g. "100 mbps" or integer (Mbps)
+    #[serde(deserialize_with = "deserialize_bandwidth")]
+    pub up: Option<String>,
+    /// bandwidth for download, e.g. "100 mbps" or integer (Mbps)
+    #[serde(deserialize_with = "deserialize_bandwidth")]
+    pub down: Option<String>,
+    /// base64 encoded auth
+    pub auth: Option<String>,
+    /// plain text auth string
+    pub auth_str: Option<String>,
+    /// XPlus obfuscation key
+    pub obfs: Option<String>,
+    pub alpn: Option<Vec<String>>,
+    pub sni: Option<String>,
+    pub ech_opts: Option<EchOptions>,
+    #[serde(default)]
+    pub skip_cert_verify: bool,
+    pub ca: Option<String>,
+    pub ca_str: Option<String>,
+    pub fingerprint: Option<String>,
+    pub disable_mtu_discovery: Option<bool>,
+    pub fast_open: Option<bool>,
+    /// port hopping interval in seconds
+    pub hop_interval: Option<u64>,
+    /// receive window for stream
+    pub recv_window_conn: Option<u64>,
+    /// receive window for connection
+    pub recv_window: Option<u64>,
+    #[serde(alias = "certificate")]
+    pub tls_cert: Option<String>,
+    #[serde(alias = "private-key")]
+    pub tls_key: Option<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -556,6 +1054,63 @@ pub enum OutboundGroupProtocol {
     Smart(OutboundGroupSmart),
     #[serde(rename = "select")]
     Select(OutboundGroupSelect),
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
+pub struct OutboundGroupSelection {
+    #[serde(rename = "include-all", default)]
+    pub include_all: bool,
+    #[serde(rename = "include-all-proxies", default)]
+    pub include_all_proxies: bool,
+    #[serde(rename = "include-all-providers", default)]
+    pub include_all_providers: bool,
+    pub filter: Option<String>,
+    #[serde(rename = "exclude-filter")]
+    pub exclude_filter: Option<String>,
+}
+
+impl OutboundGroupSelection {
+    fn expand(
+        &self,
+        proxies: &mut Option<Vec<String>>,
+        use_provider: &mut Option<Vec<String>>,
+        all_proxies: &[String],
+        all_providers: &[String],
+    ) -> Result<(), crate::Error> {
+        if self.include_all || self.include_all_providers {
+            *use_provider = Some(all_providers.to_vec());
+        }
+        if !(self.include_all || self.include_all_proxies) {
+            return Ok(());
+        }
+
+        let filters = self
+            .filter
+            .as_deref()
+            .filter(|filter| !filter.is_empty())
+            .map(|filter| {
+                filter
+                    .split('`')
+                    .map(regex::Regex::new)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| {
+                        crate::Error::InvalidConfig(format!(
+                            "invalid proxy group filter: {error}"
+                        ))
+                    })
+            })
+            .transpose()?;
+        let proxies = proxies.get_or_insert_default();
+        for name in all_proxies {
+            if filters.as_ref().is_none_or(|filters| {
+                filters.iter().any(|filter| filter.is_match(name))
+            }) && !proxies.contains(name)
+            {
+                proxies.push(name.clone());
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Only used statically in config parsing.
@@ -584,6 +1139,74 @@ impl OutboundGroupProtocol {
             OutboundGroupProtocol::Select(g) => g.proxies.as_ref(),
         }
     }
+
+    /// Returns the proxy providers used by the group, if any.
+    pub fn use_providers(&self) -> Option<&Vec<String>> {
+        match &self {
+            OutboundGroupProtocol::Relay(g) => g.use_provider.as_ref(),
+            OutboundGroupProtocol::UrlTest(g) => g.use_provider.as_ref(),
+            OutboundGroupProtocol::Fallback(g) => g.use_provider.as_ref(),
+            OutboundGroupProtocol::LoadBalance(g) => g.use_provider.as_ref(),
+            OutboundGroupProtocol::Smart(g) => g.use_provider.as_ref(),
+            OutboundGroupProtocol::Select(g) => g.use_provider.as_ref(),
+        }
+    }
+
+    pub fn selection(&self) -> &OutboundGroupSelection {
+        match self {
+            OutboundGroupProtocol::Relay(g) => &g.selection,
+            OutboundGroupProtocol::UrlTest(g) => &g.selection,
+            OutboundGroupProtocol::Fallback(g) => &g.selection,
+            OutboundGroupProtocol::LoadBalance(g) => &g.selection,
+            OutboundGroupProtocol::Smart(g) => &g.selection,
+            OutboundGroupProtocol::Select(g) => &g.selection,
+        }
+    }
+
+    pub fn expand_include_all(
+        &mut self,
+        all_proxies: &[String],
+        all_providers: &[String],
+    ) -> Result<(), crate::Error> {
+        match self {
+            OutboundGroupProtocol::Relay(g) => g.selection.expand(
+                &mut g.proxies,
+                &mut g.use_provider,
+                all_proxies,
+                all_providers,
+            ),
+            OutboundGroupProtocol::UrlTest(g) => g.selection.expand(
+                &mut g.proxies,
+                &mut g.use_provider,
+                all_proxies,
+                all_providers,
+            ),
+            OutboundGroupProtocol::Fallback(g) => g.selection.expand(
+                &mut g.proxies,
+                &mut g.use_provider,
+                all_proxies,
+                all_providers,
+            ),
+            OutboundGroupProtocol::LoadBalance(g) => g.selection.expand(
+                &mut g.proxies,
+                &mut g.use_provider,
+                all_proxies,
+                all_providers,
+            ),
+            OutboundGroupProtocol::Smart(g) => g.selection.expand(
+                &mut g.proxies,
+                &mut g.use_provider,
+                all_proxies,
+                all_providers,
+            ),
+            OutboundGroupProtocol::Select(g) => g.selection.expand(
+                &mut g.proxies,
+                &mut g.use_provider,
+                all_proxies,
+                all_providers,
+            ),
+        }
+    }
 }
 
 impl Display for OutboundGroupProtocol {
@@ -607,6 +1230,8 @@ pub struct OutboundGroupRelay {
     pub use_provider: Option<Vec<String>>,
     pub icon: Option<String>,
     pub url: Option<String>,
+    #[serde(flatten)]
+    pub selection: OutboundGroupSelection,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
@@ -623,6 +1248,8 @@ pub struct OutboundGroupUrlTest {
     pub lazy: Option<bool>,
     pub tolerance: Option<u16>,
     pub icon: Option<String>,
+    #[serde(flatten)]
+    pub selection: OutboundGroupSelection,
 }
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
 pub struct OutboundGroupFallback {
@@ -637,6 +1264,8 @@ pub struct OutboundGroupFallback {
     pub interval: u64,
     pub lazy: Option<bool>,
     pub icon: Option<String>,
+    #[serde(flatten)]
+    pub selection: OutboundGroupSelection,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
@@ -653,6 +1282,8 @@ pub struct OutboundGroupLoadBalance {
     pub lazy: Option<bool>,
     pub strategy: Option<LoadBalanceStrategy>,
     pub icon: Option<String>,
+    #[serde(flatten)]
+    pub selection: OutboundGroupSelection,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, Default)]
@@ -692,6 +1323,8 @@ pub struct OutboundGroupSmart {
     /// When > 0, bandwidth metrics are included in selection algorithm
     #[serde(rename = "bandwidth-weight")]
     pub bandwidth_weight: Option<f64>,
+    #[serde(flatten)]
+    pub selection: OutboundGroupSelection,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
@@ -705,6 +1338,8 @@ pub struct OutboundGroupSelect {
 
     pub url: Option<String>,
     pub icon: Option<String>,
+    #[serde(flatten)]
+    pub selection: OutboundGroupSelection,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
@@ -730,9 +1365,15 @@ pub struct OutboundHttpProvider {
     #[serde(skip)]
     pub name: String,
     pub url: String,
+    /// Optional outbound used to download this provider. This is the
+    /// `proxy:` field supported by Mihomo proxy providers.
+    #[serde(default)]
+    pub proxy: Option<String>,
     pub interval: u64,
     pub path: String,
     pub health_check: HealthCheck,
+    #[serde(rename = "override", default)]
+    pub override_options: OutboundProxyProviderOverride,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
@@ -743,6 +1384,99 @@ pub struct OutboundFileProvider {
     pub path: String,
     pub interval: Option<u64>,
     pub health_check: HealthCheck,
+    #[serde(rename = "override", default)]
+    pub override_options: OutboundProxyProviderOverride,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
+#[serde(rename_all = "kebab-case", default)]
+pub struct OutboundProxyProviderOverride {
+    pub tfo: Option<bool>,
+    pub mptcp: Option<bool>,
+    pub udp: Option<bool>,
+    pub udp_over_tcp: Option<bool>,
+    pub up: Option<String>,
+    pub down: Option<String>,
+    pub dialer_proxy: Option<String>,
+    pub skip_cert_verify: Option<bool>,
+    pub interface_name: Option<String>,
+    pub routing_mark: Option<i64>,
+    pub ip_version: Option<String>,
+    pub additional_prefix: Option<String>,
+    pub additional_suffix: Option<String>,
+    pub proxy_name: Vec<OutboundProxyNameOverride>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub struct OutboundProxyNameOverride {
+    pub pattern: String,
+    pub target: String,
+}
+
+impl OutboundProxyProviderOverride {
+    pub fn apply(
+        &self,
+        mapping: &mut HashMap<String, Value>,
+    ) -> Result<(), crate::Error> {
+        macro_rules! set_value {
+            ($field:ident, $key:literal) => {
+                if let Some(value) = &self.$field {
+                    mapping.insert(
+                        $key.to_owned(),
+                        serde_yaml::to_value(value).map_err(|error| {
+                            crate::Error::InvalidConfig(format!(
+                                "invalid proxy provider override `{}`: {error}",
+                                $key
+                            ))
+                        })?,
+                    );
+                }
+            };
+        }
+
+        set_value!(tfo, "tfo");
+        set_value!(mptcp, "mptcp");
+        set_value!(udp, "udp");
+        set_value!(udp_over_tcp, "udp-over-tcp");
+        set_value!(up, "up");
+        set_value!(down, "down");
+        set_value!(dialer_proxy, "dialer-proxy");
+        set_value!(skip_cert_verify, "skip-cert-verify");
+        set_value!(interface_name, "interface-name");
+        set_value!(routing_mark, "routing-mark");
+        set_value!(ip_version, "ip-version");
+
+        let mut name = mapping
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                crate::Error::InvalidConfig(
+                    "proxy provider entry is missing string field `name`".to_owned(),
+                )
+            })?
+            .to_owned();
+        for replacement in &self.proxy_name {
+            let pattern =
+                regex::Regex::new(&replacement.pattern).map_err(|error| {
+                    crate::Error::InvalidConfig(format!(
+                        "invalid proxy provider name override `{}`: {error}",
+                        replacement.pattern
+                    ))
+                })?;
+            name = pattern
+                .replace_all(&name, replacement.target.as_str())
+                .into_owned();
+        }
+        if let Some(prefix) = &self.additional_prefix {
+            name.insert_str(0, prefix);
+        }
+        if let Some(suffix) = &self.additional_suffix {
+            name.push_str(suffix);
+        }
+        mapping.insert("name".to_owned(), Value::String(name));
+        Ok(())
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
@@ -769,6 +1503,201 @@ impl TryFrom<HashMap<String, Value>> for OutboundProxyProviderDef {
         ))
         .map_err(map_serde_error(name))
     }
+}
+
+#[cfg(test)]
+mod proxy_provider_compatibility_tests {
+    use super::{OutboundProxyProviderDef, OutboundProxyProviderDef::Http};
+
+    #[test]
+    fn parses_mihomo_proxy_provider_download_proxy() {
+        let yaml = r#"
+            type: http
+            url: https://example.com/provider.yaml
+            proxy: Proxy
+            interval: 3600
+            path: ./provider.yaml
+            health-check:
+              enable: true
+              url: https://example.com/generate_204
+              interval: 300
+        "#;
+
+        let Http(provider) =
+            serde_yaml::from_str::<OutboundProxyProviderDef>(yaml).unwrap()
+        else {
+            panic!("expected HTTP provider");
+        };
+        assert_eq!(provider.proxy.as_deref(), Some("Proxy"));
+    }
+}
+
+/// Deserialize a field that can be either a string or an integer (converts int
+/// to string) Used for fields like short-id that YAML may parse as integer
+fn deserialize_string_or_int<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+    struct StringOrIntVisitor;
+
+    impl<'de> de::Visitor<'de> for StringOrIntVisitor {
+        type Value = String;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "a string or integer")
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            Ok(v.to_string())
+        }
+
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
+            Ok(v.to_string())
+        }
+
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
+            Ok(v.to_string())
+        }
+    }
+
+    deserializer.deserialize_any(StringOrIntVisitor)
+}
+
+fn deserialize_optional_string_or_int<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+
+    match Option::<Value>::deserialize(deserializer)? {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value)),
+        Some(Value::Number(value)) => Ok(Some(value.to_string())),
+        Some(value) => Err(de::Error::custom(format!(
+            "expected a string or integer, got {value:?}"
+        ))),
+    }
+}
+
+/// Deserialize bandwidth that can be either a string ("100 mbps") or integer
+/// (Mbps)
+fn deserialize_bandwidth<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+    struct BandwidthVisitor;
+
+    impl<'de> de::Visitor<'de> for BandwidthVisitor {
+        type Value = Option<String>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "a string or integer for bandwidth")
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            Ok(Some(v.to_string()))
+        }
+
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
+            Ok(Some(format!("{} Mbps", v)))
+        }
+
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
+            Ok(Some(format!("{} Mbps", v)))
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+    }
+
+    deserializer.deserialize_any(BandwidthVisitor)
+}
+
+/// Parse a bandwidth string like "200 Mbps", "1 Gbps", "100 mbps" into bytes
+/// per second
+fn parse_bandwidth_str(s: &str) -> Option<u64> {
+    let s = s.trim().to_lowercase();
+    let (num_str, multiplier) = if s.ends_with("gbps") {
+        (&s[..s.len() - 4], 1_000_000_000u64 / 8)
+    } else if s.ends_with("g bps") {
+        (&s[..s.len() - 5], 1_000_000_000u64 / 8)
+    } else if s.ends_with("mbps") {
+        (&s[..s.len() - 4], 1_000_000u64 / 8)
+    } else if s.ends_with("m bps") {
+        (&s[..s.len() - 5], 1_000_000u64 / 8)
+    } else if s.ends_with("kbps") {
+        (&s[..s.len() - 4], 1_000u64 / 8)
+    } else if s.ends_with("k bps") {
+        (&s[..s.len() - 5], 1_000u64 / 8)
+    } else if s.ends_with("bps") {
+        (&s[..s.len() - 3], 1u64)
+    } else if s.ends_with("gb/s") {
+        (&s[..s.len() - 4], 1_000_000_000u64 / 8)
+    } else if s.ends_with("mb/s") {
+        (&s[..s.len() - 4], 1_000_000u64 / 8)
+    } else if s.ends_with("kb/s") {
+        (&s[..s.len() - 4], 1_000u64 / 8)
+    } else if s.ends_with("b/s") {
+        (&s[..s.len() - 3], 1u64)
+    } else {
+        // Try as plain number (Mbps)
+        if let Ok(n) = s.parse::<u64>() {
+            return Some(n * 1_000_000 / 8);
+        }
+        return None;
+    };
+    num_str.trim().parse::<u64>().ok().map(|n| n * multiplier)
+}
+
+/// Deserialize bandwidth for hysteria2: string ("200 Mbps") or integer (already
+/// BPS)
+fn deserialize_bandwidth_bps<'de, D>(
+    deserializer: D,
+) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+    struct BpsVisitor;
+
+    impl<'de> de::Visitor<'de> for BpsVisitor {
+        type Value = Option<u64>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "a string or integer for bandwidth")
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            Ok(parse_bandwidth_str(v))
+        }
+
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
+            Ok(Some(v))
+        }
+
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
+            Ok(Some(v as u64))
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+    }
+
+    deserializer.deserialize_any(BpsVisitor)
 }
 
 #[cfg(all(test, feature = "tailscale"))]
@@ -819,6 +1748,70 @@ mod tailscale_tests {
             Some("https://controlplane.tailscale.com")
         );
         assert!(ephemeral);
+    }
+}
+
+#[cfg(all(test, feature = "openvpn"))]
+mod openvpn_tests {
+    use super::{OutboundOpenvpn, OutboundProxyProtocol};
+
+    #[test]
+    fn parses_all_current_mihomo_openvpn_fields() {
+        let yaml = r#"
+name: corporate-vpn
+type: openvpn
+server: vpn.example.com
+port: 1194
+proto: tcp4-client
+dev: tun
+cipher: AES-256-CBC
+auth: SHA512
+comp-lzo: adaptive
+ca: |
+  -----BEGIN CERTIFICATE-----
+  example
+  -----END CERTIFICATE-----
+username: user
+password: secret
+ping: 10
+ping-restart: 60
+mtu: 1400
+udp: false
+dialer-proxy: bootstrap
+remote-dns-resolve: true
+dns: [1.1.1.1, 8.8.8.8]
+"#;
+        let protocol: OutboundProxyProtocol = serde_yaml::from_str(yaml).unwrap();
+        let OutboundProxyProtocol::Openvpn(OutboundOpenvpn {
+            common_opts,
+            proto,
+            cipher,
+            auth,
+            comp_lzo,
+            username,
+            ping,
+            ping_restart,
+            mtu,
+            udp,
+            remote_dns_resolve,
+            dns,
+            ..
+        }) = protocol
+        else {
+            panic!("expected openvpn outbound")
+        };
+        assert_eq!(common_opts.connect_via.as_deref(), Some("bootstrap"));
+        assert_eq!(proto.as_deref(), Some("tcp4-client"));
+        assert_eq!(cipher.as_deref(), Some("AES-256-CBC"));
+        assert_eq!(auth.as_deref(), Some("SHA512"));
+        assert_eq!(comp_lzo.as_deref(), Some("adaptive"));
+        assert_eq!(username.as_deref(), Some("user"));
+        assert_eq!(ping, Some(10));
+        assert_eq!(ping_restart, Some(60));
+        assert_eq!(mtu, Some(1400));
+        assert_eq!(udp, Some(false));
+        assert_eq!(remote_dns_resolve, Some(true));
+        assert_eq!(dns.unwrap(), ["1.1.1.1", "8.8.8.8"]);
     }
 }
 
@@ -928,5 +1921,131 @@ mod anytls_tests {
         assert_eq!(config.idle_session_check_interval, Some(30));
         assert_eq!(config.idle_session_timeout, Some(300));
         assert_eq!(config.min_idle_session, Some(2));
+    }
+}
+
+#[cfg(test)]
+mod mihomo_tls_field_tests {
+    use super::{OutboundProxyProtocol, OutboundProxyProtocol::*};
+
+    #[test]
+    fn parses_mihomo_tls_field_names_for_common_v2ray_protocols() {
+        let cases = [
+            r#"
+                name: trojan-tls
+                type: trojan
+                server: example.com
+                port: 443
+                password: secret
+                fingerprint: 00:11
+                client-fingerprint: chrome
+                certificate: cert.pem
+                private-key: key.pem
+            "#,
+            r#"
+                name: vmess-tls
+                type: vmess
+                server: example.com
+                port: 443
+                uuid: 00000000-0000-0000-0000-000000000001
+                alterId: 0
+                tls: true
+                alpn: [h2, http/1.1]
+                fingerprint: 00:11
+                client-fingerprint: chrome
+                certificate: cert.pem
+                private-key: key.pem
+            "#,
+            r#"
+                name: vless-tls
+                type: vless
+                server: example.com
+                port: 443
+                uuid: 00000000-0000-0000-0000-000000000001
+                tls: true
+                alpn: [h2, http/1.1]
+                fingerprint: 00:11
+                client-fingerprint: chrome
+                certificate: cert.pem
+                private-key: key.pem
+            "#,
+            r#"
+                name: anytls-tls
+                type: anytls
+                server: example.com
+                port: 443
+                password: secret
+                certificate: cert.pem
+                private-key: key.pem
+            "#,
+        ];
+
+        for yaml in cases {
+            let proxy: OutboundProxyProtocol = serde_yaml::from_str(yaml).unwrap();
+            let (certificate, private_key) = match proxy {
+                Trojan(proxy) => (proxy.tls_cert, proxy.tls_key),
+                Vmess(proxy) => (proxy.tls_cert, proxy.tls_key),
+                Vless(proxy) => (proxy.tls_cert, proxy.tls_key),
+                Anytls(proxy) => (proxy.tls_cert, proxy.tls_key),
+                _ => unreachable!(),
+            };
+            assert_eq!(certificate.as_deref(), Some("cert.pem"));
+            assert_eq!(private_key.as_deref(), Some("key.pem"));
+        }
+    }
+
+    #[test]
+    fn parses_mihomo_vmess_string_alter_id() {
+        let yaml = r#"
+            name: vmess-string-alter-id
+            type: vmess
+            server: example.com
+            port: 443
+            uuid: 00000000-0000-0000-0000-000000000001
+            alterId: "0"
+        "#;
+
+        let Vmess(config) =
+            serde_yaml::from_str::<OutboundProxyProtocol>(yaml).unwrap()
+        else {
+            panic!("expected VMess config");
+        };
+        assert_eq!(config.alter_id, 0);
+    }
+}
+
+#[cfg(all(test, feature = "shadowsocks"))]
+mod shadowsocks_compatibility_tests {
+    use super::{OutboundProxyProtocol, OutboundProxyProtocol::Ss};
+
+    #[test]
+    fn parses_mihomo_uot_and_tls_plugin_fields() {
+        let yaml = r#"
+            name: ss-uot
+            type: ss
+            server: example.com
+            port: 443
+            cipher: aes-128-gcm
+            password: secret
+            udp: true
+            udp-over-tcp: true
+            udp-over-tcp-version: 2
+            client-fingerprint: chrome
+            plugin: gost-plugin
+            plugin-opts:
+              mode: websocket
+              tls: true
+              fingerprint: 01:02:03
+              certificate: cert.pem
+              private-key: key.pem
+        "#;
+        let config: OutboundProxyProtocol = serde_yaml::from_str(yaml).unwrap();
+        let Ss(config) = config else {
+            panic!("expected Shadowsocks config");
+        };
+        assert!(config.udp_over_tcp);
+        assert_eq!(config.udp_over_tcp_version, 2);
+        assert_eq!(config.client_fingerprint.as_deref(), Some("chrome"));
+        assert_eq!(config.plugin.as_deref(), Some("gost-plugin"));
     }
 }

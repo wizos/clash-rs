@@ -1,5 +1,5 @@
 use crate::{
-    app::net::DEFAULT_OUTBOUND_INTERFACE,
+    app::net::outbound_interface_snapshot,
     config::internal::proxy::PROXY_DIRECT,
     dns::{
         ClashResolver, EdnsClientSubnet, RuleDispatch, ThreadSafeDNSClient,
@@ -42,18 +42,17 @@ pub async fn make_clients(
         };
 
         let port = if s.net == DNSNetMode::Dhcp { 0 } else { s.port };
+        let interface = match s.interface.as_ref() {
+            Some(interface) => Some(interface.clone()),
+            None => outbound_interface_snapshot().await,
+        };
 
         match DnsClient::new_client(Opts {
             father: resolver.as_ref().cloned(),
             host: s.host.clone(),
             port,
             net: s.net.to_owned(),
-            iface: s
-                .interface
-                .as_ref()
-                .or(DEFAULT_OUTBOUND_INTERFACE.read().await.as_ref())
-                .inspect(|x| debug!("DNS client interface: {:?}", x))
-                .cloned(),
+            iface: interface.inspect(|x| debug!("DNS client interface: {:?}", x)),
             proxy,
             ecs: edns_client_subnet.clone(),
             fw_mark,

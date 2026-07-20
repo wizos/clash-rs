@@ -441,6 +441,10 @@ impl InboundManager {
         }
     }
 
+    pub async fn stop_listeners(&self) {
+        self.stop_all_listeners().await;
+    }
+
     #[allow(dead_code)]
     async fn join_all_listeners(&self) -> Result<(), crate::Error> {
         let mut last_join_error = None;

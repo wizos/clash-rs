@@ -12,11 +12,17 @@ pub mod domain_suffix;
 pub mod final_;
 pub mod geodata;
 pub mod geoip;
+pub mod inbound;
+pub mod ipasn;
 pub mod ipcidr;
+pub mod ipsuffix;
+pub mod metadata;
 pub mod network;
 pub mod port;
 pub mod process;
 pub mod ruleset;
+pub mod subrule;
+pub mod wildcard;
 
 pub trait RuleMatcher: Send + Sync + Unpin + Display {
     /// check if the rule should apply to the session
@@ -25,6 +31,13 @@ pub trait RuleMatcher: Send + Sync + Unpin + Display {
     /// the Proxy to use
     fn target(&self) -> &str;
 
+    /// Return the effective target for this session. Most rules return their
+    /// own static target; `SUB-RULE` overrides this with the matched branch's
+    /// target.
+    fn route_target(&self, sess: &Session) -> Option<&str> {
+        self.apply(sess).then(|| self.target())
+    }
+
     /// the actual content of the rule
     fn payload(&self) -> String;
 
@@ -32,6 +45,10 @@ pub trait RuleMatcher: Send + Sync + Unpin + Display {
     fn type_name(&self) -> &str;
 
     fn should_resolve_ip(&self) -> bool {
+        false
+    }
+
+    fn should_resolve_process(&self) -> bool {
         false
     }
 

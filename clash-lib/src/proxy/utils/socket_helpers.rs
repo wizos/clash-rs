@@ -3,6 +3,8 @@ use crate::app::net::OutboundInterface;
 
 use futures::io;
 use socket2::TcpKeepalive;
+#[cfg(target_os = "android")]
+use std::os::fd::AsRawFd;
 use std::{
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     time::Duration,
@@ -64,6 +66,8 @@ pub async fn new_tcp_stream(
         ),
     };
     debug!("created tcp socket");
+    #[cfg(target_os = "android")]
+    crate::process_resolver::protect_socket(socket.as_raw_fd());
 
     if !cfg!(target_os = "android")
         && let Some(iface) = iface
@@ -128,6 +132,8 @@ pub async fn new_udp_socket(
         ),
     };
     debug!("created udp socket");
+    #[cfg(target_os = "android")]
+    crate::process_resolver::protect_socket(socket.as_raw_fd());
 
     if !cfg!(target_os = "android") {
         // Skip interface binding for loopback destinations — binding a socket
@@ -254,6 +260,9 @@ pub fn new_dual_stack_udp_socket(
                 ipv4_only,
             ),
         };
+
+    #[cfg(target_os = "android")]
+    crate::process_resolver::protect_socket(socket.as_raw_fd());
 
     if let Some(iface) = iface {
         let family = socket2::Domain::for_address(bind_addr);

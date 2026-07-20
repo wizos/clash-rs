@@ -3,9 +3,23 @@ use http::uri::InvalidUri;
 
 use crate::{
     Error,
-    config::proxy::{CommonConfigOptions, GrpcOpt, H2Opt, WsOpt},
-    proxy::transport::{self, GrpcClient, H2Client, WsClient},
+    config::proxy::{
+        CommonConfigOptions, EchOptions, GrpcOpt, H2Opt, HttpOpt, WsOpt,
+    },
+    proxy::{
+        transport::{self, GrpcClient, H2Client, TlsEchOptions, WsClient},
+        vmess::vmess_impl::http::HttpConfig,
+    },
 };
+
+pub fn tls_ech_options(options: Option<&EchOptions>) -> Option<TlsEchOptions> {
+    options
+        .filter(|options| options.enable)
+        .map(|options| TlsEchOptions {
+            config: options.config.clone(),
+            query_server_name: options.query_server_name.clone(),
+        })
+}
 
 impl TryFrom<(&WsOpt, &CommonConfigOptions)> for WsClient {
     type Error = std::io::Error;
@@ -31,6 +45,30 @@ impl TryFrom<(&WsOpt, &CommonConfigOptions)> for WsClient {
             early_data_header_name,
         );
         Ok(client)
+    }
+}
+
+impl From<(&HttpOpt, &CommonConfigOptions)> for HttpConfig {
+    fn from((options, common): (&HttpOpt, &CommonConfigOptions)) -> Self {
+        Self {
+            method: options.method.clone().unwrap_or_else(|| "GET".to_owned()),
+            host: common.server.clone(),
+            path: options
+                .path
+                .as_ref()
+                .map(|path| path.to_vec())
+                .unwrap_or_else(|| vec!["/".to_owned()]),
+            headers: options
+                .headers
+                .as_ref()
+                .map(|headers| {
+                    headers
+                        .iter()
+                        .map(|(name, values)| (name.clone(), values.to_vec()))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
     }
 }
 

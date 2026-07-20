@@ -8,6 +8,7 @@ pub struct GeoIP {
     pub target: String,
     pub country_code: String,
     pub no_resolve: bool,
+    pub is_src: bool,
     pub mmdb: Option<MmdbLookup>,
 }
 
@@ -19,13 +20,20 @@ impl std::fmt::Display for GeoIP {
 
 impl RuleMatcher for GeoIP {
     fn apply(&self, sess: &Session) -> bool {
-        let ip = sess.resolved_ip.or(sess.destination.ip());
+        let ip = if self.is_src {
+            Some(sess.source.ip())
+        } else {
+            sess.resolved_ip.or(sess.destination.ip())
+        };
 
         if let Some(ip) = ip {
             if let Some(mmdb) = &self.mmdb {
                 // Check if the IP matches the country code
-                mmdb.lookup_country(ip)
-                    .is_ok_and(|country| country.country_code == self.country_code)
+                mmdb.lookup_country(ip).is_ok_and(|country| {
+                    country
+                        .country_code
+                        .eq_ignore_ascii_case(&self.country_code)
+                })
             } else {
                 warn!(
                     "GeoIP lookup failed: MMDB not available. Maybe config.mmdb is \
@@ -47,10 +55,10 @@ impl RuleMatcher for GeoIP {
     }
 
     fn type_name(&self) -> &str {
-        "GeoIP"
+        if self.is_src { "SrcGeoIP" } else { "GeoIP" }
     }
 
     fn should_resolve_ip(&self) -> bool {
-        !self.no_resolve
+        !self.is_src && !self.no_resolve
     }
 }

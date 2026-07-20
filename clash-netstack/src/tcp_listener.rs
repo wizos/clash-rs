@@ -216,6 +216,7 @@ impl TcpListener {
 
                 let src_ip = packet.src_addr();
                 let dst_ip = packet.dst_addr();
+                let dscp = packet.dscp();
                 let payload = packet.payload();
 
                 let packet = match TcpPacket::new_checked(payload) {
@@ -297,6 +298,7 @@ impl TcpListener {
                         .send(TcpStream {
                             local_addr: src_addr,
                             remote_addr: dst_addr,
+                            dscp,
 
                             handle: handle.clone(),
                             stack_notifier: iface_notifier.clone(),

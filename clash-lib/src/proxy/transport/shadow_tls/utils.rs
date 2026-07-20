@@ -47,6 +47,13 @@ impl Hmac {
         res
     }
 
+    pub(crate) fn finalize_v2(&self) -> [u8; 8] {
+        let hash = self.0.clone().finalize().into_bytes();
+        let mut result = [0; 8];
+        result.copy_from_slice(&hash[..8]);
+        result
+    }
+
     #[inline]
     pub(crate) fn to_owned(&self) -> Self {
         Self(self.0.clone())

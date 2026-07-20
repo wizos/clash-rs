@@ -3,7 +3,8 @@ use std::io;
 use crate::{common::utils, proxy::AnyStream, session::SocksAddr};
 
 use super::{
-    SECURITY_AES_128_GCM, SECURITY_CHACHA20_POLY1305, SECURITY_NONE, Security,
+    SECURITY_AES_128_CFB, SECURITY_AES_128_GCM, SECURITY_CHACHA20_POLY1305,
+    SECURITY_NONE, Security,
     stream::{self},
     user::{self, new_alter_id_list},
 };
@@ -14,6 +15,9 @@ pub struct VmessOption {
     pub alter_id: u16,
     pub security: String,
     pub udp: bool,
+    pub xudp: bool,
+    pub global_padding: bool,
+    pub authenticated_length: bool,
     pub dst: SocksAddr,
 }
 
@@ -22,6 +26,9 @@ pub struct Builder {
     pub security: Security,
     pub is_aead: bool,
     pub is_udp: bool,
+    pub is_xudp: bool,
+    pub global_padding: bool,
+    pub authenticated_length: bool,
     pub dst: SocksAddr,
 }
 
@@ -38,7 +45,8 @@ impl Builder {
         let security = match opt.security.to_lowercase().as_str() {
             "chacha20-poly1305" => SECURITY_CHACHA20_POLY1305,
             "aes-128-gcm" => SECURITY_AES_128_GCM,
-            "none" => SECURITY_NONE,
+            "none" | "zero" => SECURITY_NONE,
+            "aes-128-cfb" => SECURITY_AES_128_CFB,
             "auto" => match std::env::consts::ARCH {
                 "x86_64" | "s390x" | "aarch64" => SECURITY_AES_128_GCM,
                 _ => SECURITY_CHACHA20_POLY1305,
@@ -56,6 +64,9 @@ impl Builder {
             security,
             is_aead: opt.alter_id == 0,
             is_udp: opt.udp,
+            is_xudp: opt.xudp,
+            global_padding: opt.global_padding,
+            authenticated_length: opt.authenticated_length,
             dst: opt.dst.clone(),
         })
     }
@@ -69,6 +80,9 @@ impl Builder {
             &self.security,
             self.is_aead,
             self.is_udp,
+            self.is_xudp,
+            self.global_padding,
+            self.authenticated_length,
         )
         .await?;
 

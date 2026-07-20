@@ -1,8 +1,11 @@
-use self::{stream::VlessStream, vision::VisionStream};
+use self::{
+    encryption::ClientInstance as VlessEncryptionClient, stream::VlessStream,
+    vision::VisionStream,
+};
 use super::{
     AnyStream, ConnectorType, DialWithConnector, HandlerCommonOptions,
     OutboundHandler, OutboundType, PlainProxyAPIResponse,
-    transport::Transport,
+    transport::{Transport, VisionOptions},
     utils::{GLOBAL_DIRECT_CONNECTOR, RemoteConnector},
 };
 use crate::{
@@ -23,6 +26,7 @@ use std::{collections::HashMap, io, sync::Arc};
 use tracing::debug;
 
 mod datagram;
+pub(crate) mod encryption;
 mod stream;
 mod vision;
 
@@ -33,9 +37,25 @@ pub struct HandlerOptions {
     pub port: u16,
     pub uuid: String,
     pub udp: bool,
+    pub packet_addr: bool,
+    pub xudp: bool,
+    pub encryption: Option<Arc<VlessEncryptionClient>>,
     pub transport: Option<Box<dyn Transport>>,
     pub tls: Option<Box<dyn Transport>>,
+    pub additional_streams: Vec<TransportStreamOptions>,
+    pub additional_datagrams: Vec<TransportDatagramOptions>,
     pub flow: Option<String>,
+}
+
+pub struct TransportStreamOptions {
+    pub server: String,
+    pub port: u16,
+    pub tls: Option<Box<dyn Transport>>,
+}
+
+pub struct TransportDatagramOptions {
+    pub server: String,
+    pub port: u16,
 }
 
 pub struct Handler {
@@ -61,9 +81,15 @@ impl Handler {
         }
     }
 
-    async fn inner_proxy_stream(
+    async fn inner_proxy_stream_with_additional(
         &self,
         s: AnyStream,
+        additional_streams: Vec<AnyStream>,
+        additional_datagrams: Vec<(
+            super::AnyOutboundDatagram,
+            crate::session::SocksAddr,
+            std::net::SocketAddr,
+        )>,
         sess: &Session,
         is_udp: bool,
     ) -> io::Result<AnyStream> {
@@ -74,16 +100,46 @@ impl Handler {
         };
 
         let s = if let Some(transport) = self.opts.transport.as_ref() {
-            transport.proxy_stream(s).await?
+            transport
+                .proxy_stream_with_additional_mixed(
+                    s,
+                    additional_streams,
+                    additional_datagrams,
+                )
+                .await?
+        } else {
+            debug_assert!(additional_streams.is_empty());
+            debug_assert!(additional_datagrams.is_empty());
+            s
+        };
+
+        let s = if let Some(encryption) = self.opts.encryption.as_ref() {
+            encryption.handshake(s).await?
         } else {
             s
         };
 
+        self.wrap_vless_stream(s, sess, is_udp, vision_opts)
+    }
+
+    fn wrap_vless_stream(
+        &self,
+        s: AnyStream,
+        sess: &Session,
+        is_udp: bool,
+        vision_opts: Option<VisionOptions>,
+    ) -> io::Result<AnyStream> {
+        let destination = if is_udp && self.opts.packet_addr {
+            super::packetaddr::magic_destination()
+        } else {
+            sess.destination.clone()
+        };
         let vless_stream = VlessStream::new(
             s,
             &self.opts.uuid,
-            &sess.destination,
+            &destination,
             is_udp,
+            is_udp && self.opts.xudp,
             self.opts.flow.clone(),
         )?;
 
@@ -96,6 +152,191 @@ impl Handler {
         } else {
             Ok(Box::new(vless_stream))
         }
+    }
+
+    async fn open_datagram_transport(
+        &self,
+        connector: &dyn RemoteConnector,
+        sess: &Session,
+        resolver: ThreadSafeDNSResolver,
+        is_udp: bool,
+    ) -> io::Result<AnyStream> {
+        if self.opts.tls.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "datagram transport must provide its own TLS layer",
+            ));
+        }
+        let transport = self.opts.transport.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "missing VLESS datagram transport",
+            )
+        })?;
+        let remote_ip = resolver
+            .resolve(&self.opts.server, true)
+            .await
+            .map_err(io::Error::other)?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("failed to resolve VLESS server {}", self.opts.server),
+                )
+            })?;
+        let remote_addr = std::net::SocketAddr::new(remote_ip, self.opts.port);
+        let destination = crate::session::SocksAddr::Domain(
+            self.opts.server.clone(),
+            self.opts.port,
+        );
+        let datagram = connector
+            .connect_datagram(
+                resolver.clone(),
+                None,
+                destination.clone(),
+                sess.iface.as_ref(),
+                #[cfg(target_os = "linux")]
+                sess.so_mark,
+            )
+            .await?;
+        let additional_streams = self
+            .open_additional_streams(connector, sess, resolver.clone())
+            .await?;
+        let additional_datagrams = self
+            .open_additional_datagrams(connector, sess, resolver.clone())
+            .await?;
+        let stream = transport
+            .proxy_datagram_with_additional_mixed(
+                datagram,
+                destination,
+                remote_addr,
+                additional_streams,
+                additional_datagrams,
+            )
+            .await?;
+        let stream = if let Some(encryption) = self.opts.encryption.as_ref() {
+            encryption.handshake(stream).await?
+        } else {
+            stream
+        };
+        self.wrap_vless_stream(stream, sess, is_udp, None)
+    }
+
+    async fn open_additional_datagrams(
+        &self,
+        connector: &dyn RemoteConnector,
+        sess: &Session,
+        resolver: ThreadSafeDNSResolver,
+    ) -> io::Result<
+        Vec<(
+            super::AnyOutboundDatagram,
+            crate::session::SocksAddr,
+            std::net::SocketAddr,
+        )>,
+    > {
+        let count = self
+            .opts
+            .transport
+            .as_ref()
+            .map(|transport| transport.additional_datagrams())
+            .unwrap_or_default();
+        if self.opts.additional_datagrams.len() != count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "VLESS transport requires {count} additional datagrams, but {} \
+                     were configured",
+                    self.opts.additional_datagrams.len()
+                ),
+            ));
+        }
+        let mut additional = Vec::with_capacity(count);
+        for options in &self.opts.additional_datagrams {
+            let remote_ip = resolver
+                .resolve(&options.server, true)
+                .await
+                .map_err(io::Error::other)?
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!(
+                            "failed to resolve VLESS download server {}",
+                            options.server
+                        ),
+                    )
+                })?;
+            let remote_addr = std::net::SocketAddr::new(remote_ip, options.port);
+            let destination = crate::session::SocksAddr::Domain(
+                options.server.clone(),
+                options.port,
+            );
+            let datagram = connector
+                .connect_datagram(
+                    resolver.clone(),
+                    None,
+                    destination.clone(),
+                    sess.iface.as_ref(),
+                    #[cfg(target_os = "linux")]
+                    sess.so_mark,
+                )
+                .await?;
+            additional.push((datagram, destination, remote_addr));
+        }
+        Ok(additional)
+    }
+
+    async fn open_additional_streams(
+        &self,
+        connector: &dyn RemoteConnector,
+        sess: &Session,
+        resolver: ThreadSafeDNSResolver,
+    ) -> io::Result<Vec<AnyStream>> {
+        let count = self
+            .opts
+            .transport
+            .as_ref()
+            .map(|transport| transport.additional_streams())
+            .unwrap_or_default();
+        if !self.opts.additional_streams.is_empty()
+            && self.opts.additional_streams.len() != count
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "VLESS transport requires {count} additional streams, but {} \
+                     were configured",
+                    self.opts.additional_streams.len()
+                ),
+            ));
+        }
+        let mut streams = Vec::with_capacity(count);
+        for index in 0..count {
+            let configured = self.opts.additional_streams.get(index);
+            let server = configured
+                .map(|options| options.server.as_str())
+                .unwrap_or(self.opts.server.as_str());
+            let port = configured
+                .map(|options| options.port)
+                .unwrap_or(self.opts.port);
+            let stream = connector
+                .connect_stream(
+                    resolver.clone(),
+                    server,
+                    port,
+                    sess.iface.as_ref(),
+                    #[cfg(target_os = "linux")]
+                    sess.so_mark,
+                )
+                .await?;
+            let tls = configured
+                .and_then(|options| options.tls.as_ref())
+                .or(self.opts.tls.as_ref());
+            streams.push(if let Some(tls) = tls {
+                tls.proxy_stream(stream).await?
+            } else {
+                stream
+            });
+        }
+        Ok(streams)
     }
 }
 
@@ -171,9 +412,22 @@ impl OutboundHandler for Handler {
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
     ) -> io::Result<BoxedChainedStream> {
+        if self
+            .opts
+            .transport
+            .as_ref()
+            .is_some_and(|transport| transport.uses_datagram())
+        {
+            let s = self
+                .open_datagram_transport(connector, sess, resolver, false)
+                .await?;
+            let chained = ChainedStreamWrapper::new(s);
+            chained.append_to_chain(self.name()).await;
+            return Ok(Box::new(chained));
+        }
         let stream = connector
             .connect_stream(
-                resolver,
+                resolver.clone(),
                 self.opts.server.as_str(),
                 self.opts.port,
                 sess.iface.as_ref(),
@@ -181,8 +435,21 @@ impl OutboundHandler for Handler {
                 sess.so_mark,
             )
             .await?;
-
-        let s = self.inner_proxy_stream(stream, sess, false).await?;
+        let additional = self
+            .open_additional_streams(connector, sess, resolver.clone())
+            .await?;
+        let additional_datagrams = self
+            .open_additional_datagrams(connector, sess, resolver.clone())
+            .await?;
+        let s = self
+            .inner_proxy_stream_with_additional(
+                stream,
+                additional,
+                additional_datagrams,
+                sess,
+                false,
+            )
+            .await?;
         let chained = ChainedStreamWrapper::new(s);
         chained.append_to_chain(self.name()).await;
         Ok(Box::new(chained))
@@ -194,23 +461,59 @@ impl OutboundHandler for Handler {
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
     ) -> io::Result<BoxedChainedDatagram> {
-        let stream = connector
-            .connect_stream(
-                resolver,
-                self.opts.server.as_str(),
-                self.opts.port,
-                sess.iface.as_ref(),
-                #[cfg(target_os = "linux")]
-                sess.so_mark,
+        let stream = if self
+            .opts
+            .transport
+            .as_ref()
+            .is_some_and(|transport| transport.uses_datagram())
+        {
+            self.open_datagram_transport(connector, sess, resolver, true)
+                .await?
+        } else {
+            let stream = connector
+                .connect_stream(
+                    resolver.clone(),
+                    self.opts.server.as_str(),
+                    self.opts.port,
+                    sess.iface.as_ref(),
+                    #[cfg(target_os = "linux")]
+                    sess.so_mark,
+                )
+                .await?;
+            let additional = self
+                .open_additional_streams(connector, sess, resolver.clone())
+                .await?;
+            let additional_datagrams = self
+                .open_additional_datagrams(connector, sess, resolver.clone())
+                .await?;
+            self.inner_proxy_stream_with_additional(
+                stream,
+                additional,
+                additional_datagrams,
+                sess,
+                true,
             )
-            .await?;
-
-        let stream = self.inner_proxy_stream(stream, sess, true).await?;
-        let d = OutboundDatagramVless::new(stream, sess.destination.clone());
-
-        let chained = ChainedDatagramWrapper::new(d);
-        chained.append_to_chain(self.name()).await;
-        Ok(Box::new(chained))
+            .await?
+        };
+        if self.opts.xudp {
+            let datagram = super::xudp::OutboundDatagramXudp::new(
+                stream,
+                sess.destination.clone(),
+                sess.source,
+            );
+            let chained = ChainedDatagramWrapper::new(datagram);
+            chained.append_to_chain(self.name()).await;
+            Ok(Box::new(chained))
+        } else {
+            let datagram = OutboundDatagramVless::new(
+                stream,
+                sess.destination.clone(),
+                self.opts.packet_addr,
+            );
+            let chained = ChainedDatagramWrapper::new(datagram);
+            chained.append_to_chain(self.name()).await;
+            Ok(Box::new(chained))
+        }
     }
 
     fn try_as_plain_handler(&self) -> Option<&dyn PlainProxyAPIResponse> {
@@ -384,8 +687,13 @@ mod tests {
             port: 8443,
             uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".into(),
             udp: true,
+            packet_addr: false,
+            xudp: false,
+            encryption: None,
             tls: tls_client(None),
             transport: Some(Box::new(ws_client)),
+            additional_streams: Vec::new(),
+            additional_datagrams: Vec::new(),
             flow: None,
         };
         let handler = Arc::new(Handler::new(opts));

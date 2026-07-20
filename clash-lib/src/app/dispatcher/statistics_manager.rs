@@ -58,6 +58,8 @@ pub struct TrackerInfo {
     pub proxy_chain_holder: ProxyChain,
     #[serde(skip)]
     pub session_holder: Session,
+    #[serde(skip)]
+    pub is_proxy: bool,
 
     /// Per-user byte counters, separate from `upload_total`/`download_total`.
     /// Only incremented when `session_holder.inbound_user` is set.
@@ -88,6 +90,12 @@ pub struct Manager {
     download_blip: AtomicU64,
     upload_total: AtomicU64,
     download_total: AtomicU64,
+    proxy_upload_temp: AtomicU64,
+    proxy_download_temp: AtomicU64,
+    proxy_upload_blip: AtomicU64,
+    proxy_download_blip: AtomicU64,
+    proxy_upload_total: AtomicU64,
+    proxy_download_total: AtomicU64,
     /// Bytes accumulated from **closed** connections, keyed by inbound_user.
     /// Drained (and reset) by [`Manager::drain_user_stats`].
     user_period_stats: Arc<Mutex<HashMap<String, UserTraffic>>>,
@@ -104,6 +112,12 @@ impl Manager {
             download_blip: AtomicU64::new(0),
             upload_total: AtomicU64::new(0),
             download_total: AtomicU64::new(0),
+            proxy_upload_temp: AtomicU64::new(0),
+            proxy_download_temp: AtomicU64::new(0),
+            proxy_upload_blip: AtomicU64::new(0),
+            proxy_download_blip: AtomicU64::new(0),
+            proxy_upload_total: AtomicU64::new(0),
+            proxy_download_total: AtomicU64::new(0),
             user_period_stats: Arc::new(Mutex::new(HashMap::new())),
         });
         let c = v.clone();
@@ -114,9 +128,11 @@ impl Manager {
     }
 
     pub async fn track(&self, item: Tracked, close_notify: Sender<()>) {
+        let event = Self::tracker_snapshot(&item.tracker_info()).await;
         let mut connections = self.connections.lock().await;
-
         connections.insert(item.id(), (item, close_notify));
+        drop(connections);
+        crate::app::events::emit("request", event);
     }
 
     /// Untrack a connection.
@@ -205,15 +221,14 @@ impl Manager {
         result
     }
 
-    pub async fn close(&self, id: uuid::Uuid) {
-        let connections = self.connections.clone();
-
-        tokio::spawn(async move {
-            let mut connections = connections.lock().await;
-            if let Some((_, close_notify)) = connections.remove(&id) {
-                let _ = close_notify.send(());
-            }
-        });
+    pub async fn close(&self, id: uuid::Uuid) -> bool {
+        let mut connections = self.connections.lock().await;
+        if let Some((_, close_notify)) = connections.remove(&id) {
+            let _ = close_notify.send(());
+            true
+        } else {
+            false
+        }
     }
 
     pub async fn close_all(&self) {
@@ -225,58 +240,84 @@ impl Manager {
         }
     }
 
-    pub fn push_uploaded(&self, n: usize) {
+    pub fn push_uploaded(&self, n: usize, is_proxy: bool) {
         self.upload_temp
             .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
         self.upload_total
             .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        if is_proxy {
+            self.proxy_upload_temp
+                .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+            self.proxy_upload_total
+                .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
-    pub fn push_downloaded(&self, n: usize) {
+    pub fn push_downloaded(&self, n: usize, is_proxy: bool) {
         self.download_temp
             .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
         self.download_total
             .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        if is_proxy {
+            self.proxy_download_temp
+                .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+            self.proxy_download_total
+                .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
-    pub fn now(&self) -> (u64, u64) {
-        (
-            self.upload_blip.load(std::sync::atomic::Ordering::Relaxed),
-            self.download_blip
-                .load(std::sync::atomic::Ordering::Relaxed),
-        )
+    pub fn now(&self, only_proxy: bool) -> (u64, u64) {
+        if only_proxy {
+            (
+                self.proxy_upload_blip.load(Ordering::Relaxed),
+                self.proxy_download_blip.load(Ordering::Relaxed),
+            )
+        } else {
+            (
+                self.upload_blip.load(Ordering::Relaxed),
+                self.download_blip.load(Ordering::Relaxed),
+            )
+        }
     }
 
-    pub async fn snapshot(&self) -> Snapshot {
+    pub async fn snapshot(&self, only_proxy: bool) -> Snapshot {
         let mut connections = vec![];
         let conns = self.connections.lock().await;
         for v in conns.values() {
-            let t = v.0.tracker_info();
-            let chain = t.proxy_chain_holder.0.read().await;
-            connections.push(TrackerInfo {
-                uuid: t.uuid,
-                upload_total: AtomicU64::new(t.upload_total.load(Ordering::Acquire)),
-                download_total: AtomicU64::new(
-                    t.download_total.load(Ordering::Acquire),
-                ),
-                start_time: t.start_time,
-                proxy_chain: chain.clone(),
-                rule: t.rule.clone(),
-                rule_payload: t.rule_payload.clone(),
-                session: t.session_holder.as_map(),
-                ..Default::default()
-            });
+            connections.push(Self::tracker_snapshot(&v.0.tracker_info()).await);
         }
 
         Snapshot {
-            download_total: self
-                .download_total
-                .load(std::sync::atomic::Ordering::Relaxed),
-            upload_total: self
-                .upload_total
-                .load(std::sync::atomic::Ordering::Relaxed),
+            download_total: if only_proxy {
+                self.proxy_download_total.load(Ordering::Relaxed)
+            } else {
+                self.download_total.load(Ordering::Relaxed)
+            },
+            upload_total: if only_proxy {
+                self.proxy_upload_total.load(Ordering::Relaxed)
+            } else {
+                self.upload_total.load(Ordering::Relaxed)
+            },
             connections,
             memory: self.memory_usage(),
+        }
+    }
+
+    async fn tracker_snapshot(tracker: &Arc<TrackerInfo>) -> TrackerInfo {
+        TrackerInfo {
+            uuid: tracker.uuid,
+            upload_total: AtomicU64::new(
+                tracker.upload_total.load(Ordering::Acquire),
+            ),
+            download_total: AtomicU64::new(
+                tracker.download_total.load(Ordering::Acquire),
+            ),
+            start_time: tracker.start_time,
+            proxy_chain: tracker.proxy_chain_holder.snapshot().await,
+            rule: tracker.rule.clone(),
+            rule_payload: tracker.rule_payload.clone(),
+            session: tracker.session_holder.as_map(),
+            ..Default::default()
         }
     }
 
@@ -288,6 +329,12 @@ impl Manager {
         self.download_temp.store(0, Ordering::Relaxed);
         self.download_blip.store(0, Ordering::Relaxed);
         self.download_total.store(0, Ordering::Relaxed);
+        self.proxy_upload_temp.store(0, Ordering::Relaxed);
+        self.proxy_upload_blip.store(0, Ordering::Relaxed);
+        self.proxy_upload_total.store(0, Ordering::Relaxed);
+        self.proxy_download_temp.store(0, Ordering::Relaxed);
+        self.proxy_download_blip.store(0, Ordering::Relaxed);
+        self.proxy_download_total.store(0, Ordering::Relaxed);
     }
 
     pub fn memory_usage(&self) -> usize {
@@ -321,6 +368,16 @@ impl Manager {
                 Ordering::Relaxed,
             );
             self.download_temp.store(0, Ordering::Relaxed);
+            self.proxy_upload_blip.store(
+                self.proxy_upload_temp.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+            self.proxy_upload_temp.store(0, Ordering::Relaxed);
+            self.proxy_download_blip.store(
+                self.proxy_download_temp.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+            self.proxy_download_temp.store(0, Ordering::Relaxed);
         }
     }
 }
@@ -390,5 +447,21 @@ mod tests {
             u.download, 280,
             "download should be sum of both connections"
         );
+    }
+
+    #[tokio::test]
+    async fn proxy_totals_exclude_direct_connections() {
+        let mgr = Manager::new();
+        mgr.push_uploaded(100, false);
+        mgr.push_downloaded(200, false);
+        mgr.push_uploaded(30, true);
+        mgr.push_downloaded(40, true);
+
+        let all = mgr.snapshot(false).await;
+        let proxy = mgr.snapshot(true).await;
+        assert_eq!(all.upload_total, 130);
+        assert_eq!(all.download_total, 240);
+        assert_eq!(proxy.upload_total, 30);
+        assert_eq!(proxy.download_total, 40);
     }
 }

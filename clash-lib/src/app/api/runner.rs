@@ -167,6 +167,7 @@ impl Runner for ApiRunner {
                         dns_resolver.clone(),
                         dns_listen_addr,
                         dns_enabled,
+                        outbound_manager.clone(),
                     ),
                 )
                 .nest("/rules", handlers::rule::routes(router.clone()))

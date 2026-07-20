@@ -16,7 +16,7 @@ impl TryFrom<V2RayOBFSOption> for V2rayWsClient {
         if opt.mode != "websocket" {
             return Err(io::Error::other("v2ray plugin does not support this mode"));
         }
-        Self::try_new(
+        Self::try_new_with_tls(
             opt.host,
             opt.port,
             opt.path,
@@ -24,6 +24,10 @@ impl TryFrom<V2RayOBFSOption> for V2rayWsClient {
             opt.tls,
             opt.skip_cert_verify,
             opt.mux,
+            opt.fingerprint,
+            opt.ech,
+            opt.certificate.as_deref(),
+            opt.private_key.as_deref(),
         )
     }
 }
@@ -31,11 +35,39 @@ impl TryFrom<V2RayOBFSOption> for V2rayWsClient {
 pub struct V2rayWsClient {
     pub tls_client: Option<Box<dyn Transport>>,
     pub ws_client: transport::WsClient,
+    mux: bool,
 }
 
 // TODO: temporarily untested
 impl V2rayWsClient {
+    // Retained for embedders using the original v2ray-plugin constructor.
+    #[allow(dead_code)]
     pub fn try_new(
+        host: String,
+        port: u16,
+        path: String,
+        headers: HashMap<String, String>,
+        tls: bool,
+        skip_cert_verify: bool,
+        mux: bool,
+    ) -> std::io::Result<Self> {
+        Self::try_new_with_tls(
+            host,
+            port,
+            path,
+            headers,
+            tls,
+            skip_cert_verify,
+            mux,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_new_with_tls(
         host: String,
         port: u16,
         path: String,
@@ -43,19 +75,27 @@ impl V2rayWsClient {
         tls: bool,
         skip_cert_verify: bool,
         mux: bool,
+        fingerprint: Option<String>,
+        ech: Option<transport::TlsEchOptions>,
+        certificate: Option<&str>,
+        private_key: Option<&str>,
     ) -> std::io::Result<Self> {
-        if mux {
-            return Err(io::Error::other("v2ray plugin does not support mux"));
-        }
+        let tls_sni = headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("host"))
+            .map(|(_, value)| value.clone())
+            .unwrap_or_else(|| host.clone());
 
         let tls_client = if tls {
-            Some(Box::new(TlsClient::new(
+            Some(Box::new(TlsClient::new_with_ech(
                 skip_cert_verify,
-                host.clone(),
+                tls_sni,
                 Some(vec!["http/1.1".to_owned()]),
                 None,
-                None,
-                None,
+                fingerprint,
+                ech,
+                certificate,
+                private_key,
             )?) as _)
         } else {
             None
@@ -81,6 +121,7 @@ impl V2rayWsClient {
         Ok(Self {
             tls_client,
             ws_client,
+            mux,
         })
     }
 
@@ -94,7 +135,12 @@ impl V2rayWsClient {
             s
         };
 
-        self.ws_client.proxy_stream(s).await
+        let stream = self.ws_client.proxy_stream(s).await?;
+        Ok(if self.mux {
+            super::mux::wrap(stream)
+        } else {
+            stream
+        })
     }
 }
 

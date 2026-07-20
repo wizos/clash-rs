@@ -5,32 +5,45 @@ use std::{
     task::{Context, Poll},
 };
 
+use async_trait::async_trait;
 use bytes::{BufMut, BytesMut};
 use futures::ready;
 use tokio::io::{AsyncRead, AsyncWrite, BufStream, ReadBuf};
 
 use crate::{
     common::{errors::map_io_error, utils},
-    proxy::AnyStream,
+    proxy::{AnyStream, transport::Transport},
 };
 
 pub struct HttpConfig {
     pub method: String,
     pub host: String,
     pub path: Vec<String>,
-    pub headers: HashMap<String, String>,
+    pub headers: HashMap<String, Vec<String>>,
 }
 
 impl HttpConfig {
-    pub fn proxy_stream(&self, stream: AnyStream) -> io::Result<AnyStream> {
-        let idx = utils::rand_range(0..self.path.len());
-        let path = self.path[idx].clone();
+    fn wrap_stream(&self, stream: AnyStream) -> io::Result<AnyStream> {
+        let path = if self.path.is_empty() {
+            "/".to_owned()
+        } else {
+            let idx = utils::rand_range(0..self.path.len());
+            self.path[idx].clone()
+        };
         Ok(Box::new(HttpStream::new(
             stream,
+            self.method.clone(),
             self.host.clone(),
             path,
             self.headers.clone(),
         )))
+    }
+}
+
+#[async_trait]
+impl Transport for HttpConfig {
+    async fn proxy_stream(&self, stream: AnyStream) -> io::Result<AnyStream> {
+        self.wrap_stream(stream)
     }
 }
 
@@ -48,9 +61,10 @@ impl HttpConfig {
 /// struct, a `Poll::Pending` return never discards already-received bytes.
 pub struct HttpStream {
     bufio: BufStream<AnyStream>,
+    method: String,
     host: String,
     path: String,
-    headers: HashMap<String, String>,
+    headers: HashMap<String, Vec<String>>,
     /// Before `header_consumed`: accumulates incoming bytes while we search
     /// for the end of the HTTP response header.
     /// After `header_consumed`: holds any body bytes that arrived together
@@ -70,12 +84,14 @@ pub struct HttpStream {
 impl HttpStream {
     pub fn new(
         stream: AnyStream,
+        method: String,
         host: String,
         path: String,
-        headers: HashMap<String, String>,
+        headers: HashMap<String, Vec<String>>,
     ) -> Self {
         Self {
             bufio: BufStream::new(stream),
+            method,
             host,
             path,
             headers,
@@ -91,10 +107,14 @@ impl HttpStream {
 
 /// Drain `this.write_buf[this.write_pos..]` into the inner buffered stream,
 /// advancing `this.write_pos` after each partial write.
-fn drain_write_buf(this: &mut HttpStream, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+fn drain_write_buf(
+    this: &mut HttpStream,
+    cx: &mut Context<'_>,
+) -> Poll<io::Result<()>> {
     while this.write_pos < this.write_buf.len() {
         let n = ready!(
-            Pin::new(&mut this.bufio).poll_write(cx, &this.write_buf[this.write_pos..])
+            Pin::new(&mut this.bufio)
+                .poll_write(cx, &this.write_buf[this.write_pos..])
         )?;
         if n == 0 {
             return Poll::Ready(Err(io::Error::from(io::ErrorKind::WriteZero)));
@@ -143,7 +163,9 @@ impl AsyncRead for HttpStream {
                 ready!(pin.as_mut().poll_read(cx, &mut rb))?;
                 let filled = rb.filled();
                 if filled.is_empty() {
-                    return Poll::Ready(Err(io::Error::from(io::ErrorKind::UnexpectedEof)));
+                    return Poll::Ready(Err(io::Error::from(
+                        io::ErrorKind::UnexpectedEof,
+                    )));
                 }
                 this.buf.extend_from_slice(filled);
             }
@@ -192,14 +214,36 @@ impl AsyncWrite for HttpStream {
         this.write_buf.clear();
         if !this.header_sent {
             this.header_sent = true;
-            let req_line = format!("GET {} HTTP/1.1\r\n", this.path);
+            let method = if this.method.is_empty() {
+                "GET"
+            } else {
+                this.method.as_str()
+            };
+            let req_line = format!("{method} {} HTTP/1.1\r\n", this.path);
             this.write_buf.put_slice(req_line.as_bytes());
-            let host_line = format!("Host: {}\r\n", this.host);
+            let host = this
+                .headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("host"))
+                .and_then(|(_, values)| {
+                    (!values.is_empty()).then(|| {
+                        let index = utils::rand_range(0..values.len());
+                        values[index].as_str()
+                    })
+                })
+                .unwrap_or(&this.host);
+            let host_line = format!("Host: {host}\r\n");
             this.write_buf.put_slice(host_line.as_bytes());
-            for (k, v) in this.headers.iter() {
-                let header_line = format!("{}: {}\r\n", k, v);
+            for (name, values) in this.headers.iter() {
+                if name.eq_ignore_ascii_case("host") || values.is_empty() {
+                    continue;
+                }
+                let index = utils::rand_range(0..values.len());
+                let header_line = format!("{name}: {}\r\n", values[index]);
                 this.write_buf.put_slice(header_line.as_bytes());
             }
+            let content_length = format!("Content-Length: {}\r\n\r\n", buf.len());
+            this.write_buf.put_slice(content_length.as_bytes());
         }
         this.write_buf.put_slice(buf);
         this.write_pos = 0;
@@ -211,17 +255,74 @@ impl AsyncWrite for HttpStream {
         Poll::Ready(Ok(committed))
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         ready!(drain_write_buf(this, cx))?;
         this.write_committed = 0;
         Pin::new(&mut this.bufio).poll_flush(cx)
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         ready!(drain_write_buf(this, cx))?;
         this.write_committed = 0;
         Pin::new(&mut this.bufio).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::*;
+
+    fn config() -> HttpConfig {
+        HttpConfig {
+            method: "POST".to_owned(),
+            host: "origin.example".to_owned(),
+            path: vec!["/tunnel".to_owned()],
+            headers: HashMap::from([
+                ("Host".to_owned(), vec!["front.example".to_owned()]),
+                ("X-Test".to_owned(), vec!["yes".to_owned()]),
+            ]),
+        }
+    }
+
+    #[tokio::test]
+    async fn writes_mihomo_http_first_request() {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let mut stream = config().wrap_stream(Box::new(client)).unwrap();
+        stream.write_all(b"hello").await.unwrap();
+        stream.flush().await.unwrap();
+
+        let expected = b"POST /tunnel HTTP/1.1\r\nHost: front.example\r\nX-Test: yes\r\nContent-Length: 5\r\n\r\nhello";
+        let mut received = vec![0; expected.len()];
+        server.read_exact(&mut received).await.unwrap();
+        assert_eq!(received, expected);
+    }
+
+    #[tokio::test]
+    async fn strips_fragmented_http_response_header() {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let mut stream = config().wrap_stream(Box::new(client)).unwrap();
+
+        tokio::spawn(async move {
+            server
+                .write_all(b"HTTP/1.1 200 OK\r\nX-Test:")
+                .await
+                .unwrap();
+            tokio::task::yield_now().await;
+            server.write_all(b" yes\r\n\r\nresponse").await.unwrap();
+        });
+
+        let mut response = [0; 8];
+        stream.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"response");
     }
 }

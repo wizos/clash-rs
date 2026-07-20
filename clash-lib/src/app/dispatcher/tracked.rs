@@ -11,6 +11,7 @@ use tracing::debug;
 
 use crate::{
     app::router::RuleMatcher,
+    config::internal::proxy::PROXY_DIRECT,
     proxy::{ProxyStream, datagram::UdpPacket},
     session::Session,
 };
@@ -127,6 +128,11 @@ impl TrackedStream {
     ) -> Self {
         let uuid = uuid::Uuid::new_v4();
         let chain = inner.chain().clone();
+        let is_proxy = chain
+            .snapshot()
+            .await
+            .first()
+            .is_some_and(|name| name != PROXY_DIRECT);
         let (tx, rx) = tokio::sync::oneshot::channel();
         let s = Self {
             inner,
@@ -142,6 +148,7 @@ impl TrackedStream {
                     .unwrap_or_default(),
                 rule_payload: rule.map(|x| x.payload()).unwrap_or_default(),
                 proxy_chain_holder: chain.clone(),
+                is_proxy,
                 ..Default::default()
             }),
             close_notify: rx,
@@ -211,7 +218,8 @@ impl ReadTracker {
     }
 
     fn push_downloaded(&self, download: usize) {
-        self.manager.push_downloaded(download);
+        self.manager
+            .push_downloaded(download, self.tracker.is_proxy);
         self.tracker
             .download_total
             .fetch_add(download as u64, std::sync::atomic::Ordering::Release);
@@ -235,7 +243,7 @@ impl WriteTracker {
     }
 
     fn push_uploaded(&self, upload: usize) {
-        self.manager.push_uploaded(upload);
+        self.manager.push_uploaded(upload, self.tracker.is_proxy);
         self.tracker
             .upload_total
             .fetch_add(upload as u64, std::sync::atomic::Ordering::Release);
@@ -276,7 +284,8 @@ impl AsyncRead for TrackedStream {
 
         let v = Pin::new(self.inner.as_mut()).poll_read(cx, buf);
         let download = buf.filled().len();
-        self.manager.push_downloaded(download);
+        self.manager
+            .push_downloaded(download, self.tracker.is_proxy);
         self.tracker
             .download_total
             .fetch_add(download as u64, std::sync::atomic::Ordering::Release);
@@ -311,7 +320,7 @@ impl AsyncWrite for TrackedStream {
             Poll::Ready(Ok(n)) => n,
             _ => return v,
         };
-        self.manager.push_uploaded(upload);
+        self.manager.push_uploaded(upload, self.tracker.is_proxy);
         self.tracker
             .upload_total
             .fetch_add(upload as u64, std::sync::atomic::Ordering::Release);
@@ -461,6 +470,11 @@ impl TrackedDatagram {
     ) -> Self {
         let uuid = uuid::Uuid::new_v4();
         let chain = inner.chain().clone();
+        let is_proxy = chain
+            .snapshot()
+            .await
+            .first()
+            .is_some_and(|name| name != PROXY_DIRECT);
         let (tx, rx) = tokio::sync::oneshot::channel();
         let s = Self {
             inner,
@@ -476,6 +490,7 @@ impl TrackedDatagram {
                     .unwrap_or_default(),
                 rule_payload: rule.map(|x| x.payload()).unwrap_or_default(),
                 proxy_chain_holder: chain.clone(),
+                is_proxy,
                 ..Default::default()
             }),
             close_notify: rx,
@@ -520,7 +535,7 @@ impl Stream for TrackedDatagram {
         let r = Pin::new(self.inner.as_mut()).poll_next(cx);
         if let Poll::Ready(Some(ref pkt)) = r {
             let n = pkt.data.len();
-            self.manager.push_downloaded(n);
+            self.manager.push_downloaded(n, self.tracker.is_proxy);
             self.tracker
                 .download_total
                 .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
@@ -568,7 +583,7 @@ impl Sink<UdpPacket> for TrackedDatagram {
         }
 
         let upload = item.data.len();
-        self.manager.push_uploaded(upload);
+        self.manager.push_uploaded(upload, self.tracker.is_proxy);
         self.tracker
             .upload_total
             .fetch_add(upload as u64, std::sync::atomic::Ordering::Relaxed);
@@ -612,5 +627,46 @@ impl Sink<UdpPacket> for TrackedDatagram {
         }
 
         Pin::new(self.inner.as_mut()).poll_close(cx)
+    }
+}
+
+#[cfg(test)]
+mod event_tests {
+    use super::{BoxedChainedStream, ChainedStreamWrapper, Manager, TrackedStream};
+    use crate::session::Session;
+
+    #[tokio::test]
+    async fn emits_request_at_registration_before_a_short_connection_closes() {
+        let mut events = crate::app::events::subscribe();
+        let (stream, _peer) = tokio::io::duplex(64);
+        let stream: BoxedChainedStream = Box::new(ChainedStreamWrapper::new(stream));
+        let tracked =
+            TrackedStream::new(stream, Manager::new(), Session::default(), None)
+                .await;
+
+        let expected_id = tracked.id().to_string();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let event: serde_json::Value =
+                    serde_json::from_str(&events.recv().await.unwrap()).unwrap();
+                if event["type"] == "request" && event["data"]["id"] == expected_id {
+                    assert!(event["data"]["metadata"]["sourcePort"].is_string());
+                    assert!(
+                        event["data"]["metadata"]["destinationPort"].is_string()
+                    );
+                    assert!(event["data"]["metadata"]["inboundPort"].is_string());
+                    assert!(event["data"]["metadata"]["sourceGeoIP"].is_array());
+                    assert!(
+                        event["data"]["metadata"]["destinationGeoIP"].is_array()
+                    );
+                    assert!(
+                        event["data"]["metadata"]["destinationIPASN"].is_string()
+                    );
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("request event was not emitted at registration");
     }
 }

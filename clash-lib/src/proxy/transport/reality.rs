@@ -23,11 +23,23 @@ fn init_roots() -> Arc<RootCertStore> {
 pub struct Client(Arc<ClientInner>);
 
 impl Client {
+    // Retained for callers that do not need explicit ALPN configuration.
+    #[allow(dead_code)]
     pub fn new(sni: String, public_key: [u8; 32], short_id: Vec<u8>) -> Self {
+        Self::new_with_alpn(sni, public_key, short_id, None)
+    }
+
+    pub fn new_with_alpn(
+        sni: String,
+        public_key: [u8; 32],
+        short_id: Vec<u8>,
+        alpn: Option<Vec<String>>,
+    ) -> Self {
         Self(Arc::new(ClientInner {
             sni,
             public_key,
             short_id,
+            alpn: alpn.unwrap_or_default(),
             roots: OnceLock::new(),
         }))
     }
@@ -54,10 +66,15 @@ impl Client {
                 io::Error::new(io::ErrorKind::InvalidInput, e.to_string())
             })?;
 
-        let tls_config = ClientConfig::builder()
+        let mut tls_config = ClientConfig::builder()
             .with_root_certificates(self.roots.get_or_init(init_roots).clone())
             .with_reality(reality)
             .with_no_client_auth();
+        tls_config.alpn_protocols = self
+            .alpn
+            .iter()
+            .map(|protocol| protocol.as_bytes().to_vec())
+            .collect();
 
         let sni: ServerName<'_> =
             ServerName::try_from(self.sni.clone()).map_err(|e| {
@@ -144,6 +161,7 @@ pub struct ClientInner {
     sni: String,
     public_key: [u8; 32],
     short_id: Vec<u8>,
+    alpn: Vec<String>,
     // cached for performance
     roots: OnceLock<Arc<RootCertStore>>,
 }
@@ -167,6 +185,7 @@ mod tests {
         assert_eq!(c.sni, "example.com");
         assert_eq!(c.public_key, [1u8; 32]);
         assert_eq!(c.short_id, vec![0xab, 0xcd]);
+        assert!(c.alpn.is_empty());
     }
 
     // short_id > 8 bytes → RealityConfig::new() fails → InvalidInput

@@ -6,6 +6,7 @@ use bytes::{Buf, Bytes};
 use clash_lib::{Config, Options};
 use http_body_util::BodyExt;
 use std::{path::PathBuf, time::Duration};
+use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest};
 
 mod common;
 
@@ -59,6 +60,59 @@ async fn get_allow_lan(port: u16) -> bool {
     json.get("allow-lan")
         .and_then(|v| v.as_bool())
         .expect("'allow-lan' not found or not a bool")
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn unavailable_proxy_provider_does_not_prevent_group_startup() {
+    let api_port = alloc_ports(1);
+    let cwd = tempfile::tempdir().unwrap();
+    let config = format!(
+        r#"
+external-controller: 127.0.0.1:{api_port}
+proxy-groups:
+  - name: Proxy
+    type: select
+    proxies: [DIRECT]
+    use: [unavailable]
+proxy-providers:
+  unavailable:
+    type: file
+    path: missing-provider.yaml
+    interval: 3600
+    health-check:
+      enable: false
+      interval: 600
+      url: http://www.gstatic.com/generate_204
+rules:
+  - MATCH,Proxy
+"#
+    );
+    let _clash = ClashInstance::start(
+        Options {
+            config: Config::Str(config),
+            cwd: Some(cwd.path().to_string_lossy().to_string()),
+            rt: None,
+            log_file: None,
+            config_path: None,
+        },
+        vec![api_port],
+    )
+    .expect("an unavailable provider should remain registered");
+
+    let url = format!("http://127.0.0.1:{api_port}/proxies");
+    let request = hyper::Request::builder()
+        .uri(&url)
+        .body(http_body_util::Empty::<Bytes>::new())
+        .unwrap();
+    let response = send_http_request(url.parse().unwrap(), request)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_reader(
+        response.collect().await.unwrap().aggregate().reader(),
+    )
+    .unwrap();
+
+    assert_eq!(json["proxies"]["Proxy"]["type"], "Selector");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -132,6 +186,20 @@ async fn test_config_reload_via_payload() {
         "expected allow-lan=true before reload"
     );
 
+    // Keep a long-lived runtime event connection open while reloading. The
+    // old API must close it so the replacement controller is not blocked by a
+    // WebSocket that is designed to live for the lifetime of the core.
+    let mut events_request = format!("ws://127.0.0.1:{port_base}/ws/events")
+        .into_client_request()
+        .expect("Failed to build events websocket request");
+    events_request.headers_mut().insert(
+        hyper::header::AUTHORIZATION,
+        "Bearer clash-rs".parse().unwrap(),
+    );
+    let (_events, _) = connect_async(events_request)
+        .await
+        .expect("Failed to connect runtime events websocket");
+
     // Reload with a new payload that flips allow-lan to false
     let new_payload = format!(
         r#"
@@ -167,9 +235,11 @@ proxies:
         .expect("Failed to send PUT /configs request");
     assert_eq!(
         res.status(),
-        http::StatusCode::NO_CONTENT,
-        "PUT /configs should return 204 No Content"
+        http::StatusCode::ACCEPTED,
+        "PUT /configs should queue the reload with 202 Accepted"
     );
+    let accepted = parse_json(res).await;
+    assert_eq!(accepted["reload-attempt"], 1);
 
     // Wait briefly for the reload to propagate
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -299,7 +369,7 @@ async fn test_config_reload_via_empty_path_uses_stored_config_path() {
     let configs_url = format!("http://127.0.0.1:{}/configs", port_base);
 
     // PUT /configs with empty path should reload from the stored config_path
-    // and return 204 No Content (not 400).
+    // and queue the reload (not return 400).
     let req = hyper::Request::builder()
         .uri(&configs_url)
         .header(hyper::header::AUTHORIZATION, "Bearer clash-rs")
@@ -313,7 +383,7 @@ async fn test_config_reload_via_empty_path_uses_stored_config_path() {
         .expect("Failed to send PUT /configs request");
     assert_eq!(
         res.status(),
-        http::StatusCode::NO_CONTENT,
+        http::StatusCode::ACCEPTED,
         "PUT /configs with empty path and a stored config_path should succeed"
     );
 }
@@ -631,7 +701,7 @@ proxies:
     let res = send_http_request::<String>(configs_url.parse().unwrap(), req)
         .await
         .expect("Failed to send PUT /configs");
-    assert_eq!(res.status(), http::StatusCode::NO_CONTENT);
+    assert_eq!(res.status(), http::StatusCode::ACCEPTED);
 
     // Wait briefly for the reload to propagate
     tokio::time::sleep(Duration::from_millis(1000)).await;

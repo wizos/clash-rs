@@ -1,6 +1,7 @@
 pub mod api;
 pub mod dispatcher;
 pub mod dns;
+pub mod events;
 pub mod inbound;
 pub mod logging;
 pub mod net;
@@ -8,3 +9,4 @@ pub mod outbound;
 pub mod profile;
 pub mod remote_content_manager;
 pub mod router;
+pub mod sniffer;

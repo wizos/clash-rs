@@ -154,13 +154,20 @@ impl AsyncWrite for Http2Stream {
     ) -> std::task::Poll<Result<usize, std::io::Error>> {
         self.send.reserve_capacity(buf.len());
         std::task::Poll::Ready(match ready!(self.send.poll_capacity(cx)) {
-            Some(Ok(to_write)) => self
-                .send
-                .send_data(Bytes::from(buf[..to_write].to_owned()), false)
-                .map_or_else(
-                    |e| Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, e)),
-                    |_| Ok(to_write),
-                ),
+            Some(Ok(capacity)) => {
+                let to_write = capacity.min(buf.len());
+                self.send
+                    .send_data(Bytes::from(buf[..to_write].to_owned()), false)
+                    .map_or_else(
+                        |e| {
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::BrokenPipe,
+                                e,
+                            ))
+                        },
+                        |_| Ok(to_write),
+                    )
+            }
             _ => Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "broken pipe",
@@ -177,20 +184,10 @@ impl AsyncWrite for Http2Stream {
 
     fn poll_shutdown(
         mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
+        _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), std::io::Error>> {
-        self.send.reserve_capacity(0);
-        std::task::Poll::Ready(ready!(self.send.poll_capacity(cx)).map_or(
-            Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "broken pipe",
-            )),
-            |_| {
-                self.send.send_data(Bytes::new(), true).map_or_else(
-                    |e| Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, e)),
-                    |_| Ok(()),
-                )
-            },
+        std::task::Poll::Ready(self.send.send_data(Bytes::new(), true).map_err(
+            |error| std::io::Error::new(std::io::ErrorKind::BrokenPipe, error),
         ))
     }
 }

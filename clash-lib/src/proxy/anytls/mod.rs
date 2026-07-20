@@ -1,12 +1,12 @@
 use erased_serde::Serialize as ErasedSerialize;
-use std::{collections::HashMap, io, sync::Arc};
+use std::{collections::HashMap, io, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use bytes::{BufMut, BytesMut};
-use sha2::{Digest, Sha256};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+#[cfg(test)]
+use tokio::io::AsyncWrite;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tracing::debug;
 
 use crate::{
     app::{
@@ -17,7 +17,7 @@ use crate::{
         dns::ThreadSafeDNSResolver,
     },
     impl_default_connector,
-    proxy::transport::Transport,
+    proxy::{transport::Transport, uot},
     session::Session,
 };
 
@@ -26,9 +26,9 @@ use super::{
     OutboundHandler, OutboundType, PlainProxyAPIResponse,
     utils::{GLOBAL_DIRECT_CONNECTOR, RemoteConnector},
 };
-mod datagram;
-use datagram::OutboundDatagramAnytls;
+mod client_session;
 pub mod inbound;
+mod padding;
 
 // AnyTLS frame command bytes (see the anytls protocol spec).
 const CMD_WASTE: u8 = 0;
@@ -39,14 +39,11 @@ const CMD_SETTINGS: u8 = 4;
 const CMD_ALERT: u8 = 5;
 const CMD_UPDATE_PADDING_SCHEME: u8 = 6;
 const CMD_SERVER_SETTINGS: u8 = 10;
-/// Stream ID used for our single-stream multiplexing.
+const CMD_SYN_ACK: u8 = 7;
+const CMD_HEART_REQUEST: u8 = 8;
+const CMD_HEART_RESPONSE: u8 = 9;
+#[cfg(test)]
 const STREAM_ID: u32 = 1;
-
-/// Padding scheme advertised by this client: no padding on any packet.
-///
-/// The MD5 is pre-computed over the literal string "stop=0" (no trailing
-/// newline), matching how anytls-go serialises a single-entry scheme.
-const CLIENT_PADDING_SCHEME_MD5: &str = "47edb1f4ed8a99480bf416d178311f10";
 
 pub struct HandlerOptions {
     pub name: String,
@@ -57,12 +54,16 @@ pub struct HandlerOptions {
     pub udp: bool,
     pub tls: Option<Box<dyn Transport>>,
     pub transport: Option<Box<dyn Transport>>,
+    pub idle_session_check_interval: Duration,
+    pub idle_session_timeout: Duration,
+    pub min_idle_session: usize,
 }
 
 pub struct Handler {
     opts: HandlerOptions,
 
     connector: tokio::sync::RwLock<Option<Arc<dyn RemoteConnector>>>,
+    session_pool: Arc<client_session::Pool>,
 }
 
 impl_default_connector!(Handler);
@@ -76,22 +77,30 @@ impl std::fmt::Debug for Handler {
 }
 
 impl Handler {
-    const DUPLEX_BUFFER_SIZE: usize = 64 * 1024;
-    const RELAY_BUFFER_SIZE: usize = 16 * 1024;
-    const UDP_OVER_TCP_V2_MAGIC_ADDR: &str = "sp.v2.udp-over-tcp.arpa";
-
     pub fn new(opts: HandlerOptions) -> Self {
+        let session_pool = client_session::Pool::new(
+            opts.idle_session_check_interval,
+            opts.idle_session_timeout,
+            opts.min_idle_session,
+        );
         Self {
             opts,
             connector: Default::default(),
+            session_pool,
         }
     }
 
+    #[cfg(test)]
     async fn inner_proxy_stream(
         &self,
         s: AnyStream,
         sess: &Session,
     ) -> io::Result<AnyStream> {
+        let s = self.prepare_transport(s).await?;
+        self.open_anytls_stream(s, sess).await
+    }
+
+    async fn prepare_transport(&self, s: AnyStream) -> io::Result<AnyStream> {
         let s = if let Some(tls_client) = self.opts.tls.as_ref() {
             tls_client.proxy_stream(s).await?
         } else {
@@ -104,159 +113,71 @@ impl Handler {
             s
         };
 
-        self.open_anytls_stream(s, sess).await
+        Ok(s)
     }
 
+    async fn acquire_stream(
+        &self,
+        connector: &dyn RemoteConnector,
+        sess: &Session,
+        resolver: ThreadSafeDNSResolver,
+    ) -> io::Result<AnyStream> {
+        loop {
+            if let Some(idle) = self.session_pool.take().await {
+                match client_session::open_existing(
+                    idle,
+                    &self.opts.name,
+                    &sess.destination,
+                    self.session_pool.clone(),
+                )
+                .await
+                {
+                    Ok(stream) => return Ok(stream),
+                    Err(error) => {
+                        debug!(
+                            "anytls {} discarded an unusable idle session: {}",
+                            self.opts.name, error
+                        );
+                    }
+                }
+            }
+
+            let raw = connector
+                .connect_stream(
+                    resolver.clone(),
+                    self.opts.server.as_str(),
+                    self.opts.port,
+                    sess.iface.as_ref(),
+                    #[cfg(target_os = "linux")]
+                    sess.so_mark,
+                )
+                .await?;
+            let stream = self.prepare_transport(raw).await?;
+            return client_session::open_new(
+                stream,
+                &self.opts.password,
+                &self.opts.name,
+                &sess.destination,
+                Some(self.session_pool.clone()),
+            )
+            .await;
+        }
+    }
+
+    #[cfg(test)]
     async fn open_anytls_stream(
         &self,
-        mut stream: AnyStream,
+        stream: AnyStream,
         sess: &Session,
     ) -> io::Result<AnyStream> {
-        // Build the ENTIRE handshake in one buffer so it is sent as a single
-        // TLS application-data record.  sing-box reads the first record as a
-        // complete auth packet; splitting the write across multiple records
-        // causes it to get EOF while reading the padding-length field.
-        let password = Sha256::digest(self.opts.password.as_bytes());
-        let settings = format!(
-            "v=2\nclient=clash-rs/{}\npadding-md5={}",
-            env!("CLASH_VERSION_OVERRIDE"),
-            CLIENT_PADDING_SCHEME_MD5
-        );
-        let mut addr_buf = BytesMut::new();
-        sess.destination.write_buf(&mut addr_buf);
-
-        let mut handshake = BytesMut::new();
-        handshake.put_slice(password.as_slice()); // sha256(password) – 32 B
-        handshake.put_u16(0); // padding0 length = 0 (no padding)
-        handshake.extend_from_slice(&Self::encode_frame(
-            CMD_SETTINGS,
-            0,
-            settings.as_bytes(),
-        )?);
-        handshake.extend_from_slice(&Self::encode_frame(CMD_SYN, STREAM_ID, &[])?);
-        handshake
-            .extend_from_slice(&Self::encode_frame(CMD_PSH, STREAM_ID, &addr_buf)?);
-
-        stream.write_all(&handshake).await?;
-        stream.flush().await?;
-
-        let (mut remote_read, mut remote_write) = tokio::io::split(stream);
-        let (app_stream, relay_stream) = tokio::io::duplex(Self::DUPLEX_BUFFER_SIZE);
-        let (mut relay_read, mut relay_write) = tokio::io::split(relay_stream);
-        let name_a = self.opts.name.clone();
-        let name_b = self.opts.name.clone();
-
-        let cancel = CancellationToken::new();
-        let cancel_a = cancel.clone();
-        let cancel_b = cancel;
-
-        tokio::spawn(async move {
-            let mut buf = vec![0u8; Self::RELAY_BUFFER_SIZE];
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = cancel_a.cancelled() => break,
-                    result = relay_read.read(&mut buf) => {
-                        let n = match result {
-                            Ok(n) => n,
-                            Err(err) => {
-                                debug!("anytls {} relay read error: {}", name_a, err);
-                                cancel_a.cancel();
-                                break;
-                            }
-                        };
-
-                        if n == 0 {
-                            if let Err(err) =
-                                Self::write_frame(&mut remote_write, CMD_FIN, STREAM_ID, &[])
-                                    .await
-                            {
-                                debug!("anytls {} send FIN failed: {}", name_a, err);
-                            }
-                            if let Err(err) = remote_write.flush().await {
-                                debug!("anytls {} flush FIN failed: {}", name_a, err);
-                            }
-                            cancel_a.cancel();
-                            break;
-                        }
-
-                        if let Err(err) = Self::write_frame(
-                            &mut remote_write,
-                            CMD_PSH,
-                            STREAM_ID,
-                            &buf[..n],
-                        )
-                        .await
-                        {
-                            debug!("anytls {} send PSH failed: {}", name_a, err);
-                            cancel_a.cancel();
-                            break;
-                        }
-                    }
-                }
-            }
-        });
-
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = cancel_b.cancelled() => break,
-                    result = Self::read_frame(&mut remote_read) => {
-                        let (cmd, stream_id, data) = match result {
-                            Ok(frame) => frame,
-                            Err(err) => {
-                                debug!("anytls {} read frame failed: {}", name_b, err);
-                                cancel_b.cancel();
-                                break;
-                            }
-                        };
-
-                        if stream_id != STREAM_ID {
-                            debug!(
-                                "anytls {} ignores frame for unexpected stream id {}",
-                                name_b, stream_id
-                            );
-                            continue;
-                        }
-
-                        match cmd {
-                            CMD_PSH => {
-                                if let Err(err) = relay_write.write_all(&data).await {
-                                    debug!("anytls {} relay write failed: {}", name_b, err);
-                                    cancel_b.cancel();
-                                    break;
-                                }
-                            }
-                            CMD_FIN => {
-                                if let Err(err) = relay_write.shutdown().await {
-                                    debug!(
-                                        "anytls {} relay shutdown failed: {}",
-                                        name_b, err
-                                    );
-                                }
-                                cancel_b.cancel();
-                                break;
-                            }
-                            CMD_ALERT => {
-                                let msg = String::from_utf8_lossy(&data);
-                                warn!("anytls {} alert: {}", name_b, msg);
-                                let _ = relay_write.shutdown().await;
-                                cancel_b.cancel();
-                                break;
-                            }
-                            // v2: server settings / padding-scheme update — read
-                            // and discard; we use a fixed no-padding scheme.
-                            CMD_SERVER_SETTINGS | CMD_UPDATE_PADDING_SCHEME => {}
-                            CMD_WASTE | CMD_SYN | CMD_SETTINGS => {}
-                            _ => {}
-                        }
-                    }
-                }
-            }
-        });
-
-        Ok(Box::new(app_stream))
+        client_session::open_new(
+            stream,
+            &self.opts.password,
+            &self.opts.name,
+            &sess.destination,
+            None,
+        )
+        .await
     }
 
     /// Encodes a frame into a `BytesMut` without any I/O.
@@ -279,6 +200,7 @@ impl Handler {
         Ok(buf)
     }
 
+    #[cfg(test)]
     async fn write_frame(
         writer: &mut (impl AsyncWrite + Unpin),
         command: u8,
@@ -313,12 +235,11 @@ impl Handler {
         }
         Ok((command, stream_id, data))
     }
+}
 
-    fn encode_uot_connect_request(dst_addr: &crate::session::SocksAddr) -> BytesMut {
-        let mut request = BytesMut::new();
-        request.put_u8(1); // isConnect = true (UoT v2 connect mode)
-        dst_addr.write_buf(&mut request);
-        request
+impl Drop for Handler {
+    fn drop(&mut self) {
+        self.session_pool.close();
     }
 }
 
@@ -394,18 +315,7 @@ impl OutboundHandler for Handler {
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
     ) -> io::Result<BoxedChainedStream> {
-        let stream = connector
-            .connect_stream(
-                resolver,
-                self.opts.server.as_str(),
-                self.opts.port,
-                sess.iface.as_ref(),
-                #[cfg(target_os = "linux")]
-                sess.so_mark,
-            )
-            .await?;
-
-        let s = self.inner_proxy_stream(stream, sess).await?;
+        let s = self.acquire_stream(connector, sess, resolver).await?;
         let chained = ChainedStreamWrapper::new(s);
         chained.append_to_chain(self.name()).await;
         Ok(Box::new(chained))
@@ -417,33 +327,22 @@ impl OutboundHandler for Handler {
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
     ) -> io::Result<BoxedChainedDatagram> {
-        let stream = connector
-            .connect_stream(
-                resolver,
-                self.opts.server.as_str(),
-                self.opts.port,
-                sess.iface.as_ref(),
-                #[cfg(target_os = "linux")]
-                sess.so_mark,
-            )
-            .await?;
-
         // AnyTLS UDP follows udp-over-tcp v2:
         // 1) open stream to sp.v2.udp-over-tcp.arpa
         // 2) send connect request (isConnect + real udp destination)
         // 3) exchange length-prefixed udp payloads.
         let mut proxy_sess = sess.clone();
-        proxy_sess.destination = crate::session::SocksAddr::try_from((
-            Self::UDP_OVER_TCP_V2_MAGIC_ADDR.to_owned(),
-            0,
-        ))?;
+        proxy_sess.destination =
+            crate::session::SocksAddr::try_from((uot::MAGIC_ADDRESS.to_owned(), 0))?;
 
-        let mut stream = self.inner_proxy_stream(stream, &proxy_sess).await?;
-        let request = Self::encode_uot_connect_request(&sess.destination);
+        let mut stream = self
+            .acquire_stream(connector, &proxy_sess, resolver)
+            .await?;
+        let request = uot::encode_connect_request(&sess.destination);
         stream.write_all(&request).await?;
         stream.flush().await?;
 
-        let datagram = OutboundDatagramAnytls::new(stream, sess.destination.clone());
+        let datagram = uot::ConnectedDatagram::new(stream, sess.destination.clone());
         let chained = crate::app::dispatcher::ChainedDatagramWrapper::new(datagram);
         chained.append_to_chain(self.name()).await;
         Ok(Box::new(chained))
@@ -562,26 +461,33 @@ mod tests {
                 None
             },
             transport: None,
+            idle_session_check_interval: Duration::ZERO,
+            idle_session_timeout: Duration::ZERO,
+            min_idle_session: 0,
         })
     }
 
     async fn read_frame_raw(
         r: &mut (impl AsyncReadExt + Unpin),
     ) -> (u8, u32, Vec<u8>) {
-        let cmd = r.read_u8().await.unwrap();
-        let sid = r.read_u32().await.unwrap();
-        let len = r.read_u16().await.unwrap() as usize;
-        let mut data = vec![0u8; len];
-        if len > 0 {
-            r.read_exact(&mut data).await.unwrap();
+        loop {
+            let cmd = r.read_u8().await.unwrap();
+            let sid = r.read_u32().await.unwrap();
+            let len = r.read_u16().await.unwrap() as usize;
+            let mut data = vec![0u8; len];
+            if len > 0 {
+                r.read_exact(&mut data).await.unwrap();
+            }
+            if cmd != CMD_WASTE {
+                return (cmd, sid, data);
+            }
         }
-        (cmd, sid, data)
     }
 
     #[test]
     fn test_encode_uot_connect_request() {
         let dst = SocksAddr::try_from(("1.1.1.1".to_owned(), 53)).unwrap();
-        let req = Handler::encode_uot_connect_request(&dst);
+        let req = uot::encode_connect_request(&dst);
 
         assert_eq!(req[0], 1);
         let parsed = SocksAddr::try_from(&req[1..]).unwrap();
@@ -591,7 +497,7 @@ mod tests {
     #[test]
     fn test_encode_uot_connect_request_domain() {
         let dst = SocksAddr::try_from(("example.com".to_owned(), 80)).unwrap();
-        let req = Handler::encode_uot_connect_request(&dst);
+        let req = uot::encode_connect_request(&dst);
 
         assert_eq!(req[0], 1);
         let parsed = SocksAddr::try_from(&req[1..]).unwrap();
@@ -689,8 +595,15 @@ mod tests {
         server.read_exact(&mut hash_buf).await.unwrap();
         assert_eq!(&hash_buf, Sha256::digest(b"secret").as_slice());
 
-        // Reserved u16(0)
-        assert_eq!(server.read_u16().await.unwrap(), 0);
+        // Packet-zero authentication padding from Mihomo's default scheme.
+        let padding_length = server.read_u16().await.unwrap() as usize;
+        assert_eq!(padding_length, 30);
+        let mut authentication_padding = vec![0u8; padding_length];
+        server
+            .read_exact(&mut authentication_padding)
+            .await
+            .unwrap();
+        assert!(authentication_padding.iter().all(|byte| *byte == 0));
 
         // SETTINGS frame (stream_id = 0) — v2 protocol with padding-md5
         let (cmd, sid, data) = read_frame_raw(&mut server).await;
@@ -703,7 +616,7 @@ mod tests {
             "settings must include padding-md5"
         );
         assert!(
-            settings_str.contains(CLIENT_PADDING_SCHEME_MD5),
+            settings_str.contains(padding::PaddingFactory::default_factory().md5()),
             "padding-md5 must match our scheme"
         );
 
@@ -736,7 +649,12 @@ mod tests {
         // Drain the initial handshake bytes from server side.
         let mut hash_buf = [0u8; 32];
         server.read_exact(&mut hash_buf).await.unwrap();
-        server.read_u16().await.unwrap();
+        let padding_length = server.read_u16().await.unwrap() as usize;
+        let mut authentication_padding = vec![0u8; padding_length];
+        server
+            .read_exact(&mut authentication_padding)
+            .await
+            .unwrap();
         read_frame_raw(&mut server).await; // SETTINGS
         read_frame_raw(&mut server).await; // SYN
         read_frame_raw(&mut server).await; // PSH (dest)
@@ -778,7 +696,7 @@ mod tests {
     async fn test_datagram_write_length_prefix() {
         let target = SocksAddr::try_from(("1.1.1.1".to_owned(), 53)).unwrap();
         let (client, mut server) = duplex(4096);
-        let mut dg = datagram::OutboundDatagramAnytls::new(Box::new(client), target);
+        let mut dg = uot::ConnectedDatagram::new(Box::new(client), target);
 
         let payload = b"hello world";
         dg.send(UdpPacket {
@@ -808,8 +726,7 @@ mod tests {
         wire.extend_from_slice(payload);
 
         let (client, mut server) = duplex(4096);
-        let mut dg =
-            datagram::OutboundDatagramAnytls::new(Box::new(client), target.clone());
+        let mut dg = uot::ConnectedDatagram::new(Box::new(client), target.clone());
 
         server.write_all(&wire).await.unwrap();
 
@@ -822,7 +739,7 @@ mod tests {
     async fn test_datagram_oversized_packet_rejected() {
         let target = SocksAddr::try_from(("1.1.1.1".to_owned(), 53)).unwrap();
         let (client, _server) = duplex(4096);
-        let mut dg = datagram::OutboundDatagramAnytls::new(Box::new(client), target);
+        let mut dg = uot::ConnectedDatagram::new(Box::new(client), target);
 
         let oversized = vec![0u8; u16::MAX as usize + 1];
         let result = dg
@@ -892,6 +809,9 @@ mod tests {
             udp: true,
             tls: Some(Box::new(tls)),
             transport: None,
+            idle_session_check_interval: Duration::ZERO,
+            idle_session_timeout: Duration::ZERO,
+            min_idle_session: 0,
         };
         let handler = Arc::new(Handler::new(opts));
         handler

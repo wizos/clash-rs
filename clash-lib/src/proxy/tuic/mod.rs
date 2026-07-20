@@ -4,8 +4,12 @@ mod handle_task;
 pub(crate) mod types;
 
 use crate::{
-    common::tls::{DefaultTlsVerifier, build_tls_client_config},
-    proxy::{tuic::types::SocketAdderTrans, utils::new_udp_socket},
+    common::tls::DefaultTlsVerifier,
+    proxy::{
+        transport::{TlsEchOptions, build_rustls_client_config_with_optional_ech},
+        tuic::types::SocketAdderTrans,
+        utils::new_udp_socket,
+    },
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -91,6 +95,7 @@ pub struct HandlerOptions {
     pub tls_cert: Option<String>,
     /// File path or inline PEM client private key for mTLS.
     pub tls_key: Option<String>,
+    pub ech: Option<TlsEchOptions>,
 }
 
 pub struct Handler {
@@ -208,11 +213,14 @@ impl Handler {
     ) -> Result<TuicEndpoint> {
         let verifier =
             Arc::new(DefaultTlsVerifier::new(None, opts.skip_cert_verify));
-        let mut crypto = build_tls_client_config(
+        let mut crypto = build_rustls_client_config_with_optional_ech(
             verifier,
             opts.tls_cert.as_deref(),
             opts.tls_key.as_deref(),
+            opts.ech.as_ref(),
+            opts.sni.as_deref().unwrap_or(&opts.server),
         )
+        .await
         .map_err(|e| anyhow::anyhow!("tuic TLS: {e}"))?;
         // TODO(error-handling) if alpn not match the following error will be
         // throw: aborted by peer: the cryptographic handshake failed: error
@@ -471,6 +479,7 @@ mod tests {
             gc_lifetime: Duration::from_millis(15000),
             send_window: 8 * 1024 * 1024 * 2,
             receive_window: VarInt::from_u64(8 * 1024 * 1024)?,
+            ech: None,
             tls_cert: None,
             tls_key: None,
         })
@@ -516,13 +525,7 @@ mod tests {
             typ: crate::session::Type::Socks5,
             source: "127.0.0.1:54321".parse()?,
             destination: format!("127.0.0.1:{target_port}").parse()?,
-            resolved_ip: None,
-            so_mark: None,
-            iface: None,
-            country: None,
-            asn: None,
-            traffic_stats: None,
-            inbound_user: None,
+            ..Default::default()
         };
 
         let mut stream = handler.connect_stream(&session, resolver).await?;
@@ -571,13 +574,7 @@ mod tests {
             typ: crate::session::Type::Socks5,
             source: "127.0.0.1:54321".parse()?,
             destination: format!("127.0.0.1:{target_port}").parse()?,
-            resolved_ip: None,
-            so_mark: None,
-            iface: None,
-            country: None,
-            asn: None,
-            traffic_stats: None,
-            inbound_user: None,
+            ..Default::default()
         };
 
         let result = handler.connect_stream(&session, resolver).await;
@@ -636,13 +633,7 @@ mod tests {
             typ: crate::session::Type::Socks5,
             source: "[::1]:54321".parse()?,
             destination: format!("[::1]:{target_port}").parse()?,
-            resolved_ip: None,
-            so_mark: None,
-            iface: None,
-            country: None,
-            asn: None,
-            traffic_stats: None,
-            inbound_user: None,
+            ..Default::default()
         };
 
         let mut stream = handler.connect_stream(&session, resolver).await?;
@@ -692,13 +683,7 @@ mod tests {
             typ: crate::session::Type::Socks5,
             source: "127.0.0.1:54321".parse()?,
             destination: format!("127.0.0.1:{target_port}").parse()?,
-            resolved_ip: None,
-            so_mark: None,
-            iface: None,
-            country: None,
-            asn: None,
-            traffic_stats: None,
-            inbound_user: None,
+            ..Default::default()
         };
 
         let mut stream = handler.connect_stream(&session, resolver).await?;

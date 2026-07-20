@@ -5,7 +5,6 @@ use erased_serde::Serialize;
 use tracing::debug;
 
 use crate::{
-    Error,
     app::remote_content_manager::{
         healthcheck::HealthCheck,
         providers::{Provider, ProviderType, ProviderVehicleType},
@@ -33,9 +32,7 @@ impl PlainProvider {
         let hc = Arc::new(hc);
 
         if proxies.is_empty() {
-            return Err(
-                Error::InvalidConfig(format!("{name}: proxies is empty")).into()
-            );
+            tracing::warn!("{name}: proxies is empty, creating empty proxy group");
         }
 
         if hc.auto() {

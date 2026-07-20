@@ -14,6 +14,7 @@ use crate::{
     },
 };
 use anyhow::anyhow;
+use hyper::Uri;
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -34,6 +35,7 @@ pub struct Config {
     pub experimental: Option<def::Experimental>,
     pub profile: Profile,
     pub rules: Vec<RuleType>,
+    pub sub_rules: HashMap<String, Vec<RuleType>>,
     pub rule_providers: HashMap<String, RuleProviderDef>,
     pub users: Vec<auth::User>,
     /// a list maintaining the order from the config file
@@ -47,14 +49,77 @@ pub struct Config {
 
 impl Config {
     pub fn validate(self) -> Result<Self, crate::Error> {
-        for r in self.rules.iter() {
-            if !self.proxies.contains_key(r.target())
-                && !self.proxy_groups.contains_key(r.target())
-            {
+        for r in &self.rules {
+            self.validate_rule_target(r)?;
+        }
+        for rules in self.sub_rules.values() {
+            for rule in rules {
+                self.validate_rule_target(rule)?;
+            }
+        }
+        for name in self.sub_rules.keys() {
+            self.validate_sub_rule_cycle(name, &mut Vec::new())?;
+        }
+        for group in self.proxy_groups.values() {
+            let OutboundProxy::ProxyGroup(group) = group else {
+                continue;
+            };
+
+            let has_proxies = group.proxies().is_some_and(|items| !items.is_empty());
+            let has_providers =
+                group.use_providers().is_some_and(|items| !items.is_empty());
+            if !has_proxies && !has_providers {
                 return Err(Error::InvalidConfig(format!(
-                    "proxy `{}` referenced in a rule was not found",
-                    r.target()
+                    "proxy group `{}` has no proxies or proxy providers",
+                    group.name()
                 )));
+            }
+
+            if let Some(proxies) = group.proxies() {
+                for proxy in proxies {
+                    if !self.proxies.contains_key(proxy)
+                        && !self.proxy_groups.contains_key(proxy)
+                    {
+                        return Err(Error::InvalidConfig(format!(
+                            "proxy `{proxy}` referenced by proxy group `{}` was \
+                             not found",
+                            group.name()
+                        )));
+                    }
+                }
+            }
+
+            if let Some(providers) = group.use_providers() {
+                for provider in providers {
+                    if !self.proxy_providers.contains_key(provider) {
+                        return Err(Error::InvalidConfig(format!(
+                            "proxy provider `{provider}` referenced by proxy group \
+                             `{}` was not found",
+                            group.name()
+                        )));
+                    }
+                }
+            }
+        }
+        for name in self.proxy_groups.keys() {
+            self.validate_proxy_group_cycle(name, &mut Vec::new())?;
+        }
+        for (name, provider) in &self.proxy_providers {
+            if let OutboundProxyProviderDef::Http(provider) = provider {
+                provider.url.parse::<Uri>().map_err(|error| {
+                    Error::InvalidConfig(format!(
+                        "invalid URL for proxy provider `{name}`: {error}"
+                    ))
+                })?;
+            }
+        }
+        for (name, provider) in &self.rule_providers {
+            if let RuleProviderDef::Http(provider) = provider {
+                provider.url.parse::<Uri>().map_err(|error| {
+                    Error::InvalidConfig(format!(
+                        "invalid URL for rule provider `{name}`: {error}"
+                    ))
+                })?;
             }
         }
         // Check for duplicate AnyTLS user passwords
@@ -78,6 +143,85 @@ impl Config {
         }
         Ok(self)
     }
+
+    fn validate_rule_target(&self, rule: &RuleType) -> Result<(), crate::Error> {
+        if let RuleType::RuleSet { rule_set, .. } = rule
+            && !self.rule_providers.contains_key(rule_set)
+        {
+            return Err(Error::InvalidConfig(format!(
+                "rule provider `{rule_set}` referenced in a rule was not found"
+            )));
+        }
+        if let RuleType::SubRule { sub_rule, .. } = rule {
+            if !self.sub_rules.contains_key(sub_rule) {
+                return Err(Error::InvalidConfig(format!(
+                    "sub-rule `{sub_rule}` referenced in a rule was not found"
+                )));
+            }
+            return Ok(());
+        }
+        if !self.proxies.contains_key(rule.target())
+            && !self.proxy_groups.contains_key(rule.target())
+        {
+            return Err(Error::InvalidConfig(format!(
+                "proxy `{}` referenced in a rule was not found",
+                rule.target()
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_sub_rule_cycle(
+        &self,
+        name: &str,
+        path: &mut Vec<String>,
+    ) -> Result<(), crate::Error> {
+        if path.iter().any(|item| item == name) {
+            path.push(name.to_string());
+            return Err(Error::InvalidConfig(format!(
+                "sub-rule circular reference: {}",
+                path.join(" -> ")
+            )));
+        }
+
+        path.push(name.to_string());
+        if let Some(rules) = self.sub_rules.get(name) {
+            for rule in rules {
+                if let RuleType::SubRule { sub_rule, .. } = rule {
+                    self.validate_sub_rule_cycle(sub_rule, path)?;
+                }
+            }
+        }
+        path.pop();
+        Ok(())
+    }
+
+    fn validate_proxy_group_cycle(
+        &self,
+        name: &str,
+        path: &mut Vec<String>,
+    ) -> Result<(), crate::Error> {
+        if path.iter().any(|item| item == name) {
+            path.push(name.to_string());
+            return Err(Error::InvalidConfig(format!(
+                "proxy group circular reference: {}",
+                path.join(" -> ")
+            )));
+        }
+
+        path.push(name.to_string());
+        if let Some(OutboundProxy::ProxyGroup(group)) = self.proxy_groups.get(name)
+            && let Some(proxies) = group.proxies()
+        {
+            for proxy in proxies {
+                if self.proxy_groups.contains_key(proxy) {
+                    self.validate_proxy_group_cycle(proxy, path)?;
+                }
+            }
+        }
+        path.pop();
+        Ok(())
+    }
 }
 
 pub struct General {
@@ -96,6 +240,11 @@ pub struct General {
 
     pub geosite: Option<String>,
     pub geosite_download_url: Option<String>,
+
+    pub unified_delay: bool,
+    pub tcp_concurrent: bool,
+    pub find_process_mode: crate::config::def::FindProcessMode,
+    pub sniffer: Option<crate::config::def::SnifferConfig>,
 }
 
 pub struct Profile {
@@ -117,6 +266,7 @@ pub struct TunConfig {
     pub so_mark: Option<u32>,
     pub route_table: u32,
     pub dns_hijack: bool,
+    pub auto_detect_interface: bool,
 }
 
 #[derive(Serialize, Clone, Debug, Copy, PartialEq, Hash, Eq)]
@@ -236,6 +386,141 @@ pub struct InlineRuleProvider {
     pub behavior: RuleSetBehavior,
     #[serde(alias = "payload")]
     pub inline_rules: Vec<String>,
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use crate::{Config as SourceConfig, config::internal::proxy::OutboundProxy};
+
+    fn parse_error(yaml: &str) -> String {
+        SourceConfig::Str(yaml.to_owned())
+            .try_parse()
+            .err()
+            .expect("configuration unexpectedly validated")
+            .to_string()
+    }
+
+    #[test]
+    fn rejects_missing_proxy_group_member() {
+        let error = parse_error(
+            r#"
+proxy-groups:
+  - name: broken
+    type: select
+    proxies: [missing]
+rules:
+  - MATCH,broken
+"#,
+        );
+        assert!(error.contains("missing"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn rejects_missing_proxy_provider_reference() {
+        let error = parse_error(
+            r#"
+proxy-groups:
+  - name: broken
+    type: select
+    use: [missing-provider]
+rules:
+  - MATCH,broken
+"#,
+        );
+        assert!(
+            error.contains("missing-provider"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn rejects_proxy_group_cycle() {
+        let error = parse_error(
+            r#"
+proxy-groups:
+  - name: group-a
+    type: select
+    proxies: [group-b]
+  - name: group-b
+    type: select
+    proxies: [group-a]
+rules:
+  - MATCH,group-a
+"#,
+        );
+        assert!(
+            error.contains("circular reference"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn rejects_missing_rule_provider_reference() {
+        let error = parse_error(
+            r#"
+rules:
+  - RULE-SET,missing-provider,DIRECT
+"#,
+        );
+        assert!(
+            error.contains("missing-provider"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn expands_mihomo_include_all_proxy_groups() {
+        let config = SourceConfig::Str(
+            r#"
+proxies:
+  - name: Hong Kong 01 🇭🇰
+    type: socks5
+    server: 127.0.0.1
+    port: 1080
+  - name: Tokyo 01 🇯🇵
+    type: socks5
+    server: 127.0.0.1
+    port: 1081
+proxy-groups:
+  - name: Hong Kong
+    type: select
+    include-all: true
+    filter: 🇭🇰
+rules:
+  - MATCH,Hong Kong
+"#
+            .to_owned(),
+        )
+        .try_parse()
+        .expect("include-all group should validate");
+
+        let OutboundProxy::ProxyGroup(group) = &config.proxy_groups["Hong Kong"]
+        else {
+            panic!("expected proxy group");
+        };
+        assert_eq!(group.proxies().unwrap(), &["Hong Kong 01 🇭🇰"]);
+    }
+
+    #[test]
+    fn geox_urls_enable_mihomo_default_database_paths() {
+        let config = SourceConfig::Str(
+            r#"
+geox-url:
+  mmdb: https://example.com/Country.mmdb
+  asn: https://example.com/ASN.mmdb
+  geosite: https://example.com/GEOSITE.dat
+rules:
+  - MATCH,DIRECT
+"#
+            .to_owned(),
+        )
+        .try_parse()
+        .unwrap();
+
+        assert_eq!(config.general.mmdb.as_deref(), Some("Country.mmdb"));
+        assert_eq!(config.general.asn_mmdb.as_deref(), Some("ASN.mmdb"));
+        assert_eq!(config.general.geosite.as_deref(), Some("GEOSITE.dat"));
+    }
 }
 
 #[cfg(test)]

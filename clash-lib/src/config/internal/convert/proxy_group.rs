@@ -7,11 +7,14 @@ use crate::{
 
 pub fn convert(
     before: Option<Vec<OutboundGroupProtocol>>,
+    all_proxies: &[String],
+    all_providers: &[String],
     proxy_names: &mut Vec<String>,
 ) -> Result<HashMap<String, OutboundProxy>, crate::Error> {
     before.unwrap_or_default().into_iter().try_fold(
         HashMap::<String, OutboundProxy>::new(),
-        |mut rv, group_protocol| {
+        |mut rv, mut group_protocol| {
+            group_protocol.expand_include_all(all_proxies, all_providers)?;
             let name = group_protocol.name().to_owned();
             if rv.contains_key(name.as_str()) {
                 return Err(Error::InvalidConfig(format!(

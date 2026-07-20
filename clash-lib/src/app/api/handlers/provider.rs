@@ -8,11 +8,12 @@ use std::{
 
 use axum::{
     Extension, Router,
+    body::Bytes,
     extract::{Path, Query, State},
     http::{Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -39,6 +40,7 @@ pub fn routes(outbound_manager: ThreadSafeOutboundManager) -> Router<Arc<AppStat
             "/{provider_name}",
             Router::new()
                 .route("/", get(get_provider).put(update_provider))
+                .route("/side-load", post(side_load_proxy_provider))
                 .route("/healthcheck", get(provider_healthcheck))
                 .nest(
                     "/{proxy_name}",
@@ -58,6 +60,23 @@ pub fn routes(outbound_manager: ThreadSafeOutboundManager) -> Router<Arc<AppStat
                 .with_state(state.clone()),
         )
         .with_state(state)
+}
+
+async fn side_load_proxy_provider(
+    Extension(provider): Extension<ArcProxyProvider>,
+    body: Bytes,
+) -> impl IntoResponse {
+    match provider.side_update(&body).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "side-load proxy provider {} failed: {error}",
+                provider.name()
+            ),
+        )
+            .into_response(),
+    }
 }
 
 async fn get_providers(State(state): State<ProviderState>) -> impl IntoResponse {
@@ -134,7 +153,9 @@ async fn update_provider(
 async fn provider_healthcheck(
     Extension(provider): Extension<ArcProxyProvider>,
 ) -> impl IntoResponse {
-    provider.healthcheck().await;
+    tokio::spawn(async move {
+        provider.healthcheck().await;
+    });
 
     (
         StatusCode::ACCEPTED,
@@ -197,8 +218,9 @@ async fn get_proxy_delay(
         .await;
     match result.first().unwrap() {
         Ok((actual, overall)) => {
+            let selected = outbound_manager.selected_delay(*actual, *overall);
             let mut r = HashMap::new();
-            r.insert("delay".to_owned(), actual.as_millis());
+            r.insert("delay".to_owned(), selected.as_millis());
             r.insert("overall".to_owned(), overall.as_millis());
             axum::response::Json(r).into_response()
         }
@@ -225,9 +247,32 @@ pub fn rule_routes(router: ArcRouter) -> Router<Arc<AppState>> {
             "/{provider_name}",
             get(get_rule_provider).put(update_rule_provider),
         )
+        .route("/{provider_name}/side-load", post(side_load_rule_provider))
         .route("/{provider_name}/rules", get(get_rule_provider_rules))
         .route("/{provider_name}/match", get(match_rule_provider))
         .with_state(state)
+}
+
+async fn side_load_rule_provider(
+    State(state): State<RuleProviderState>,
+    Path(RuleProviderNamePath { provider_name }): Path<RuleProviderNamePath>,
+    body: Bytes,
+) -> impl IntoResponse {
+    match state.router.get_rule_providers().get(&provider_name) {
+        Some(provider) => match provider.side_update(&body).await {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(error) => (
+                StatusCode::BAD_REQUEST,
+                format!("side-load rule provider {provider_name} failed: {error}"),
+            )
+                .into_response(),
+        },
+        None => (
+            StatusCode::NOT_FOUND,
+            format!("rule provider {provider_name} not found"),
+        )
+            .into_response(),
+    }
 }
 
 async fn get_rule_providers(
@@ -350,6 +395,7 @@ async fn match_rule_provider(
         country: None,
         traffic_stats: None,
         inbound_user: None,
+        ..Default::default()
     };
 
     axum::response::Json(MatchResponse {

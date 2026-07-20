@@ -10,12 +10,11 @@ use crate::{
         },
         dns::ThreadSafeDNSResolver,
     },
-    common::errors::map_io_error,
     config::internal::proxy::PROXY_DIRECT,
     proxy::{
         OutboundHandler,
         direct::datagram::OutboundDatagramImpl,
-        utils::{new_dual_stack_udp_socket, new_tcp_stream},
+        utils::{new_dual_stack_udp_socket, resolve_and_connect_tcp},
     },
     session::Session,
 };
@@ -27,7 +26,6 @@ use super::{
     utils::RemoteConnector,
 };
 use async_trait::async_trait;
-use futures::TryFutureExt;
 
 #[derive(Clone)]
 pub struct Handler {
@@ -69,14 +67,10 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
     ) -> std::io::Result<BoxedChainedStream> {
-        let remote_ip = resolver
-            .resolve(sess.destination.host().as_str(), false)
-            .map_err(map_io_error)
-            .await?
-            .ok_or_else(|| std::io::Error::other("no dns result"))?;
-
-        let s = new_tcp_stream(
-            (remote_ip, sess.destination.port()).into(),
+        let s = resolve_and_connect_tcp(
+            resolver,
+            sess.destination.host().as_str(),
+            sess.destination.port(),
             sess.iface.as_ref(),
             #[cfg(target_os = "linux")]
             sess.so_mark,

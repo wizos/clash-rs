@@ -425,31 +425,75 @@ pub struct Session {
     /// Set by the Shadowsocks inbound before dispatch; used for per-user
     /// traffic attribution.
     pub inbound_user: Option<String>,
+    /// Local port of the inbound listener which accepted this connection.
+    pub inbound_port: u16,
+    /// Mihomo-compatible inbound listener name (for example `DEFAULT-MIXED`).
+    pub inbound_name: String,
+    /// Owning operating-system user/application id, when it can be resolved.
+    pub uid: u32,
+    /// IP differentiated-services code point (the upper six bits of TOS/TC).
+    pub dscp: u8,
+    /// Resolved process/package name used by process rules and API metadata.
+    pub process: String,
+    /// Resolved process executable path, when the platform exposes it.
+    pub process_path: String,
+    /// Domain obtained from TLS/HTTP/QUIC protocol sniffing. Domain rules use
+    /// this in preference to the transport destination, matching Mihomo.
+    pub sniff_host: String,
 }
 
 impl Session {
+    /// Host used by domain-based routing rules. Mihomo exposes a sniffed host
+    /// to rules even when `override-destination` is disabled.
+    pub fn rule_host(&self) -> Option<&str> {
+        if self.sniff_host.is_empty() {
+            self.destination.domain()
+        } else {
+            Some(self.sniff_host.as_str())
+        }
+    }
+
     pub fn as_map(&self) -> HashMap<String, Box<dyn ESerialize + Send + Sync>> {
         let mut rv = HashMap::new();
         rv.insert("network".to_string(), Box::new(self.network) as _);
         rv.insert("type".to_string(), Box::new(self.typ) as _);
         rv.insert("sourceIP".to_string(), Box::new(self.source.ip()) as _);
-        rv.insert("sourcePort".to_string(), Box::new(self.source.port()) as _);
+        // Mihomo's tracker metadata contract exposes ports as decimal strings.
+        // FlClash's generated Metadata model follows that contract, so numeric
+        // JSON values here make every request event fail deserialization.
+        rv.insert(
+            "sourcePort".to_string(),
+            Box::new(self.source.port().to_string()) as _,
+        );
         rv.insert("destinationIP".to_string(), {
             let ip = self.resolved_ip.or(self.destination.ip());
-            let asn = self.asn.clone();
-
-            let rv = match (ip, asn) {
-                (Some(ip), Some(asn)) => format!("{ip}({asn})"),
-                (Some(ip), None) => ip.to_string(),
-                (None, _) => "".to_string(),
-            };
+            let rv = ip.map(|ip| ip.to_string()).unwrap_or_default();
             Box::new(rv) as _
         });
         rv.insert(
             "destinationPort".to_string(),
-            Box::new(self.destination.port()) as _,
+            Box::new(self.destination.port().to_string()) as _,
         );
         rv.insert("host".to_string(), Box::new(self.destination.host()) as _);
+        rv.insert(
+            "sourceGeoIP".to_string(),
+            Box::new(Vec::<String>::new()) as _,
+        );
+        rv.insert(
+            "destinationGeoIP".to_string(),
+            Box::new(self.country.clone().into_iter().collect::<Vec<_>>()) as _,
+        );
+        rv.insert("sourceIPASN".to_string(), Box::new(String::new()) as _);
+        rv.insert(
+            "destinationIPASN".to_string(),
+            Box::new(self.asn.clone().unwrap_or_default()) as _,
+        );
+        rv.insert(
+            "remoteDestination".to_string(),
+            Box::new(String::new()) as _,
+        );
+        rv.insert("specialProxy".to_string(), Box::new(String::new()) as _);
+        rv.insert("specialRules".to_string(), Box::new(String::new()) as _);
         rv.insert("asn".to_string(), Box::new(self.asn.clone()) as _);
         rv.insert("country".to_string(), Box::new(self.country.clone()) as _);
         rv.insert(
@@ -459,6 +503,25 @@ impl Session {
         if let Some(ref user) = self.inbound_user {
             rv.insert("inboundUser".to_string(), Box::new(user.clone()) as _);
         }
+        rv.insert(
+            "inboundPort".to_string(),
+            Box::new(self.inbound_port.to_string()) as _,
+        );
+        rv.insert(
+            "inboundName".to_string(),
+            Box::new(self.inbound_name.clone()) as _,
+        );
+        rv.insert("uid".to_string(), Box::new(self.uid) as _);
+        rv.insert("dscp".to_string(), Box::new(self.dscp) as _);
+        rv.insert("process".to_string(), Box::new(self.process.clone()) as _);
+        rv.insert(
+            "processPath".to_string(),
+            Box::new(self.process_path.clone()) as _,
+        );
+        rv.insert(
+            "sniffHost".to_string(),
+            Box::new(self.sniff_host.clone()) as _,
+        );
         rv
     }
 }
@@ -477,6 +540,13 @@ impl Default for Session {
             asn: None,
             traffic_stats: None,
             inbound_user: None,
+            inbound_port: 0,
+            inbound_name: String::new(),
+            uid: 0,
+            dscp: 0,
+            process: String::new(),
+            process_path: String::new(),
+            sniff_host: String::new(),
         }
     }
 }
@@ -508,6 +578,13 @@ impl Debug for Session {
             .field("iface", &self.iface)
             .field("country", &self.country)
             .field("asn", &self.asn)
+            .field("inbound_port", &self.inbound_port)
+            .field("inbound_name", &self.inbound_name)
+            .field("uid", &self.uid)
+            .field("dscp", &self.dscp)
+            .field("process", &self.process)
+            .field("process_path", &self.process_path)
+            .field("sniff_host", &self.sniff_host)
             .finish()
     }
 }
@@ -526,6 +603,13 @@ impl Clone for Session {
             asn: self.asn.clone(),
             traffic_stats: self.traffic_stats.clone(),
             inbound_user: self.inbound_user.clone(),
+            inbound_port: self.inbound_port,
+            inbound_name: self.inbound_name.clone(),
+            uid: self.uid,
+            dscp: self.dscp,
+            process: self.process.clone(),
+            process_path: self.process_path.clone(),
+            sniff_host: self.sniff_host.clone(),
         }
     }
 }

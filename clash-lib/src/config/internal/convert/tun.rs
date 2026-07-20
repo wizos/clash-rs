@@ -39,6 +39,7 @@ pub fn convert(
                 def::DnsHijack::Switch(b) => b,
                 def::DnsHijack::List(_) => true,
             },
+            auto_detect_interface: t.auto_detect_interface,
         }),
         None => Ok(config::TunConfig::default()),
     }

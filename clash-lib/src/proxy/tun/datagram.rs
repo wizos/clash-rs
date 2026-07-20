@@ -2,7 +2,7 @@ use crate::{
     app::{
         dispatcher::Dispatcher,
         dns::{ThreadSafeDNSResolver, exchange_with_resolver},
-        net::DEFAULT_OUTBOUND_INTERFACE,
+        net::outbound_interface_snapshot,
     },
     common::errors::new_io_error,
     proxy::datagram::UdpPacket,
@@ -39,11 +39,14 @@ pub(crate) async fn handle_inbound_datagram(
     // is to the tun
     let udp_stream = TunDatagram::new(l_tx, d_rx);
 
-    let default_outbound = DEFAULT_OUTBOUND_INTERFACE.read().await;
+    // Keep only an owned snapshot. Holding the global read guard for the
+    // lifetime of this UDP dispatcher deadlocks live reload, which needs the
+    // write side in `init_net_config()`.
+    let default_outbound = outbound_interface_snapshot().await;
     let sess = Session {
         network: Network::Udp,
         typ: Type::Tun,
-        iface: default_outbound.clone().inspect(|x| {
+        iface: default_outbound.inspect(|x| {
             debug!("selecting outbound interface: {:?} for tun UDP traffic", x);
         }),
         so_mark,
@@ -80,11 +83,18 @@ pub(crate) async fn handle_inbound_datagram(
             data,
             local_addr,
             remote_addr,
+            dscp,
         }) = lr.recv().await
         {
             if remote_addr.ip().is_multicast() {
                 continue;
             }
+            crate::flow_metadata::record_dscp(
+                Network::Udp,
+                local_addr,
+                remote_addr,
+                dscp,
+            );
             let pkt = UdpPacket {
                 data: data.data().into(),
                 src_addr: local_addr.into(),

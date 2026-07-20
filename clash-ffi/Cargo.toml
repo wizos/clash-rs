@@ -5,8 +5,30 @@ version = { workspace = true }
 edition = { workspace = true }
 
 [dependencies]
-clash-lib = { path = "../clash-lib", default-features = false, features = ["shadowsocks", "tuic", "ssh", "zero_copy"] }
+clash-lib = { path = "../clash-lib", default-features = false, features = [
+    "ring",
+    "masque",
+    "mieru",
+    "openvpn",
+    "shadowquic",
+    "shadowsocks",
+    "ssh",
+    "sudoku",
+    "tailscale",
+    "tun",
+    "tuic",
+    "utls",
+    "wireguard",
+    "zero_copy",
+] }
+tokio-util = "0.7"
+
+[target.'cfg(target_os = "android")'.dependencies]
+ndk-context = "0.1"
 
 [lib]
 name = "clashrs"
 crate-type = ["staticlib", "cdylib"]
+
+[dev-dependencies]
+hex = "0.4"

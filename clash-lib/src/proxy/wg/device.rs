@@ -60,7 +60,7 @@ enum SenderType {
 }
 
 pub struct DeviceManager {
-    addr: Ipv4Addr,
+    addr: Option<Ipv4Addr>,
     addr_v6: Option<Ipv6Addr>,
     resolver: ThreadSafeDNSResolver,
     dns_servers: Vec<SocketAddr>,
@@ -79,7 +79,7 @@ pub struct DeviceManager {
 
 impl DeviceManager {
     pub fn new(
-        addr: Ipv4Addr,
+        addr: Option<Ipv4Addr>,
         addr_v6: Option<Ipv6Addr>,
         resolver: ThreadSafeDNSResolver,
         dns_servers: Vec<SocketAddr>,
@@ -114,7 +114,25 @@ impl DeviceManager {
         }
     }
 
-    pub async fn new_tcp_socket(&self, remote: SocketAddr) -> SocketPair {
+    pub async fn new_tcp_socket(
+        &self,
+        remote: SocketAddr,
+    ) -> std::io::Result<SocketPair> {
+        match remote {
+            SocketAddr::V4(_) if self.addr.is_none() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AddrNotAvailable,
+                    "virtual IP stack has no IPv4 address",
+                ));
+            }
+            SocketAddr::V6(_) if self.addr_v6.is_none() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AddrNotAvailable,
+                    "virtual IP stack has no IPv6 address",
+                ));
+            }
+            _ => {}
+        }
         let socket = Self::new_client_socket();
         let read_pair = tokio::sync::mpsc::channel(1024);
         let write_pair = tokio::sync::mpsc::channel(1024);
@@ -122,8 +140,13 @@ impl DeviceManager {
         self.socket_notifier
             .send(Socket::Tcp(socket, remote, read_pair.0, write_pair.1))
             .await
-            .unwrap();
-        SocketPair::new(read_pair.1, write_pair.0)
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "virtual IP stack stopped",
+                )
+            })?;
+        Ok(SocketPair::new(read_pair.1, write_pair.0))
     }
 
     pub async fn new_udp_socket(&self) -> UdpPair {
@@ -257,7 +280,9 @@ impl DeviceManager {
 
         let mut iface = Interface::new(config, &mut device, Instant::now());
         iface.update_ip_addrs(|addrs| {
-            addrs.push(IpCidr::new(self.addr.into(), 32)).unwrap();
+            if let Some(addr) = self.addr {
+                addrs.push(IpCidr::new(addr.into(), 32)).unwrap();
+            }
 
             if let Some(addr_v6) = self.addr_v6 {
                 addrs.push(IpCidr::new(addr_v6.into(), 128)).unwrap();
@@ -291,7 +316,7 @@ impl DeviceManager {
                                 iface.context(),
                                 remote,
                                 (match remote {
-                                    SocketAddr::V4(_) => IpAddr::V4(self.addr),
+                                    SocketAddr::V4(_) => IpAddr::V4(self.addr.unwrap()),
                                     SocketAddr::V6(_) => IpAddr::V6(self.addr_v6.unwrap()),
                                 }, self.get_ephemeral_tcp_port().await),
                             )
@@ -515,7 +540,13 @@ impl DeviceManager {
 
                                                 if !socket.is_open() {
                                                     let local_addr: IpAddr = match ip {
-                                                        IpAddr::V4(_) => self.addr.into(),
+                                                        IpAddr::V4(_) => match self.addr {
+                                                            Some(addr) => addr.into(),
+                                                            None => {
+                                                                warn!("cannot send IPv4 packet: virtual stack has no IPv4 address");
+                                                                continue;
+                                                            }
+                                                        },
                                                         IpAddr::V6(_) => self.addr_v6.unwrap().into(),
                                                     };
                                                     socket

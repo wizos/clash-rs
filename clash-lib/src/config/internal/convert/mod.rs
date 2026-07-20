@@ -6,6 +6,7 @@ use tracing::warn;
 
 use crate::{
     Error,
+    app::sniffer::Sniffer,
     common::auth,
     config::{
         def,
@@ -39,6 +40,29 @@ impl TryFrom<def::Config> for config::Config {
 pub(super) fn convert(mut c: def::Config) -> Result<config::Config, crate::Error> {
     let mut proxy_names =
         vec![String::from(PROXY_DIRECT), String::from(PROXY_REJECT)];
+    let mut all_proxy_names = c
+        .proxy
+        .as_ref()
+        .map(|proxies| {
+            proxies
+                .iter()
+                .map(|proxy| proxy.name().to_owned())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    all_proxy_names.sort();
+    let proxy_providers = c
+        .proxy_provider
+        .take()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(name, mut provider)| {
+            provider.set_name(name.clone());
+            (name, provider)
+        })
+        .collect::<HashMap<_, _>>();
+    let mut all_provider_names = proxy_providers.keys().cloned().collect::<Vec<_>>();
+    all_provider_names.sort();
 
     if c.allow_lan.unwrap_or_default() && c.bind_address.is_localhost() {
         warn!(
@@ -51,6 +75,23 @@ pub(super) fn convert(mut c: def::Config) -> Result<config::Config, crate::Error
     {
         tun.so_mark = c.routing_mark;
     }
+    Sniffer::validate_config(c.sniffer.as_ref())?;
+    let rules = parse_rules(c.rule.take().unwrap_or_default())?;
+    let sub_rules = c
+        .sub_rules
+        .take()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(name, rules)| {
+            if name.trim().is_empty() {
+                return Err(Error::InvalidConfig(
+                    "sub-rule name is empty".to_string(),
+                ));
+            }
+            Ok((name, parse_rules(rules)?))
+        })
+        .collect::<Result<HashMap<_, _>, Error>>()?;
+
     config::Config {
         general: general::convert(&c)?,
         dns: (&c).try_into()?,
@@ -60,16 +101,8 @@ pub(super) fn convert(mut c: def::Config) -> Result<config::Config, crate::Error
             store_selected: c.profile.store_selected,
             store_smart_stats: c.profile.store_smart_stats,
         },
-        rules: c
-            .rule
-            .take()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|x| {
-                x.parse::<RuleType>()
-                    .map_err(|x| Error::InvalidConfig(x.to_string()))
-            })
-            .collect::<Result<Vec<_>, _>>()?,
+        rules,
+        sub_rules,
         rule_providers: rule_provider::convert(c.rule_provider.take()),
         users: c
             .authentication
@@ -113,20 +146,14 @@ pub(super) fn convert(mut c: def::Config) -> Result<config::Config, crate::Error
                 Ok(rv)
             },
         )?,
-        proxy_groups: proxy_group::convert(c.proxy_group.take(), &mut proxy_names)?,
+        proxy_groups: proxy_group::convert(
+            c.proxy_group.take(),
+            &all_proxy_names,
+            &all_provider_names,
+            &mut proxy_names,
+        )?,
         proxy_names,
-        proxy_providers: c
-            .proxy_provider
-            .take()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(name, mut provider)| {
-                // `name` is `#[serde(skip)]` so it defaults to ""; populate from the
-                // map key.
-                provider.set_name(name.clone());
-                (name, provider)
-            })
-            .collect(),
+        proxy_providers,
         listeners: listener::convert(c.listeners.take(), &c)?,
         inbound_providers: c
             .inbound_provider
@@ -140,6 +167,16 @@ pub(super) fn convert(mut c: def::Config) -> Result<config::Config, crate::Error
             .collect(),
     }
     .validate()
+}
+
+fn parse_rules(rules: Vec<String>) -> Result<Vec<RuleType>, Error> {
+    rules
+        .into_iter()
+        .map(|rule| {
+            rule.parse::<RuleType>()
+                .map_err(|error| Error::InvalidConfig(error.to_string()))
+        })
+        .collect()
 }
 
 impl TryFrom<HashMap<String, Value>> for OutboundGroupProtocol {

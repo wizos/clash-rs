@@ -31,7 +31,7 @@ use crate::{
         net::OutboundInterface,
     },
     common::tls::{self, GLOBAL_ROOT_STORE},
-    dns::{ThreadSafeDNSClient, dhcp::DhcpClient},
+    dns::{ThreadSafeDNSClient, dhcp::DhcpClient, system_dns::SystemDnsClient},
     proxy::OutboundHandler,
 };
 use anyhow::anyhow;
@@ -43,6 +43,7 @@ pub enum DNSNetMode {
     DoT,
     DoH,
     Dhcp,
+    System,
 }
 
 impl Display for DNSNetMode {
@@ -53,6 +54,7 @@ impl Display for DNSNetMode {
             Self::DoT => write!(f, "DoT"),
             Self::DoH => write!(f, "DoH"),
             Self::Dhcp => write!(f, "DHCP"),
+            Self::System => write!(f, "System"),
         }
     }
 }
@@ -204,7 +206,7 @@ pub struct Opts {
 
 type FwMark = Option<u32>;
 
-enum DnsConfig {
+pub(crate) enum DnsConfig {
     Udp(
         net::SocketAddr,
         Option<OutboundInterface>,
@@ -272,7 +274,7 @@ impl Display for DnsConfig {
     }
 }
 
-struct Inner {
+pub(crate) struct Inner {
     c: Option<client::Client<DnsRuntimeProvider>>,
     bg_handle: Option<JoinHandle<()>>,
 }
@@ -348,6 +350,10 @@ impl DnsClient {
         if matches!(opts.net, DNSNetMode::Dhcp) {
             let host = opts.host.to_string();
             return Ok(Arc::new(DhcpClient::new(&host, opts.fw_mark).await));
+        }
+
+        if matches!(opts.net, DNSNetMode::System) {
+            return Ok(Arc::new(SystemDnsClient::new(opts.fw_mark).await));
         }
 
         let mut ip: Option<IpAddr> = None;
@@ -487,6 +493,7 @@ impl DnsClient {
                 }))
             }
             DNSNetMode::Dhcp => unreachable!("."),
+            DNSNetMode::System => unreachable!("."),
         }
     }
 

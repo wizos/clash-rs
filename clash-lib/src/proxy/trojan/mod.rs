@@ -30,6 +30,15 @@ use super::{
 };
 
 mod datagram;
+#[cfg(feature = "shadowsocks")]
+mod shadowsocks;
+
+#[cfg(feature = "shadowsocks")]
+#[derive(Clone)]
+pub struct SsCipherOptions {
+    pub method: String,
+    pub password: String,
+}
 
 pub struct HandlerOptions {
     pub name: String,
@@ -41,6 +50,8 @@ pub struct HandlerOptions {
     // might support shadow-tls?
     pub tls: Option<Box<dyn Transport>>,
     pub transport: Option<Box<dyn Transport>>,
+    #[cfg(feature = "shadowsocks")]
+    pub ss_cipher: Option<SsCipherOptions>,
 }
 
 pub struct Handler {
@@ -86,6 +97,11 @@ impl Handler {
         } else {
             s
         };
+
+        #[cfg(feature = "shadowsocks")]
+        if let Some(options) = self.opts.ss_cipher.as_ref() {
+            s = Box::new(shadowsocks::Stream::new(s, options)?);
+        }
 
         let mut buf = BytesMut::new();
         let password = Sha224::digest(self.opts.password.as_bytes());
@@ -381,6 +397,8 @@ mod tests {
             udp: true,
             tls: Some(Box::new(tls)),
             transport: Some(Box::new(transport)),
+            #[cfg(feature = "shadowsocks")]
+            ss_cipher: None,
         };
         let handler = Arc::new(Handler::new(opts));
         handler
@@ -444,6 +462,8 @@ mod tests {
             udp: true,
             tls: Some(Box::new(tls)),
             transport: Some(Box::new(transport)),
+            #[cfg(feature = "shadowsocks")]
+            ss_cipher: None,
         };
         let handler = Arc::new(Handler::new(opts));
         handler

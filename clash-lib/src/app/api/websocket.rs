@@ -23,12 +23,38 @@ use crate::app::api::{
 
 pub fn routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
     Router::new()
+        .route("/events", get(events))
         .route("/connections", get(connections))
         .route("/traffic", get(traffic))
         .route("/memory", get(memory))
         .route("/logs", get(log))
         .route("/flows", get(flows_ws_handle))
         .with_state(state)
+}
+
+async fn events(ws: WebSocketUpgrade) -> impl IntoResponse {
+    ws.on_failed_upgrade(|e| {
+        warn!("runtime event websocket upgrade failed: {}", e);
+    })
+    .on_upgrade(move |mut socket| async move {
+        let mut receiver = crate::app::events::subscribe();
+        loop {
+            match receiver.recv().await {
+                Ok(event) => {
+                    if let Err(error) =
+                        socket.send(Message::Text(event.into())).await
+                    {
+                        debug!("runtime event websocket closed: {}", error);
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!("runtime event websocket lagged by {} messages", skipped);
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
 }
 
 pub async fn connections(
@@ -42,7 +68,7 @@ pub async fn connections(
 
         loop {
             interval.tick().await;
-            let snapshot = state.statistics_manager.snapshot().await;
+            let snapshot = state.statistics_manager.snapshot(false).await;
 
             let body = match serde_json::to_string(&snapshot) {
                 Ok(body) => body,
@@ -75,7 +101,7 @@ pub async fn traffic(
 
         loop {
             interval.tick().await;
-            let (up, down) = state.statistics_manager.now();
+            let (up, down) = state.statistics_manager.now(false);
             let response = json!({
                 "up": up,
                 "down": down,

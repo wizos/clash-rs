@@ -9,7 +9,7 @@ use axum::{
     response::IntoResponse,
     routing::{delete, get},
 };
-use http::HeaderMap;
+use http::{HeaderMap, StatusCode};
 use serde::Deserialize;
 use tracing::{debug, warn};
 
@@ -33,6 +33,8 @@ pub fn routes(statistics_manager: Arc<StatisticsManager>) -> Router<Arc<AppState
 #[derive(Deserialize)]
 pub struct GetConnectionsQuery {
     pub interval: Option<u64>,
+    #[serde(rename = "only-proxy", default)]
+    pub only_proxy: bool,
 }
 
 async fn get_connections(
@@ -43,7 +45,7 @@ async fn get_connections(
 ) -> impl IntoResponse {
     if !is_request_websocket(&headers) {
         let mgr = state.statistics_manager.clone();
-        let snapshot = mgr.snapshot().await;
+        let snapshot = mgr.snapshot(q.only_proxy).await;
         return Json(snapshot).into_response();
     }
 
@@ -60,11 +62,12 @@ async fn get_connections(
     })
     .on_upgrade(move |mut socket| async move {
         let interval = q.interval;
+        let only_proxy = q.only_proxy;
 
         let mgr = state.statistics_manager.clone();
 
         loop {
-            let snapshot = mgr.snapshot().await;
+            let snapshot = mgr.snapshot(only_proxy).await;
             let body = match serde_json::to_string(&snapshot) {
                 Ok(s) => s,
                 Err(e) => {
@@ -92,8 +95,11 @@ async fn close_connection(
     Path(id): Path<uuid::Uuid>,
 ) -> impl IntoResponse {
     let mgr = state.statistics_manager;
-    mgr.close(id).await;
-    format!("connection {id} closed").into_response()
+    if mgr.close(id).await {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::NOT_FOUND
+    }
 }
 
 async fn close_all_connection(
@@ -101,5 +107,5 @@ async fn close_all_connection(
 ) -> impl IntoResponse {
     let mgr = state.statistics_manager;
     mgr.close_all().await;
-    "all connections closed".into_response()
+    StatusCode::NO_CONTENT
 }

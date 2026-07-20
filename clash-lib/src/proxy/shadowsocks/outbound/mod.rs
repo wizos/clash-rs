@@ -2,7 +2,9 @@ mod datagram;
 mod stream;
 
 use self::{
-    datagram::{OutboundDatagramShadowsocks, ShadowsocksUdpIo},
+    datagram::{
+        OutboundDatagramShadowsocks, OutboundDatagramShadowsocksR, ShadowsocksUdpIo,
+    },
     stream::ShadowSocksStream,
 };
 
@@ -19,13 +21,15 @@ use crate::{
     proxy::{
         AnyStream, ConnectorType, DialWithConnector, HandlerCommonOptions,
         OutboundHandler, OutboundType, PlainProxyAPIResponse,
-        shadowsocks::map_cipher,
+        shadowsocks::{map_cipher, ssr_protocol::SsrProtocol},
         transport::Sip003Plugin,
+        uot,
         utils::{GLOBAL_DIRECT_CONNECTOR, RemoteConnector},
     },
     session::Session,
 };
 use async_trait::async_trait;
+use bytes::BytesMut;
 use erased_serde::Serialize as ErasedSerialize;
 use shadowsocks::{
     ProxyClientStream, ProxySocket, ServerConfig, config::ServerType,
@@ -43,12 +47,16 @@ pub struct HandlerOptions {
     pub cipher: String,
     pub plugin: Option<Box<dyn Sip003Plugin>>,
     pub udp: bool,
+    pub udp_over_tcp: bool,
+    pub udp_over_tcp_version: u8,
 }
 
 pub struct Handler {
     opts: HandlerOptions,
     ctx: Arc<shadowsocks::context::Context>,
     connector: tokio::sync::RwLock<Option<Arc<dyn RemoteConnector>>>,
+    outbound_type: OutboundType,
+    ssr_protocol: Option<SsrProtocol>,
 }
 
 impl_default_connector!(Handler);
@@ -67,6 +75,19 @@ impl Handler {
             opts,
             ctx: Context::new_shared(ServerType::Local),
             connector: tokio::sync::RwLock::new(None),
+            outbound_type: OutboundType::Shadowsocks,
+            ssr_protocol: None,
+        }
+    }
+
+    pub fn new_shadowsocksr(
+        opts: HandlerOptions,
+        protocol: Option<SsrProtocol>,
+    ) -> Self {
+        Self {
+            outbound_type: OutboundType::ShadowsocksR,
+            ssr_protocol: protocol,
+            ..Self::new(opts)
         }
     }
 
@@ -82,6 +103,22 @@ impl Handler {
         };
 
         let cfg = self.server_config()?;
+
+        if let Some(protocol) = &self.ssr_protocol {
+            use tokio::io::AsyncWriteExt;
+
+            let mut stream = protocol.wrap_stream(
+                self.ctx.clone(),
+                stream,
+                cfg.method(),
+                cfg.key(),
+                cfg.password(),
+            );
+            let mut target = BytesMut::with_capacity(sess.destination.size());
+            sess.destination.write_buf(&mut target);
+            stream.write_all(&target).await?;
+            return Ok(stream);
+        }
 
         let stream = ProxyClientStream::from_stream(
             self.ctx.clone(),
@@ -114,7 +151,7 @@ impl OutboundHandler for Handler {
     }
 
     fn proto(&self) -> OutboundType {
-        OutboundType::Shadowsocks
+        self.outbound_type
     }
 
     async fn support_udp(&self) -> bool {
@@ -198,6 +235,36 @@ impl OutboundHandler for Handler {
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
     ) -> io::Result<BoxedChainedDatagram> {
+        if self.opts.udp_over_tcp {
+            let stream = connector
+                .connect_stream(
+                    resolver.clone(),
+                    self.opts.server.as_str(),
+                    self.opts.port,
+                    sess.iface.as_ref(),
+                    #[cfg(target_os = "linux")]
+                    sess.so_mark,
+                )
+                .await?;
+            let mut proxy_session = sess.clone();
+            proxy_session.destination =
+                uot::request_destination(self.opts.udp_over_tcp_version)?;
+            let mut stream =
+                self.proxy_stream(stream, &proxy_session, resolver).await?;
+            if self.opts.udp_over_tcp_version == uot::VERSION {
+                use tokio::io::AsyncWriteExt;
+                stream
+                    .write_all(&uot::encode_connect_request(&sess.destination))
+                    .await?;
+                stream.flush().await?;
+            }
+            let datagram =
+                uot::ConnectedDatagram::new(stream, sess.destination.clone());
+            let chained = ChainedDatagramWrapper::new(datagram);
+            chained.append_to_chain(self.name()).await;
+            return Ok(Box::new(chained));
+        }
+
         let cfg = self.server_config()?;
 
         let socket = connector
@@ -211,12 +278,6 @@ impl OutboundHandler for Handler {
             )
             .await?;
 
-        let socket = ProxySocket::from_socket(
-            UdpSocketType::Client,
-            self.ctx.clone(),
-            &cfg,
-            ShadowsocksUdpIo::new(socket),
-        );
         let server_addr = resolver
             .resolve(&self.opts.server, false)
             .await
@@ -230,10 +291,29 @@ impl OutboundHandler for Handler {
                 "failed to resolve {}",
                 self.opts.server
             )))?;
-        let d = OutboundDatagramShadowsocks::new(
-            socket,
-            (server_addr, self.opts.port).into(),
+        let remote_addr = (server_addr, self.opts.port).into();
+
+        if let Some(protocol) = &self.ssr_protocol {
+            let datagram = OutboundDatagramShadowsocksR::new(
+                socket,
+                remote_addr,
+                self.ctx.clone(),
+                cfg.method(),
+                cfg.key().to_vec(),
+                protocol.udp_protocol(cfg.key(), cfg.password()),
+            );
+            let chained = ChainedDatagramWrapper::new(datagram);
+            chained.append_to_chain(self.name()).await;
+            return Ok(Box::new(chained));
+        }
+
+        let socket = ProxySocket::from_socket(
+            UdpSocketType::Client,
+            self.ctx.clone(),
+            &cfg,
+            ShadowsocksUdpIo::new(socket),
         );
+        let d = OutboundDatagramShadowsocks::new(socket, remote_addr);
         let d = ChainedDatagramWrapper::new(d);
         d.append_to_chain(self.name()).await;
         Ok(Box::new(d))
@@ -259,6 +339,113 @@ impl PlainProxyAPIResponse for Handler {
             m.insert("plugin".to_owned(), Box::new(true) as _);
         }
         m
+    }
+}
+
+#[cfg(test)]
+mod uot_tests {
+    use std::{net::Ipv4Addr, sync::Arc};
+
+    use futures::{SinkExt, StreamExt};
+    use shadowsocks::{
+        config::ServerType, context::Context, relay::tcprelay::ProxyServerStream,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+
+    use super::*;
+    use crate::{
+        proxy::{datagram::UdpPacket, uot, utils::test_utils::noop::NoopResolver},
+        session::SocksAddr,
+    };
+
+    const PASSWORD: &str = "uot-test-password";
+    const CIPHER: &str = "aes-128-gcm";
+
+    async fn round_trip(version: u8) {
+        let handler = Handler::new(HandlerOptions {
+            name: "ss-uot".to_owned(),
+            common_opts: Default::default(),
+            server: "example.com".to_owned(),
+            port: 443,
+            password: PASSWORD.to_owned(),
+            cipher: CIPHER.to_owned(),
+            plugin: None,
+            udp: true,
+            udp_over_tcp: true,
+            udp_over_tcp_version: version,
+        });
+        let server_config = handler.server_config().unwrap();
+        let method = server_config.method();
+        let key = server_config.key().to_vec();
+        let destination = SocksAddr::from((Ipv4Addr::new(1, 1, 1, 1), 53));
+        let (client, server) = duplex(16 * 1024);
+
+        let expected_destination = destination.clone();
+        let server = tokio::spawn(async move {
+            let context = Context::new_shared(ServerType::Server);
+            let mut stream =
+                ProxyServerStream::from_stream(context, server, method, &key);
+            let magic = stream.handshake().await.unwrap();
+            let expected_magic = if version == uot::VERSION {
+                uot::MAGIC_ADDRESS
+            } else {
+                uot::LEGACY_MAGIC_ADDRESS
+            };
+            assert_eq!(magic.to_string(), format!("{expected_magic}:0"));
+            if version == uot::VERSION {
+                assert_eq!(stream.read_u8().await.unwrap(), 1);
+                assert_eq!(
+                    SocksAddr::read_from(&mut stream).await.unwrap(),
+                    expected_destination
+                );
+            }
+            assert_eq!(stream.read_u16().await.unwrap(), 5);
+            let mut payload = [0u8; 5];
+            stream.read_exact(&mut payload).await.unwrap();
+            assert_eq!(&payload, b"query");
+            stream.write_u16(5).await.unwrap();
+            stream.write_all(b"reply").await.unwrap();
+            stream.flush().await.unwrap();
+        });
+
+        let proxy_session = Session {
+            destination: uot::request_destination(version).unwrap(),
+            ..Default::default()
+        };
+        let resolver = Arc::new(NoopResolver);
+        let mut stream = handler
+            .proxy_stream(Box::new(client), &proxy_session, resolver)
+            .await
+            .unwrap();
+        if version == uot::VERSION {
+            stream
+                .write_all(&uot::encode_connect_request(&destination))
+                .await
+                .unwrap();
+        }
+        let mut datagram = uot::ConnectedDatagram::new(stream, destination.clone());
+        datagram
+            .send(UdpPacket {
+                data: b"query".to_vec(),
+                src_addr: destination.clone(),
+                dst_addr: destination.clone(),
+                inbound_user: None,
+            })
+            .await
+            .unwrap();
+        let reply = datagram.next().await.unwrap();
+        assert_eq!(reply.data, b"reply");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shadowsocks_uot_v1_matches_mihomo() {
+        round_trip(uot::LEGACY_VERSION).await;
+    }
+
+    #[tokio::test]
+    async fn shadowsocks_uot_v2_matches_mihomo() {
+        round_trip(uot::VERSION).await;
     }
 }
 
@@ -352,6 +539,8 @@ mod tests {
             cipher: CIPHER.to_owned(),
             plugin: Default::default(),
             udp: false,
+            udp_over_tcp: false,
+            udp_over_tcp_version: uot::LEGACY_VERSION,
         };
 
         let handler = Arc::new(Handler::new(opts));
@@ -422,6 +611,8 @@ mod tests {
             cipher: CIPHER.to_owned(),
             plugin: Some(Box::new(client)),
             udp: false,
+            udp_over_tcp: false,
+            udp_over_tcp_version: uot::LEGACY_VERSION,
         };
         let handler: Arc<dyn OutboundHandler> = Arc::new(Handler::new(opts));
         // we need to store all the runners in a container, to make sure all of
@@ -492,6 +683,8 @@ mod tests {
             cipher: CIPHER.to_owned(),
             plugin: Some(plugin),
             udp: false,
+            udp_over_tcp: false,
+            udp_over_tcp_version: uot::LEGACY_VERSION,
         };
 
         let handler: Arc<dyn OutboundHandler> = Arc::new(Handler::new(opts));
@@ -537,6 +730,8 @@ mod tests {
             cipher: CIPHER.to_owned(),
             plugin: Some(Box::new(plugin)),
             udp: false,
+            udp_over_tcp: false,
+            udp_over_tcp_version: uot::LEGACY_VERSION,
         };
 
         let handler: Arc<dyn OutboundHandler> = Arc::new(Handler::new(opts));

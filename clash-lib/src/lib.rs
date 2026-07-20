@@ -13,6 +13,7 @@ use crate::{
         outbound::manager::OutboundManager,
         profile,
         router::Router,
+        sniffer::Sniffer,
     },
     common::{
         auth, dashboard,
@@ -36,13 +37,15 @@ use std::{
     sync::{Arc, OnceLock},
 };
 use thiserror::Error;
-use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
+use tokio::sync::{Mutex, broadcast, mpsc};
 use tracing::{debug, error, info, warn};
 
 pub mod app;
 pub mod config;
 
 mod common;
+mod flow_metadata;
+pub mod process_resolver;
 mod proxy;
 mod runner;
 mod session;
@@ -106,7 +109,7 @@ impl Config {
     pub fn try_parse(self) -> Result<InternalConfig> {
         match self {
             Config::Def(c) => c.try_into(),
-            Config::Internal(c) => Ok(c),
+            Config::Internal(c) => c.validate(),
             Config::File(file) => {
                 TryInto::<def::Config>::try_into(PathBuf::from(file))?.try_into()
             }
@@ -133,10 +136,15 @@ impl Config {
 
 pub struct GlobalState {
     log_level: LogLevel,
+    reload_generation: u64,
+    reload_attempt: u64,
+    reload_completed: u64,
+    reload_error: Option<String>,
+    reload_phase: String,
     #[cfg(feature = "tun")]
     tunnel_runner: ArcRunner,
     dns_listener: ArcRunner,
-    reload_tx: mpsc::Sender<(Config, oneshot::Sender<()>)>,
+    reload_tx: mpsc::Sender<(u64, Config)>,
     cwd: String,
     /// Path to the config file used at startup. Used by the dashboard "Reload"
     /// button which sends an empty path to mean "reload current config".
@@ -288,6 +296,11 @@ pub async fn start(
 
     let global_state = Arc::new(Mutex::new(GlobalState {
         log_level,
+        reload_generation: 0,
+        reload_attempt: 0,
+        reload_completed: 0,
+        reload_error: None,
+        reload_phase: "idle".to_owned(),
         #[cfg(feature = "tun")]
         tunnel_runner: components.tun_runner.clone(),
         dns_listener: components.dns_listener.clone(),
@@ -331,26 +344,70 @@ pub async fn start(
     let cwd_clone = cwd.clone();
 
     let reload_token = shutdown_token.child_token();
-    tokio::spawn(async move {
+    let reload_handle = tokio::spawn(async move {
+        let mut components = components;
         // Listen for config reload signal and reload config
-        while let Some((config, done)) = reload_rx.recv().await {
+        loop {
+            let next = tokio::select! {
+                _ = reload_token.cancelled() => {
+                    api_listener.shutdown();
+                    components.stop_all().await;
+                    api_listener.join().await.ok();
+                    break;
+                }
+                next = reload_rx.recv() => next,
+            };
+            let Some((reload_attempt, config)) = next else {
+                api_listener.shutdown();
+                components.stop_all().await;
+                api_listener.join().await.ok();
+                break;
+            };
             info!("reloading config");
+            {
+                let mut state = global_state.lock().await;
+                state.reload_phase = "parsing".to_owned();
+            }
             let config = match config.try_parse() {
                 Ok(c) => c,
                 Err(e) => {
                     error!("failed to reload config: {}", e);
+                    let mut state = global_state.lock().await;
+                    state.reload_completed = reload_attempt;
+                    state.reload_error = Some(e.to_string());
+                    state.reload_phase = "failed".to_owned();
                     continue;
                 }
             };
 
             let controller_cfg = config.general.controller.clone();
 
+            {
+                let mut state = global_state.lock().await;
+                state.reload_phase = "creating-components".to_owned();
+            }
             let new_components =
-                create_components(cwd_clone.clone(), config).await?;
+                match create_components(cwd_clone.clone(), config).await {
+                    Ok(components) => components,
+                    Err(error) => {
+                        error!("failed to create replacement components: {}", error);
+                        let mut state = global_state.lock().await;
+                        state.reload_completed = reload_attempt;
+                        state.reload_error = Some(error.to_string());
+                        state.reload_phase = "failed".to_owned();
+                        continue;
+                    }
+                };
 
-            let _ = done.send(());
-
-            components.stop_all();
+            {
+                let mut state = global_state.lock().await;
+                state.reload_phase = "stopping-old-components".to_owned();
+            }
+            components.stop_all().await;
+            {
+                let mut state = global_state.lock().await;
+                state.reload_phase = "starting-new-components".to_owned();
+            }
             new_components.start_all();
 
             // TODO: every reload is causing the API server to restart, we should
@@ -374,20 +431,31 @@ pub async fn start(
                 new_components.dns_listen.clone(),
                 new_components.dns_enabled,
             ));
-            let mut g = global_state.lock().await;
-
-            #[cfg(feature = "tun")]
             {
-                g.tunnel_runner = new_components.tun_runner.clone();
+                let mut g = global_state.lock().await;
+                #[cfg(feature = "tun")]
+                {
+                    g.tunnel_runner = new_components.tun_runner.clone();
+                }
+                g.dns_listener = new_components.dns_listener.clone();
             }
-            g.dns_listener = new_components.dns_listener.clone();
 
+            {
+                let mut state = global_state.lock().await;
+                state.reload_phase = "restarting-api".to_owned();
+            }
             api_listener.shutdown();
             // Wait for the old API server to fully stop before starting the new
             // one, to avoid EADDRINUSE on the same port.
             api_listener.join().await.ok();
             new_api_listener.run_async();
             api_listener = new_api_listener;
+            components = new_components;
+            let mut g = global_state.lock().await;
+            g.reload_generation = g.reload_generation.saturating_add(1);
+            g.reload_completed = reload_attempt;
+            g.reload_error = None;
+            g.reload_phase = "idle".to_owned();
         }
         Ok::<(), Error>(())
     });
@@ -396,6 +464,10 @@ pub async fn start(
         result = tokio::signal::ctrl_c() => { result.map_err(Error::Io)?; }
         _ = shutdown_token.cancelled() => {}
     }
+    shutdown_token.cancel();
+    reload_handle.await.map_err(|error| {
+        Error::Operation(format!("reload task join failed: {error}"))
+    })??;
     Ok(())
 }
 
@@ -423,11 +495,21 @@ impl RuntimeComponents {
         self.inbound_manager.run_async();
     }
 
-    fn stop_all(&self) {
+    async fn stop_all(&self) {
         #[cfg(feature = "tun")]
         self.tun_runner.shutdown();
         self.dns_listener.shutdown();
         self.inbound_manager.shutdown();
+        #[cfg(feature = "tun")]
+        if let Err(error) = self.tun_runner.join().await {
+            warn!("failed to join TUN runner: {error}");
+        }
+        if let Err(error) = self.dns_listener.join().await {
+            warn!("failed to join DNS listener: {error}");
+        }
+        if let Err(error) = self.inbound_manager.join().await {
+            warn!("failed to join inbound listeners: {error}");
+        }
     }
 }
 
@@ -435,10 +517,11 @@ async fn create_components(
     cwd: PathBuf,
     config: InternalConfig,
 ) -> Result<RuntimeComponents> {
-    if config.tun.enable {
-        debug!("tun enabled, initializing default outbound interface");
-        init_net_config(config.tun.so_mark).await;
-    }
+    let sniffer = Sniffer::from_config(config.general.sniffer.as_ref())?;
+    let unified_delay = config.general.unified_delay;
+    crate::proxy::utils::set_tcp_concurrent(config.general.tcp_concurrent);
+    crate::process_resolver::set_find_process_mode(config.general.find_process_mode);
+    init_net_config(config.general.interface.as_ref(), config.tun.so_mark).await;
 
     let cancellation_token = tokio_util::sync::CancellationToken::new();
 
@@ -464,7 +547,7 @@ async fn create_components(
                 _ => None,
             })
             .collect(),
-    );
+    )?;
 
     // Create a shared outbound registry seeded with plain outbounds.
     // After OutboundManager is initialized it will be extended with all
@@ -519,18 +602,15 @@ async fn create_components(
     // resolver and the (later-built) router + outbound manager. The DNS
     // runtime provider consults the OnceLocks at dial time and falls back to
     // DIRECT until they are populated.
-    let rule_dispatch: Option<Arc<dns::RuleDispatch>> = if config.dns.respect_rules {
-        Some(dns::RuleDispatch::new())
-    } else {
-        None
-    };
+    let rule_dispatch = dns::RuleDispatch::new();
+    let dns_rule_dispatch = config.dns.respect_rules.then(|| rule_dispatch.clone());
 
     let dns_resolver = dns::new_resolver(
         config.dns,
         Some(cache_store.clone()),
         pending_country_mmdb.clone(),
         outbound_registry.clone(),
-        rule_dispatch.clone(),
+        dns_rule_dispatch,
     )
     .await;
 
@@ -553,12 +633,16 @@ async fn create_components(
             cwd.to_string_lossy().to_string(),
             config.general.routing_mask,
             outbound_registry.clone(),
+            rule_dispatch.clone(),
         )
         .await?,
     );
+    outbound_manager.set_unified_delay(unified_delay);
 
-    if let Some(rd) = &rule_dispatch
-        && rd.outbound_manager.set(outbound_manager.clone()).is_err()
+    if rule_dispatch
+        .outbound_manager
+        .set(outbound_manager.clone())
+        .is_err()
     {
         warn!(
             "RuleDispatch outbound_manager OnceLock was already set — this is \
@@ -635,6 +719,7 @@ async fn create_components(
     let router = Arc::new(
         Router::new(
             config.rules,
+            config.sub_rules,
             config.rule_providers,
             dns_resolver.clone(),
             country_mmdb,
@@ -645,9 +730,7 @@ async fn create_components(
         .await,
     );
 
-    if let Some(rd) = &rule_dispatch
-        && rd.router.set(router.clone()).is_err()
-    {
+    if rule_dispatch.router.set(router.clone()).is_err() {
         warn!(
             "RuleDispatch router OnceLock was already set — this is unexpected and \
              indicates a double-initialization bug"
@@ -664,6 +747,7 @@ async fn create_components(
         config.general.mode,
         statistics_manager.clone(),
         config.experimental.and_then(|e| e.tcp_buffer_size),
+        sniffer,
     ));
 
     debug!("initializing authenticator");

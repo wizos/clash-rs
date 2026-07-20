@@ -2,9 +2,17 @@ use crate::{app::router::rules::RuleMatcher, session::Session};
 
 #[derive(Clone)]
 pub struct Port {
-    pub port: u16,
+    pub payload: String,
+    pub port_ranges: Vec<(u16, u16)>,
     pub target: String,
-    pub is_src: bool,
+    pub kind: PortKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PortKind {
+    Source,
+    Destination,
+    Inbound,
 }
 
 impl std::fmt::Display for Port {
@@ -13,19 +21,26 @@ impl std::fmt::Display for Port {
             f,
             "{} {} port {}",
             self.target,
-            if self.is_src { "src" } else { "dst" },
-            self.port
+            match self.kind {
+                PortKind::Source => "src",
+                PortKind::Destination => "dst",
+                PortKind::Inbound => "inbound",
+            },
+            self.payload
         )
     }
 }
 
 impl RuleMatcher for Port {
     fn apply(&self, sess: &Session) -> bool {
-        if self.is_src {
-            sess.source.port() == self.port
-        } else {
-            sess.destination.port() == self.port
-        }
+        let port = match self.kind {
+            PortKind::Source => sess.source.port(),
+            PortKind::Destination => sess.destination.port(),
+            PortKind::Inbound => sess.inbound_port,
+        };
+        self.port_ranges
+            .iter()
+            .any(|(start, end)| (*start..=*end).contains(&port))
     }
 
     fn target(&self) -> &str {
@@ -33,10 +48,48 @@ impl RuleMatcher for Port {
     }
 
     fn payload(&self) -> String {
-        self.port.to_string()
+        self.payload.clone()
     }
 
     fn type_name(&self) -> &str {
         "Port"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::SocksAddr;
+
+    #[test]
+    fn matches_port_ranges() {
+        let matcher = Port {
+            payload: "80/443/1000-2000".to_string(),
+            port_ranges: vec![(80, 80), (443, 443), (1000, 2000)],
+            target: "PROXY".to_string(),
+            kind: PortKind::Destination,
+        };
+        let session = Session {
+            destination: SocksAddr::Domain("example.com".to_string(), 1443),
+            ..Default::default()
+        };
+
+        assert!(matcher.apply(&session));
+    }
+
+    #[test]
+    fn matches_inbound_port() {
+        let matcher = Port {
+            payload: "7890".to_string(),
+            port_ranges: vec![(7890, 7890)],
+            target: "PROXY".to_string(),
+            kind: PortKind::Inbound,
+        };
+        let session = Session {
+            inbound_port: 7890,
+            ..Default::default()
+        };
+
+        assert!(matcher.apply(&session));
     }
 }

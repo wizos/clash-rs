@@ -12,11 +12,14 @@ use crate::{
         },
         dns::ThreadSafeDNSResolver,
     },
-    common::tls::{DefaultTlsVerifier, build_tls_client_config},
+    common::tls::DefaultTlsVerifier,
     proxy::{
         ConnectorType, DialWithConnector, OutboundHandler, OutboundType,
-        PlainProxyAPIResponse, converters::hysteria2::PortGenerator,
-        datagram::UdpPacket, utils::new_udp_socket,
+        PlainProxyAPIResponse,
+        converters::hysteria2::PortGenerator,
+        datagram::UdpPacket,
+        transport::{TlsEchOptions, build_rustls_client_config_with_optional_ech},
+        utils::new_udp_socket,
     },
     session::{Session, SocksAddr},
 };
@@ -39,7 +42,7 @@ use std::{
     str::FromStr,
     sync::{Arc, RwLock, atomic::AtomicU32},
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OnceCell};
 use tracing::{debug, trace, warn};
 
 #[derive(Clone)]
@@ -76,6 +79,7 @@ pub struct HystOption {
     pub tls_cert: Option<String>,
     /// File path or inline PEM client private key for mTLS.
     pub tls_key: Option<String>,
+    pub ech: Option<TlsEchOptions>,
 }
 
 enum CcRx {
@@ -99,7 +103,7 @@ impl FromStr for CcRx {
 pub struct Handler {
     opts: HystOption,
     ep_config: quinn::EndpointConfig,
-    client_config: quinn::ClientConfig,
+    client_config: OnceCell<quinn::ClientConfig>,
     conn: Mutex<Option<Arc<HysteriaConnection>>>,
     next_session_id: AtomicU32,
     // a send request guard to keep the connection alive
@@ -122,50 +126,65 @@ impl Handler {
         if opts.ca.is_some() {
             warn!("hysteria2 does not support ca yet");
         }
-        let verify = Arc::new(DefaultTlsVerifier::new(
-            opts.fingerprint.clone(),
-            opts.skip_cert_verify,
-        ));
-        let mut tls_config = build_tls_client_config(
-            verify,
-            opts.tls_cert.as_deref(),
-            opts.tls_key.as_deref(),
-        )
-        .map_err(|e| std::io::Error::new(e.kind(), format!("hysteria2 TLS: {e}")))?;
-
-        // should set alpn_protocol `h3` default
-        tls_config.alpn_protocols = if opts.alpn.is_empty() {
-            vec![b"h3".to_vec()]
-        } else {
-            opts.alpn.iter().map(|x| x.as_bytes().to_vec()).collect()
-        };
-
-        let mut transport = TransportConfig::default();
-        if opts.disable_mtu_discovery {
-            tracing::debug!("disable mtu discovery");
-            transport.mtu_discovery_config(None);
-        }
-        // TODO
-        // transport.congestion_controller_factory(DynCongestion);
-        transport.max_idle_timeout(Some(
-            Self::DEFAULT_MAX_IDLE_TIMEOUT.try_into().unwrap(),
-        ));
-        transport.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
-
-        let quic_config: QuicClientConfig = tls_config.try_into().unwrap();
-        let mut client_config = ClientConfig::new(Arc::new(quic_config));
-        client_config.transport_config(Arc::new(transport));
         let ep_config = quinn::EndpointConfig::default();
 
         Ok(Self {
             opts,
             ep_config,
-            client_config,
+            client_config: OnceCell::new(),
             next_session_id: AtomicU32::new(0),
             conn: Mutex::new(None),
             guard: Mutex::new(None),
             support_udp: RwLock::new(true),
         })
+    }
+
+    async fn client_config(&self) -> std::io::Result<&quinn::ClientConfig> {
+        self.client_config
+            .get_or_try_init(|| async {
+                let verify = Arc::new(DefaultTlsVerifier::try_new(
+                    self.opts.fingerprint.clone(),
+                    self.opts.skip_cert_verify,
+                )?);
+                let mut tls_config = build_rustls_client_config_with_optional_ech(
+                    verify,
+                    self.opts.tls_cert.as_deref(),
+                    self.opts.tls_key.as_deref(),
+                    self.opts.ech.as_ref(),
+                    self.opts.sni.as_deref().unwrap_or(""),
+                )
+                .await
+                .map_err(|error| {
+                    std::io::Error::new(
+                        error.kind(),
+                        format!("hysteria2 TLS: {error}"),
+                    )
+                })?;
+                tls_config.alpn_protocols = if self.opts.alpn.is_empty() {
+                    vec![b"h3".to_vec()]
+                } else {
+                    self.opts
+                        .alpn
+                        .iter()
+                        .map(|value| value.as_bytes().to_vec())
+                        .collect()
+                };
+                let quic_config = QuicClientConfig::try_from(tls_config)
+                    .map_err(std::io::Error::other)?;
+                let mut client_config = ClientConfig::new(Arc::new(quic_config));
+                let mut transport = TransportConfig::default();
+                if self.opts.disable_mtu_discovery {
+                    transport.mtu_discovery_config(None);
+                }
+                transport.max_idle_timeout(Some(
+                    Self::DEFAULT_MAX_IDLE_TIMEOUT.try_into().unwrap(),
+                ));
+                transport
+                    .keep_alive_interval(Some(std::time::Duration::from_secs(10)));
+                client_config.transport_config(Arc::new(transport));
+                Ok(client_config)
+            })
+            .await
     }
 
     // connect and auth
@@ -244,7 +263,7 @@ impl Handler {
             )?
         };
 
-        ep.set_default_client_config(self.client_config.clone());
+        ep.set_default_client_config(self.client_config().await?.clone());
 
         tracing::trace!("hysteria2 connecting to server: {:?}", server_socket_addr);
         let session = ep
@@ -749,6 +768,7 @@ mod tests {
             disable_mtu_discovery: false,
             tls_cert: None,
             tls_key: None,
+            ech: None,
         };
 
         let handler = Arc::new(

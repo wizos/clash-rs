@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use erased_serde::Serialize;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize as SerdeSerialize};
 use std::{
     collections::HashMap,
     fmt::{Display, Formatter},
@@ -40,12 +40,27 @@ impl Display for ProviderVehicleType {
 
 pub type ThreadSafeProviderVehicle = Arc<dyn ProviderVehicle + Send + Sync>;
 
+#[derive(Clone, Debug, Default, SerdeSerialize, PartialEq, Eq)]
+pub struct SubscriptionInfo {
+    #[serde(rename = "Upload")]
+    pub upload: u64,
+    #[serde(rename = "Download")]
+    pub download: u64,
+    #[serde(rename = "Total")]
+    pub total: u64,
+    #[serde(rename = "Expire")]
+    pub expire: u64,
+}
+
 #[cfg_attr(test, automock)]
 #[async_trait]
 pub trait ProviderVehicle {
     async fn read(&self) -> io::Result<Vec<u8>>;
     fn path(&self) -> &str;
     fn typ(&self) -> ProviderVehicleType;
+    fn subscription_info(&self) -> Option<SubscriptionInfo> {
+        None
+    }
 }
 
 pub enum ProviderType {
@@ -69,6 +84,12 @@ pub trait Provider {
     fn typ(&self) -> ProviderType;
     async fn initialize(&self) -> io::Result<()>;
     async fn update(&self) -> io::Result<()>;
+    async fn side_update(&self, _data: &[u8]) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "provider does not support side-load",
+        ))
+    }
 
     async fn as_map(&self) -> HashMap<String, Box<dyn Serialize + Send>>;
 }

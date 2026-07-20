@@ -1,8 +1,14 @@
 use super::ProxyProvider;
+#[cfg(feature = "masque")]
+use crate::proxy::masque;
+#[cfg(feature = "mieru")]
+use crate::proxy::mieru;
 #[cfg(feature = "shadowsocks")]
 use crate::proxy::shadowsocks;
 #[cfg(feature = "ssh")]
 use crate::proxy::ssh;
+#[cfg(feature = "sudoku")]
+use crate::proxy::sudoku;
 #[cfg(feature = "tailscale")]
 use crate::proxy::tailscale;
 #[cfg(feature = "onion")]
@@ -21,11 +27,14 @@ use crate::{
         },
     },
     common::errors::map_io_error,
-    config::internal::proxy::OutboundProxyProtocol,
+    config::internal::proxy::{
+        OutboundProxyProtocol, OutboundProxyProviderOverride,
+    },
     proxy::{
         AnyOutboundHandler, anytls,
         direct::{self},
-        hysteria2, reject, socks, trojan, vless, vmess,
+        dns as dns_outbound, gost_relay, http, hysteria, hysteria2, reject, snell,
+        socks, trojan, trusttunnel, vless, vmess,
     },
 };
 use async_trait::async_trait;
@@ -68,6 +77,7 @@ impl ProxySetProvider {
         interval: Duration,
         vehicle: ThreadSafeProviderVehicle,
         hc: HealthCheck,
+        override_options: OutboundProxyProviderOverride,
     ) -> anyhow::Result<Self> {
         let hc = Arc::new(hc);
 
@@ -118,18 +128,15 @@ impl ProxySetProvider {
                     Some(proxies) => {
                         let proxies = proxies
                             .into_iter()
-                            .filter_map(|x| {
-                                match OutboundProxyProtocol::try_from(x) {
-                                    Ok(p) => Some(p),
-                                    Err(e) => {
-                                        warn!(
-                                            provider = n.as_str(),
-                                            "skipping proxy due to parse error: {e}"
-                                        );
-                                        None
-                                    }
-                                }
+                            .map(|mut proxy| {
+                                override_options.apply(&mut proxy)?;
+                                Ok(proxy)
                             })
+                            .collect::<Result<Vec<_>, crate::Error>>()?
+                            .into_iter()
+                            .map(OutboundProxyProtocol::try_from)
+                            .collect::<Result<Vec<_>, crate::Error>>()?
+                            .into_iter()
                             .map(|x| match x {
                                 OutboundProxyProtocol::Direct(d) => {
                                     Ok(Arc::new(direct::Handler::new(&d.name)) as _)
@@ -137,8 +144,51 @@ impl ProxySetProvider {
                                 OutboundProxyProtocol::Reject(r) => {
                                     Ok(Arc::new(reject::Handler::new(&r.name)) as _)
                                 }
+                                OutboundProxyProtocol::Dns(d) => {
+                                    Ok(Arc::new(dns_outbound::Handler::new(&d.name))
+                                        as _)
+                                }
+                                OutboundProxyProtocol::GostRelay(config) => {
+                                    let handler: gost_relay::Handler =
+                                        config.try_into()?;
+                                    Ok(Arc::new(handler) as _)
+                                }
+                                OutboundProxyProtocol::Snell(config) => {
+                                    let handler: snell::Handler =
+                                        config.try_into()?;
+                                    Ok(Arc::new(handler) as _)
+                                }
+                                OutboundProxyProtocol::TrustTunnel(config) => {
+                                    let handler: trusttunnel::Handler =
+                                        config.try_into()?;
+                                    Ok(Arc::new(handler) as _)
+                                }
+                                #[cfg(feature = "masque")]
+                                OutboundProxyProtocol::Masque(config) => {
+                                    let handler: masque::Handler =
+                                        config.try_into()?;
+                                    Ok(Arc::new(handler) as _)
+                                }
+                                #[cfg(feature = "mieru")]
+                                OutboundProxyProtocol::Mieru(config) => {
+                                    let handler: mieru::Handler =
+                                        config.try_into()?;
+                                    Ok(Arc::new(handler) as _)
+                                }
+                                #[cfg(feature = "sudoku")]
+                                OutboundProxyProtocol::Sudoku(config) => {
+                                    let handler: sudoku::Handler =
+                                        config.try_into()?;
+                                    Ok(Arc::new(handler) as _)
+                                }
                                 #[cfg(feature = "shadowsocks")]
                                 OutboundProxyProtocol::Ss(s) => {
+                                    let h: shadowsocks::outbound::Handler =
+                                        s.try_into()?;
+                                    Ok(Arc::new(h) as _)
+                                }
+                                #[cfg(feature = "shadowsocks")]
+                                OutboundProxyProtocol::Ssr(s) => {
                                     let h: shadowsocks::outbound::Handler =
                                         s.try_into()?;
                                     Ok(Arc::new(h) as _)
@@ -147,6 +197,11 @@ impl ProxySetProvider {
                                     let h: socks::outbound::Handler =
                                         s.try_into()?;
                                     Ok(Arc::new(h) as _)
+                                }
+                                OutboundProxyProtocol::Http(config) => {
+                                    let handler: http::HttpOutbound =
+                                        config.try_into()?;
+                                    Ok(Arc::new(handler) as _)
                                 }
                                 OutboundProxyProtocol::Anytls(anytls) => {
                                     let h: anytls::Handler = anytls.try_into()?;
@@ -168,6 +223,10 @@ impl ProxySetProvider {
                                     let h: hysteria2::Handler = h.try_into()?;
                                     Ok(Arc::new(h) as _)
                                 }
+                                OutboundProxyProtocol::Hysteria(h) => {
+                                    let h: hysteria::Handler = h.try_into()?;
+                                    Ok(Arc::new(h) as _)
+                                }
                                 #[cfg(feature = "ssh")]
                                 OutboundProxyProtocol::Ssh(s) => {
                                     let h: ssh::Handler = s.try_into()?;
@@ -176,6 +235,12 @@ impl ProxySetProvider {
                                 #[cfg(feature = "wireguard")]
                                 OutboundProxyProtocol::Wireguard(wg) => {
                                     let h: wg::Handler = wg.try_into()?;
+                                    Ok(Arc::new(h) as _)
+                                }
+                                #[cfg(feature = "openvpn")]
+                                OutboundProxyProtocol::Openvpn(openvpn) => {
+                                    let h: crate::proxy::openvpn::Handler =
+                                        openvpn.try_into()?;
                                     Ok(Arc::new(h) as _)
                                 }
                                 #[cfg(feature = "onion")]
@@ -269,6 +334,17 @@ impl Provider for ProxySetProvider {
         if !same && let Some(updater) = self.fetcher.on_update.as_ref() {
             updater(ele).await;
         }
+        crate::app::events::emit("loaded", self.name());
+        Ok(())
+    }
+
+    async fn side_update(&self, data: &[u8]) -> std::io::Result<()> {
+        let (proxies, same) =
+            self.fetcher.side_update(data).await.map_err(map_io_error)?;
+        if !same && let Some(updater) = self.fetcher.on_update.as_ref() {
+            updater(proxies).await;
+        }
+        crate::app::events::emit("loaded", self.name());
         Ok(())
     }
 
@@ -286,6 +362,14 @@ impl Provider for ProxySetProvider {
             "updatedAt".to_owned(),
             Box::new(self.fetcher.updated_at().await),
         );
+        m.insert("path".to_owned(), Box::new(self.fetcher.path().to_string()));
+        m.insert(
+            "count".to_owned(),
+            Box::new(self.inner.read().await.proxies.len()),
+        );
+        if let Some(info) = self.fetcher.subscription_info() {
+            m.insert("subscriptionInfo".to_owned(), Box::new(info));
+        }
 
         m
     }
@@ -312,18 +396,21 @@ mod tests {
 
     use tokio::time::sleep;
 
-    use crate::app::{
-        dns::MockClashResolver,
-        remote_content_manager::{
-            ProxyManager,
-            healthcheck::HealthCheck,
-            providers::{
-                MockProviderVehicle, Provider, ProviderVehicleType,
-                proxy_provider::{
-                    ProxyProvider, proxy_set_provider::ProxySetProvider,
+    use crate::{
+        app::{
+            dns::MockClashResolver,
+            remote_content_manager::{
+                ProxyManager,
+                healthcheck::HealthCheck,
+                providers::{
+                    MockProviderVehicle, Provider, ProviderVehicleType,
+                    proxy_provider::{
+                        ProxyProvider, proxy_set_provider::ProxySetProvider,
+                    },
                 },
             },
         },
+        config::internal::proxy::OutboundProxyProviderOverride,
     };
 
     #[tokio::test]
@@ -367,6 +454,11 @@ proxies:
             Duration::from_secs(1),
             vehicle,
             hc,
+            OutboundProxyProviderOverride {
+                additional_prefix: Some("source|".to_owned()),
+                additional_suffix: Some("|ready".to_owned()),
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -377,5 +469,6 @@ proxies:
         sleep(Duration::from_secs_f64(1.5)).await;
 
         assert_eq!(provider.proxies().await.len(), 1);
+        assert_eq!(provider.proxies().await[0].name(), "source|socks5|ready");
     }
 }

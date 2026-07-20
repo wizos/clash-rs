@@ -1,6 +1,6 @@
 use async_trait::async_trait;
-use http::{Request, StatusCode};
-use std::collections::HashMap;
+use http::{Request, StatusCode, Uri};
+use std::{collections::HashMap, io, net::Ipv6Addr};
 use tokio_tungstenite::{
     client_async_with_config,
     tungstenite::{handshake::client::generate_key, protocol::WebSocketConfig},
@@ -46,14 +46,30 @@ impl Client {
         }
     }
 
-    fn req(&self) -> Request<()> {
+    fn req(&self) -> io::Result<Request<()>> {
+        let authority = if self.server.parse::<Ipv6Addr>().is_ok() {
+            format!("[{}]:{}", self.server, self.port)
+        } else {
+            format!("{}:{}", self.server, self.port)
+        };
+        let path = if self.path.starts_with('/') {
+            self.path.clone()
+        } else {
+            format!("/{}", self.path)
+        };
+        let uri = Uri::builder()
+            .scheme("ws")
+            .authority(authority.as_str())
+            .path_and_query(path.as_str())
+            .build()
+            .map_err(map_io_error)?;
         let mut request = Request::builder()
             .method("GET")
             .header("Connection", "Upgrade")
             .header("Upgrade", "websocket")
             .header("Sec-WebSocket-Version", "13")
             .header("Sec-WebSocket-Key", generate_key())
-            .uri(format!("ws://{}:{}{}", self.server, self.port, self.path));
+            .uri(uri);
         for (k, v) in self.headers.iter() {
             request = request.header(k.as_str(), v.as_str());
         }
@@ -61,14 +77,14 @@ impl Client {
             // we will replace this field later
             request = request.header(self.early_data_header_name.as_str(), "xxoo");
         }
-        request.body(()).unwrap()
+        request.body(()).map_err(map_io_error)
     }
 }
 
 #[async_trait]
 impl Transport for Client {
     async fn proxy_stream(&self, stream: AnyStream) -> std::io::Result<AnyStream> {
-        let req = self.req();
+        let req = self.req()?;
         if self.max_early_data > 0 {
             let early_data_conn = WebsocketEarlyDataConn::new(
                 stream,
@@ -92,5 +108,37 @@ impl Transport for Client {
             }
             Ok(Box::new(WebsocketConn::from_websocket(stream)))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Client;
+
+    fn client(server: &str, path: &str) -> Client {
+        Client::new(
+            server.to_owned(),
+            80,
+            path.to_owned(),
+            Default::default(),
+            None,
+            0,
+            String::new(),
+        )
+    }
+
+    #[test]
+    fn request_adds_missing_path_prefix() {
+        let request = client("104.17.133.14", "%2F%3Fed%3D2048").req().unwrap();
+
+        assert_eq!(
+            request.uri().to_string(),
+            "ws://104.17.133.14:80/%2F%3Fed%3D2048"
+        );
+    }
+
+    #[test]
+    fn invalid_authority_returns_error() {
+        assert!(client("invalid host", "/").req().is_err());
     }
 }

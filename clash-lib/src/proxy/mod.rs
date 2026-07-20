@@ -25,10 +25,24 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use self::utils::RemoteConnector;
 
 pub mod direct;
+pub mod dns;
+pub mod gost_relay;
+#[cfg(feature = "masque")]
+pub mod masque;
+#[cfg(feature = "mieru")]
+pub mod mieru;
+pub(crate) mod packetaddr;
 pub mod reject;
+pub mod snell;
+#[cfg(feature = "sudoku")]
+pub mod sudoku;
+pub mod trusttunnel;
+pub(crate) mod uot;
 
 pub mod http;
 pub mod mixed;
+#[cfg(feature = "openvpn")]
+pub mod openvpn;
 #[cfg(all(target_os = "linux", feature = "tproxy"))]
 pub mod tproxy;
 
@@ -39,6 +53,7 @@ pub(crate) mod datagram;
 
 pub mod anytls;
 pub mod converters;
+pub mod hysteria;
 pub mod hysteria2;
 #[cfg(feature = "shadowquic")]
 pub mod shadowquic;
@@ -61,6 +76,7 @@ pub mod vless;
 pub mod vmess;
 #[cfg(feature = "wireguard")]
 pub mod wg;
+pub(crate) mod xudp;
 
 pub mod group;
 pub use group::{fallback, loadbalance, relay, selector, urltest};
@@ -125,15 +141,20 @@ pub type AnyOutboundDatagram =
 #[derive(Serialize, Deserialize, Clone, Copy)]
 pub enum OutboundType {
     Shadowsocks,
+    ShadowsocksR,
     Vmess,
     Vless,
     Trojan,
     Anytls,
     WireGuard,
+    #[serde(rename = "OpenVPN")]
+    OpenVpn,
     Tor,
     Tuic,
     Socks5,
+    Http,
     Hysteria2,
+    Hysteria,
     Ssh,
     Tailscale,
     ShadowQuic,
@@ -147,6 +168,13 @@ pub enum OutboundType {
     Fallback,
 
     Direct,
+    Dns,
+    GostRelay,
+    Mieru,
+    Masque,
+    Snell,
+    Sudoku,
+    TrustTunnel,
     Reject,
 }
 
@@ -154,15 +182,19 @@ impl Display for OutboundType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             OutboundType::Shadowsocks => write!(f, "Shadowsocks"),
+            OutboundType::ShadowsocksR => write!(f, "ShadowsocksR"),
             OutboundType::Vmess => write!(f, "Vmess"),
             OutboundType::Vless => write!(f, "Vless"),
             OutboundType::Trojan => write!(f, "Trojan"),
             OutboundType::Anytls => write!(f, "AnyTLS"),
             OutboundType::WireGuard => write!(f, "WireGuard"),
+            OutboundType::OpenVpn => write!(f, "OpenVPN"),
             OutboundType::Tor => write!(f, "Tor"),
             OutboundType::Tuic => write!(f, "Tuic"),
             OutboundType::Socks5 => write!(f, "Socks5"),
+            OutboundType::Http => write!(f, "Http"),
             OutboundType::Hysteria2 => write!(f, "Hysteria2"),
+            OutboundType::Hysteria => write!(f, "Hysteria"),
             OutboundType::Ssh => write!(f, "ssh"),
             OutboundType::Tailscale => write!(f, "Tailscale"),
             OutboundType::ShadowQuic => write!(f, "ShadowQuic"),
@@ -175,6 +207,13 @@ impl Display for OutboundType {
             OutboundType::Fallback => write!(f, "Fallback"),
 
             OutboundType::Direct => write!(f, "Direct"),
+            OutboundType::Dns => write!(f, "Dns"),
+            OutboundType::GostRelay => write!(f, "GostRelay"),
+            OutboundType::Mieru => write!(f, "Mieru"),
+            OutboundType::Masque => write!(f, "Masque"),
+            OutboundType::Snell => write!(f, "Snell"),
+            OutboundType::Sudoku => write!(f, "Sudoku"),
+            OutboundType::TrustTunnel => write!(f, "TrustTunnel"),
             OutboundType::Reject => write!(f, "Reject"),
         }
     }

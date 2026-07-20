@@ -4,7 +4,7 @@ use axum::{
     Json, Router,
     extract::{Query, State},
     response::IntoResponse,
-    routing::get,
+    routing::{get, post, put},
 };
 use hickory_proto::{
     op::{Message, MessageType, OpCode},
@@ -25,7 +25,32 @@ pub fn routes(resolver: ThreadSafeDNSResolver) -> Router<Arc<AppState>> {
     let state = DNSState { resolver };
     Router::new()
         .route("/query", get(query_dns))
+        .route("/flush", post(flush_dns))
+        .route("/system", put(update_system_dns))
         .with_state(state)
+}
+
+async fn flush_dns(State(state): State<DNSState>) -> impl IntoResponse {
+    state.resolver.flush_cache().await;
+    StatusCode::NO_CONTENT
+}
+
+#[derive(Deserialize)]
+struct SystemDnsRequest {
+    servers: Vec<String>,
+}
+
+async fn update_system_dns(
+    State(state): State<DNSState>,
+    Json(request): Json<SystemDnsRequest>,
+) -> impl IntoResponse {
+    match crate::app::dns::update_system_dns_servers(request.servers) {
+        Ok(()) => {
+            state.resolver.flush_cache().await;
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(error) => (StatusCode::BAD_REQUEST, error).into_response(),
+    }
 }
 
 #[derive(Deserialize)]

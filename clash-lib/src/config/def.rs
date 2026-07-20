@@ -3,6 +3,7 @@ use crate::{
     app::remote_content_manager::providers::rule_provider::{
         RuleSetBehavior, RuleSetFormat,
     },
+    common::utils::default_bool_true,
 };
 use educe::Educe;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -46,6 +47,99 @@ impl Default for DnsHijack {
     }
 }
 
+/// TUN network stack type (mihomo compatible)
+#[derive(Serialize, Deserialize, Default, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TunStack {
+    /// System network stack (not yet supported in clash-rs, accepted for
+    /// compat)
+    System,
+    /// gVisor/userspace network stack (smoltcp in clash-rs)
+    #[default]
+    Gvisor,
+    /// Mixed: system for TCP, gvisor for UDP (not yet supported in clash-rs)
+    Mixed,
+}
+
+/// Process name lookup mode (mihomo compatible)
+#[derive(Serialize, Deserialize, Default, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum FindProcessMode {
+    /// Only find process name when a process-type rule exists (default)
+    #[default]
+    Strict,
+    /// Find process name for every connection (for API display)
+    Always,
+    /// Never find process name
+    Off,
+}
+
+/// Sniffer configuration (mihomo compatible)
+#[derive(Serialize, Deserialize, Default, Clone, Debug)]
+#[serde(default)]
+#[serde(rename_all = "kebab-case")]
+pub struct SnifferConfig {
+    /// Enable sniffer
+    pub enable: bool,
+    /// Override destination address with sniffed domain
+    #[serde(
+        rename = "override-destination",
+        alias = "override-dest",
+        default = "default_bool_true"
+    )]
+    pub override_dest: bool,
+    /// Sniffer types to enable (e.g., ["tls", "http"])
+    pub sniffing: Vec<String>,
+    /// Force sniffing for these domains
+    pub force_domain: Vec<String>,
+    /// Skip sniffing for these domains
+    pub skip_domain: Vec<String>,
+    /// Skip sniffing for these source addresses
+    pub skip_src_address: Vec<String>,
+    /// Skip sniffing for these destination addresses
+    pub skip_dst_address: Vec<String>,
+    /// Port whitelist for sniffing
+    #[serde(
+        rename = "port-whitelist",
+        alias = "ports",
+        deserialize_with = "deserialize_string_list"
+    )]
+    pub ports: Vec<String>,
+    /// Force DNS mapping for sniffed domains
+    #[serde(default)]
+    pub force_dns_mapping: bool,
+    /// Sniff pure IP connections
+    #[serde(default)]
+    pub parse_pure_ip: bool,
+    /// Modern per-protocol Mihomo sniffer configuration.
+    pub sniff: HashMap<String, SniffingConfig>,
+}
+
+#[derive(Serialize, Deserialize, Default, Clone, Debug)]
+#[serde(default)]
+#[serde(rename_all = "kebab-case")]
+pub struct SniffingConfig {
+    #[serde(deserialize_with = "deserialize_string_list")]
+    pub ports: Vec<String>,
+    pub override_destination: Option<bool>,
+}
+
+fn deserialize_string_list<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Vec::<Value>::deserialize(deserializer)?
+        .into_iter()
+        .map(|value| match value {
+            Value::String(value) => Ok(value),
+            Value::Number(value) => Ok(value.to_string()),
+            _ => Err(serde::de::Error::custom(
+                "expected a string or integer list item",
+            )),
+        })
+        .collect()
+}
+
 #[derive(Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct TunConfig {
@@ -70,7 +164,9 @@ pub struct TunConfig {
     /// - Example: `2001:fac::1/64`
     #[serde(alias = "gateway-v6")]
     pub gateway_v6: Option<String>,
+    #[serde(alias = "route-address")]
     pub routes: Option<Vec<String>>,
+    #[serde(alias = "auto-route")]
     #[serde(default)]
     pub route_all: bool,
     pub mtu: Option<u16>,
@@ -83,6 +179,15 @@ pub struct TunConfig {
     /// setting to a list has the same effect as setting to true
     #[serde(default)]
     pub dns_hijack: DnsHijack,
+    /// Automatically detect the default outbound interface (mihomo compatible)
+    #[serde(default)]
+    pub auto_detect_interface: bool,
+    /// TUN stack implementation (mihomo compatible config field)
+    /// Note: clash-rs currently only supports smoltcp (userspace) stack.
+    /// This field is accepted for config compatibility but does not change
+    /// behavior.
+    #[serde(default)]
+    pub stack: Option<TunStack>,
 }
 
 #[derive(Serialize, Deserialize, Default, Copy, Clone)]
@@ -413,6 +518,9 @@ pub struct Config {
     #[serde(rename = "rules")]
     /// Rule settings
     pub rule: Option<Vec<String>>,
+    /// Named Mihomo sub-rule branches referenced by `SUB-RULE` rules.
+    #[serde(rename = "sub-rules")]
+    pub sub_rules: Option<HashMap<String, Vec<String>>>,
     /// Hosts
     pub hosts: HashMap<String, String>,
     /// Country database path relative to the $CWD
@@ -427,6 +535,11 @@ pub struct Config {
     pub geosite: Option<String>,
     /// Geosite database download url
     pub geosite_download_url: Option<String>,
+
+    /// GeoX download URLs (mihomo compatible nested format)
+    /// When specified, nested values override the flat `mmdb-download-url` etc.
+    #[serde(rename = "geox-url")]
+    pub geox_url: Option<GeoXUrl>,
 
     // these options has default vals,
     // and needs extra processing
@@ -458,9 +571,15 @@ pub struct Config {
     ///   - "https://example.com"
     #[serde(rename = "cors-allow-origins")]
     pub cors_allow_origins: Option<Vec<String>>,
+    /// CORS settings (mihomo compatible nested format)
+    /// When specified, nested `allow-origins` overrides flat
+    /// `cors-allow-origins`
+    #[serde(rename = "external-controller-cors")]
+    pub external_controller_cors: Option<ExternalControllerCors>,
     /// outbound interface name
     /// # Note
     /// - not implemented yet
+    #[serde(alias = "interface-name")]
     pub interface: Option<String>,
     /// fwmark on Linux only
     /// # Note
@@ -476,6 +595,30 @@ pub struct Config {
     pub rule_provider: Option<HashMap<String, RuleProviderDef>>,
     /// experimental settings, if any
     pub experimental: Option<Experimental>,
+
+    /// Use unified delay calculation for URL test (mihomo compatible)
+    /// When true, measures handshake time instead of total RTT for more
+    /// consistent results
+    #[serde(default)]
+    pub unified_delay: bool,
+
+    /// Enable TCP concurrent dialing (mihomo compatible)
+    /// When true, dials all resolved IP addresses in parallel, using the first
+    /// successful connection
+    #[serde(default)]
+    pub tcp_concurrent: bool,
+
+    /// Process name lookup mode (mihomo compatible)
+    /// - "strict" (default): only find process name when a process-type rule
+    ///   exists
+    /// - "always": find process name for every connection
+    /// - "off": never find process name
+    #[serde(default)]
+    pub find_process_mode: FindProcessMode,
+
+    /// Sniffer settings (mihomo compatible)
+    /// Examines connection data to determine the actual protocol/domain
+    pub sniffer: Option<SnifferConfig>,
 
     /// tun settings
     /// # Example
@@ -695,7 +838,9 @@ pub struct DNS {
     /// Proxy server nameservers, used to resolve proxy server hostnames
     pub proxy_server_nameserver: Vec<String>,
     /// Lookup domains via specific nameservers
-    pub nameserver_policy: HashMap<String, String>,
+    /// Value can be a single DNS server string or an array of DNS server
+    /// strings
+    pub nameserver_policy: HashMap<String, Value>,
     /// Configure EDNS Client Subnet information to send with upstream queries
     pub edns_client_subnet: Option<EdnsClientSubnet>,
     /// When true, upstream DNS queries from `nameserver`, `fallback` and
@@ -738,6 +883,40 @@ pub struct EdnsClientSubnet {
     pub ipv4: Option<String>,
     /// IPv6 subnet expressed in CIDR notation, e.g. `2001:db8::/56`
     pub ipv6: Option<String>,
+}
+
+/// GeoX database download URLs (mihomo compatible nested format)
+/// In mihomo, these are specified under `geox-url:` as a nested object.
+/// In clash-rs, they are specified as top-level `mmdb-download-url`, etc.
+/// This struct allows both formats to work.
+#[derive(Serialize, Deserialize, Default, Clone, Debug)]
+#[serde(default)]
+#[serde(rename_all = "kebab-case")]
+pub struct GeoXUrl {
+    /// URL for GeoIP dat database
+    pub geoip: Option<String>,
+    /// URL for MMDB database
+    pub mmdb: Option<String>,
+    /// URL for ASN MMDB database
+    pub asn: Option<String>,
+    /// URL for Geosite database
+    pub geosite: Option<String>,
+}
+
+/// External controller CORS settings (mihomo compatible nested format)
+/// In mihomo, CORS is specified under `external-controller-cors:` as a nested
+/// object. In clash-rs, it's specified as flat `cors-allow-origins` list.
+/// This struct allows the nested format to work.
+#[derive(Serialize, Deserialize, Default, Clone, Debug)]
+#[serde(default)]
+#[serde(rename_all = "kebab-case")]
+pub struct ExternalControllerCors {
+    /// Allowed origins list
+    #[serde(rename = "allow-origins")]
+    pub allow_origins: Option<Vec<String>>,
+    /// Allow private network access
+    #[serde(rename = "allow-private-network")]
+    pub allow_private_network: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -917,18 +1096,16 @@ mod tests {
         assert_eq!(c.port, Some(Port(9090)));
     }
 
-    /// Verify that unknown proxy types (snell, ssr, bare http) now fail at YAML
-    /// parse time rather than silently passing and failing later at conversion.
+    /// Verify that a genuinely unsupported proxy type fails at YAML parse time
+    /// rather than silently passing and failing later at conversion.
     #[test]
     fn parse_rejects_unknown_proxy_type() {
-        let snell = "proxies:\n  - name: x\n    type: snell\n    server: s\n    \
-                     port: 1\n    psk: p\n";
-        assert!(snell.parse::<Config>().is_err(), "snell should be rejected");
-
-        let ssr = "proxies:\n  - name: x\n    type: ssr\n    server: s\n    port: \
-                   1\n    cipher: chacha20-ietf\n    password: p\n    obfs: \
-                   plain\n    protocol: origin\n";
-        assert!(ssr.parse::<Config>().is_err(), "ssr should be rejected");
+        let unknown = "proxies:\n  - name: x\n    type: made-up-proxy\n    server: \
+                       s\n    port: 1\n";
+        assert!(
+            unknown.parse::<Config>().is_err(),
+            "an unknown proxy type should be rejected"
+        );
     }
 
     #[test]

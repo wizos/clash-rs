@@ -1,3 +1,4 @@
+mod mux;
 mod websocket;
 
 pub use websocket::V2rayWsClient;
@@ -12,4 +13,8 @@ pub struct V2RayOBFSOption {
     pub tls: bool,
     pub skip_cert_verify: bool,
     pub mux: bool,
+    pub fingerprint: Option<String>,
+    pub ech: Option<super::TlsEchOptions>,
+    pub certificate: Option<String>,
+    pub private_key: Option<String>,
 }

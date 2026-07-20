@@ -49,4 +49,12 @@ impl RuleMatcher for RuleSet {
     fn type_name(&self) -> &str {
         "RuleSet"
     }
+
+    fn should_resolve_ip(&self) -> bool {
+        self.rule_provider.should_resolve_ip()
+    }
+
+    fn should_resolve_process(&self) -> bool {
+        self.rule_provider.should_resolve_process()
+    }
 }

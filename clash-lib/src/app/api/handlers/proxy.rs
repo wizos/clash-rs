@@ -172,8 +172,9 @@ async fn get_proxy_delay(
         }
     };
 
+    let selected = outbound_manager.selected_delay(actual, overall);
     let mut r = HashMap::new();
-    r.insert("delay".to_owned(), actual.as_millis());
+    r.insert("delay".to_owned(), selected.as_millis());
     r.insert("overall".to_owned(), overall.as_millis());
     (headers, axum::response::Json(r)).into_response()
 }

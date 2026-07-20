@@ -29,6 +29,7 @@ pub struct MmdbLookupCountry {
 
 #[derive(Debug)]
 pub struct MmdbLookupAsn {
+    pub asn_number: u32,
     pub asn_name: String,
 }
 
@@ -70,6 +71,7 @@ impl MmdbLookupTrait for Mmdb {
         {
             Err(err) => Err(new_io_error(err)),
             Ok(Some(asn)) => Ok(MmdbLookupAsn {
+                asn_number: asn.autonomous_system_number.unwrap_or(0),
                 asn_name: asn
                     .autonomous_system_organization
                     .unwrap_or_default()

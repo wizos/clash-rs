@@ -1,5 +1,6 @@
 use std::{
     fs::{self, metadata},
+    io::Write,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime},
@@ -13,7 +14,7 @@ use tracing::{info, trace, warn};
 
 use crate::common::utils;
 
-use super::{ProviderVehicleType, ThreadSafeProviderVehicle};
+use super::{ProviderVehicleType, SubscriptionInfo, ThreadSafeProviderVehicle};
 
 struct Inner {
     updated_at: SystemTime,
@@ -75,8 +76,45 @@ where
         self.vehicle.typ()
     }
 
+    pub fn path(&self) -> &str {
+        self.vehicle.path()
+    }
+
     pub async fn updated_at(&self) -> DateTime<Utc> {
         self.inner.read().await.updated_at.into()
+    }
+
+    pub fn subscription_info(&self) -> Option<SubscriptionInfo> {
+        self.vehicle.subscription_info()
+    }
+
+    pub async fn side_update(&self, content: &[u8]) -> anyhow::Result<(T, bool)> {
+        let parsed = (self.parser)(content)?;
+        let hash: [u8; 16] = utils::md5(content)[..16]
+            .try_into()
+            .expect("md5 must be 16 bytes");
+        let path = Path::new(self.vehicle.path());
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
+        }
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+        temporary.write_all(content)?;
+        temporary.as_file().sync_all()?;
+        if let Err(error) = temporary.persist(path) {
+            // Windows cannot replace an open destination with rename. Keep the
+            // validated temporary file as the source for the best-effort
+            // compatibility fallback.
+            fs::copy(error.file.path(), path)?;
+        }
+
+        let mut inner = self.inner.write().await;
+        let same = inner.hash == hash;
+        inner.hash = hash;
+        inner.updated_at = SystemTime::now();
+        Ok((parsed, same))
     }
 
     pub async fn initial(&self) -> anyhow::Result<T> {
@@ -224,6 +262,7 @@ where
             info!("fetcher {} updated", name);
             on_update(elm).await;
         }
+        crate::app::events::emit("loaded", name);
     }
 
     /// Watch the provider's local file and reload its content on change.
@@ -351,6 +390,9 @@ where
                 )
             };
 
+            // Tokio intervals tick immediately once. Consume that tick so a
+            // fresh cache waits for its configured interval before updating.
+            ticker.tick().await;
             if fire_immediately {
                 run(()).await;
             }
@@ -366,7 +408,14 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{path::Path, sync::Arc, time::Duration};
+    use std::{
+        path::Path,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
 
     use futures::future::BoxFuture;
     use tokio::time::sleep;
@@ -438,5 +487,75 @@ mod tests {
         assert!(parsed.len() > 5);
         assert_eq!(parsed[0], vec![1, 2, 3]);
         assert_eq!(parsed[1], vec![4, 5, 6]);
+    }
+
+    #[tokio::test]
+    async fn fresh_cache_does_not_update_immediately() {
+        let mock_file = std::env::temp_dir()
+            .join(format!("fresh_provider_cache-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&mock_file, vec![1, 2, 3]).unwrap();
+
+        let reads = Arc::new(AtomicUsize::new(0));
+        let reads_clone = reads.clone();
+        let mut mock_vehicle = MockProviderVehicle::new();
+        mock_vehicle
+            .expect_path()
+            .return_const(mock_file.to_str().unwrap().to_owned());
+        mock_vehicle.expect_read().returning(move || {
+            reads_clone.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![4, 5, 6])
+        });
+        mock_vehicle
+            .expect_typ()
+            .return_const(ProviderVehicleType::File);
+
+        let mut fetcher = Fetcher::new(
+            "fresh-cache".to_owned(),
+            Duration::from_secs(3600),
+            Arc::new(mock_vehicle),
+            |input: &[u8]| Ok(input.to_vec()),
+            None::<fn(Vec<u8>) -> BoxFuture<'static, ()>>,
+        );
+
+        fetcher.initial().await.unwrap();
+        sleep(Duration::from_millis(50)).await;
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+
+        fetcher.destroy().await;
+        std::fs::remove_file(mock_file).unwrap();
+    }
+
+    #[tokio::test]
+    async fn side_load_validates_before_atomically_replacing_cache() {
+        let cache = std::env::temp_dir()
+            .join(format!("side-loaded-provider-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&cache, b"old-valid").unwrap();
+
+        let mut vehicle = MockProviderVehicle::new();
+        vehicle
+            .expect_path()
+            .return_const(cache.to_string_lossy().into_owned());
+        vehicle.expect_typ().return_const(ProviderVehicleType::File);
+        let fetcher = Fetcher::new(
+            "side-load".to_owned(),
+            Duration::from_secs(3600),
+            Arc::new(vehicle),
+            |content: &[u8]| {
+                let content = std::str::from_utf8(content)?;
+                anyhow::ensure!(content.ends_with("-valid"), "invalid provider");
+                Ok(content.to_owned())
+            },
+            None::<fn(String) -> BoxFuture<'static, ()>>,
+        );
+
+        assert!(fetcher.side_update(b"bad").await.is_err());
+        assert_eq!(std::fs::read(&cache).unwrap(), b"old-valid");
+
+        let (parsed, same) = fetcher.side_update(b"new-valid").await.unwrap();
+        assert_eq!(parsed, "new-valid");
+        assert!(!same);
+        assert_eq!(std::fs::read(&cache).unwrap(), b"new-valid");
+
+        std::fs::remove_file(cache).unwrap();
     }
 }

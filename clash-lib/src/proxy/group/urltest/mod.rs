@@ -65,66 +65,57 @@ impl Handler {
     }
 
     async fn fastest(&self, touch: bool) -> Option<AnyOutboundHandler> {
-        let proxy_manager = self.proxy_manager.clone();
-
         let proxies = self.get_proxies(touch).await;
-        let mut fastest = proxies.first()?;
-
-        let mut fastest_delay = proxy_manager
-            .last_delay(fastest.name())
-            .await
-            .unwrap_or(Duration::from_secs(u64::MAX));
-        let mut fast_not_exist = true;
-
-        let current_fastest_index = std::cmp::min(
+        if proxies.is_empty() {
+            return None;
+        }
+        let current_index = std::cmp::min(
             self.fastest_proxy_index
                 .load(std::sync::atomic::Ordering::Relaxed),
             proxies.len() as u16 - 1,
-        );
-
-        for proxy in proxies.iter().skip(1) {
-            if proxy.name() == proxies[current_fastest_index as usize].name() {
-                fast_not_exist = false;
-            }
-
-            if !proxy_manager.alive(proxy.name()).await {
-                continue;
-            }
-
-            let delay = proxy_manager.last_delay(proxy.name()).await;
-            if delay.is_some_and(|d| d < fastest_delay) {
-                fastest = proxy;
-                fastest_delay = delay.unwrap();
-            }
-
-            if fast_not_exist
-                || proxy_manager.alive(fastest.name()).await
-                || proxy_manager
-                    .last_delay(proxies[current_fastest_index as usize].name())
-                    .await
-                    .is_some_and(|d| {
-                        d > (fastest_delay
-                            + Duration::from_millis(self.tolerance as u64))
-                    })
-            {
-                self.fastest_proxy_index.store(
-                    proxies
-                        .iter()
-                        .position(|p| p.name() == fastest.name())
-                        .unwrap() as u16,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-            }
+        ) as usize;
+        let mut delays = Vec::with_capacity(proxies.len());
+        for proxy in &proxies {
+            delays.push(self.proxy_manager.last_delay(proxy.name()).await);
         }
+        let selected_index = select_fastest_index(
+            current_index,
+            Duration::from_millis(self.tolerance as u64),
+            &delays,
+        );
+        self.fastest_proxy_index
+            .store(selected_index as u16, std::sync::atomic::Ordering::Relaxed);
+        let selected = &proxies[selected_index];
 
         trace!(
-            fastest = %fastest.name(),
-            delay = ?fastest_delay,
+            fastest = %selected.name(),
+            delay = ?delays[selected_index],
             "`{}` fastest",
             self.name(),
         );
 
-        Some(fastest.clone())
+        Some(selected.clone())
+    }
+}
+
+fn select_fastest_index(
+    current_index: usize,
+    tolerance: Duration,
+    delays: &[Option<Duration>],
+) -> usize {
+    let fastest = delays
+        .iter()
+        .enumerate()
+        .filter_map(|(index, delay)| delay.map(|delay| (index, delay)))
+        .min_by_key(|(_, delay)| *delay);
+    let Some((fastest_index, fastest_delay)) = fastest else {
+        return current_index.min(delays.len().saturating_sub(1));
+    };
+    match delays.get(current_index).copied().flatten() {
+        Some(current_delay) if current_delay <= fastest_delay + tolerance => {
+            current_index
+        }
+        _ => fastest_index,
     }
 }
 
@@ -252,7 +243,7 @@ impl GroupProxyAPIResponse for Handler {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Duration};
 
     use crate::{
         app::remote_content_manager::ProxyManager,
@@ -281,5 +272,21 @@ mod tests {
         );
 
         assert!(handler.get_active_proxy().await.is_none());
+    }
+
+    #[test]
+    fn tolerance_keeps_current_proxy_until_it_is_materially_slower() {
+        let delays = [
+            Some(Duration::from_millis(120)),
+            Some(Duration::from_millis(100)),
+        ];
+        assert_eq!(
+            super::select_fastest_index(0, Duration::from_millis(30), &delays),
+            0
+        );
+        assert_eq!(
+            super::select_fastest_index(0, Duration::from_millis(10), &delays),
+            1
+        );
     }
 }

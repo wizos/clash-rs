@@ -254,6 +254,8 @@ mod tests {
             cipher: CIPHER.to_owned(),
             plugin: Default::default(),
             udp: false,
+            udp_over_tcp: false,
+            udp_over_tcp_version: crate::proxy::uot::LEGACY_VERSION,
         };
 
         let ss_handler: AnyOutboundHandler =
@@ -290,6 +292,8 @@ mod tests {
             cipher: CIPHER.to_owned(),
             plugin: Default::default(),
             udp: false,
+            udp_over_tcp: false,
+            udp_over_tcp_version: crate::proxy::uot::LEGACY_VERSION,
         };
 
         let ss_handler: AnyOutboundHandler =

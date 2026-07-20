@@ -39,7 +39,7 @@ pub(super) fn convert(
     if let Some(Port(http_port)) = http_port
         && !all_inbounds.insert(InboundOpts::Http {
             common_opts: CommonInboundOpts {
-                name: "HTTP-IN".into(),
+                name: "DEFAULT-HTTP".into(),
                 listen: bind_address,
                 port: http_port,
                 allow_lan: c.allow_lan.unwrap_or_default(),
@@ -52,7 +52,7 @@ pub(super) fn convert(
     if let Some(Port(socks_port)) = socks_port
         && !all_inbounds.insert(InboundOpts::Socks {
             common_opts: CommonInboundOpts {
-                name: "SOCKS-IN".into(),
+                name: "DEFAULT-SOCKS".into(),
                 listen: bind_address,
                 port: socks_port,
                 allow_lan: c.allow_lan.unwrap_or_default(),
@@ -66,7 +66,7 @@ pub(super) fn convert(
     if let Some(Port(mixed_port)) = mixed_port
         && !all_inbounds.insert(InboundOpts::Mixed {
             common_opts: CommonInboundOpts {
-                name: "MIXED-IN".into(),
+                name: "DEFAULT-MIXED".into(),
                 listen: bind_address,
                 port: mixed_port,
                 allow_lan: c.allow_lan.unwrap_or_default(),
@@ -81,7 +81,7 @@ pub(super) fn convert(
     if let Some(Port(redir_port)) = redir_port
         && !all_inbounds.insert(InboundOpts::Redir {
             common_opts: CommonInboundOpts {
-                name: "REDIR-IN".into(),
+                name: "DEFAULT-REDIR".into(),
                 listen: bind_address,
                 port: redir_port,
                 allow_lan: c.allow_lan.unwrap_or_default(),
@@ -95,7 +95,7 @@ pub(super) fn convert(
     if let Some(Port(tproxy_port)) = tproxy_port
         && !all_inbounds.insert(InboundOpts::TProxy {
             common_opts: CommonInboundOpts {
-                name: "TPROXY-IN".into(),
+                name: "DEFAULT-TPROXY".into(),
                 listen: bind_address,
                 port: tproxy_port,
                 allow_lan: c.allow_lan.unwrap_or_default(),

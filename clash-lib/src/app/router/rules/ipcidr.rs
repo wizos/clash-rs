@@ -40,7 +40,7 @@ impl RuleMatcher for IpCidr {
     }
 
     fn should_resolve_ip(&self) -> bool {
-        !self.no_resolve
+        !self.match_src && !self.no_resolve
     }
 
     fn payload(&self) -> String {

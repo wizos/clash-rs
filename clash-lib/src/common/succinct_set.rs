@@ -18,6 +18,13 @@ pub struct DomainSet {
 }
 
 impl DomainSet {
+    pub fn len(&self) -> usize {
+        self.leaves
+            .iter()
+            .map(|word| word.count_ones() as usize)
+            .sum()
+    }
+
     pub fn has(&self, key: &str) -> bool {
         let key = key
             .chars()

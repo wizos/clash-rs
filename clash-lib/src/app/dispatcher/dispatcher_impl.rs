@@ -4,6 +4,7 @@ use crate::{
         dns::ClashResolver,
         outbound::manager::ThreadSafeOutboundManager,
         router::ArcRouter,
+        sniffer::{Sniffer, UdpSniffStatus},
     },
     common::io::copy_bidirectional,
     config::{
@@ -17,10 +18,13 @@ use crate::{
 };
 use futures::{SinkExt, StreamExt};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fmt::{Debug, Formatter},
     net::SocketAddr,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tokio::{io::AsyncWriteExt, sync::RwLock, task::JoinHandle};
@@ -43,6 +47,10 @@ pub struct Dispatcher {
     mode: Arc<RwLock<RunMode>>,
     manager: Arc<Manager>,
     tcp_buffer_size: usize,
+    inbound_name: String,
+    inbound_port: u16,
+    sniffer: Option<Arc<Sniffer>>,
+    suspended: Arc<AtomicBool>,
 }
 
 impl Debug for Dispatcher {
@@ -59,6 +67,7 @@ impl Dispatcher {
         mode: RunMode,
         statistics_manager: Arc<Manager>,
         tcp_buffer_size: Option<usize>,
+        sniffer: Option<Sniffer>,
     ) -> Self {
         Self {
             outbound_manager,
@@ -67,6 +76,37 @@ impl Dispatcher {
             mode: Arc::new(RwLock::new(mode)),
             manager: statistics_manager,
             tcp_buffer_size: tcp_buffer_size.unwrap_or(DEFAULT_BUFFER_SIZE),
+            inbound_name: String::new(),
+            inbound_port: 0,
+            sniffer: sniffer.map(Arc::new),
+            suspended: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Create a lightweight dispatcher view which attaches the accepting
+    /// listener's metadata before routing. All expensive managers remain
+    /// shared.
+    pub fn with_inbound_metadata(&self, name: impl Into<String>, port: u16) -> Self {
+        Self {
+            outbound_manager: self.outbound_manager.clone(),
+            router: self.router.clone(),
+            resolver: self.resolver.clone(),
+            mode: self.mode.clone(),
+            manager: self.manager.clone(),
+            tcp_buffer_size: self.tcp_buffer_size,
+            inbound_name: name.into(),
+            inbound_port: port,
+            sniffer: self.sniffer.clone(),
+            suspended: self.suspended.clone(),
+        }
+    }
+
+    fn attach_inbound_metadata(&self, sess: &mut Session) {
+        if sess.inbound_name.is_empty() {
+            sess.inbound_name.clone_from(&self.inbound_name);
+        }
+        if sess.inbound_port == 0 {
+            sess.inbound_port = self.inbound_port;
         }
     }
 
@@ -74,6 +114,20 @@ impl Dispatcher {
         info!("run mode switched to {}", mode);
 
         *self.mode.write().await = mode;
+    }
+
+    pub fn set_sniffing(&self, enabled: bool) {
+        if let Some(sniffer) = &self.sniffer {
+            sniffer.set_enabled(enabled);
+        }
+    }
+
+    pub fn set_suspended(&self, suspended: bool) {
+        self.suspended.store(suspended, Ordering::Relaxed);
+    }
+
+    pub fn is_suspended(&self) -> bool {
+        self.suspended.load(Ordering::Relaxed)
     }
 
     pub async fn get_mode(&self) -> RunMode {
@@ -86,6 +140,14 @@ impl Dispatcher {
         mut sess: Session,
         mut lhs: Box<dyn ClientStream>,
     ) {
+        if self.is_suspended() {
+            return;
+        }
+        self.attach_inbound_metadata(&mut sess);
+        let original_destination = sess.destination.clone();
+        if crate::process_resolver::should_resolve_always() {
+            crate::process_resolver::resolve_session(&mut sess);
+        }
         let dest: SocksAddr =
             match reverse_lookup(&self.resolver, &sess.destination).await {
                 Some(dest) => dest,
@@ -96,6 +158,11 @@ impl Dispatcher {
             };
 
         sess.destination = dest.clone();
+        if let Some(sniffer) = &self.sniffer {
+            lhs = sniffer
+                .sniff_tcp(&mut sess, &original_destination, lhs)
+                .await;
+        }
 
         let mode = *self.mode.read().await;
         let (outbound_name, rule) = match mode {
@@ -224,9 +291,13 @@ impl Dispatcher {
     #[must_use]
     pub async fn dispatch_datagram(
         &self,
-        sess: Session,
+        mut sess: Session,
         udp_inbound: AnyInboundDatagram,
     ) -> tokio::sync::oneshot::Sender<u8> {
+        if self.is_suspended() {
+            return tokio::sync::oneshot::channel().0;
+        }
+        self.attach_inbound_metadata(&mut sess);
         let outbound_handle_guard = TimeoutUdpSessionManager::new();
 
         let router = self.router.clone();
@@ -234,6 +305,7 @@ impl Dispatcher {
         let resolver = self.resolver.clone();
         let mode = self.mode.clone();
         let manager = self.manager.clone();
+        let sniffer = self.sniffer.clone();
 
         #[rustfmt::skip]
         /*
@@ -260,7 +332,15 @@ impl Dispatcher {
         let s = sess.clone();
         let ss = sess.clone();
         let t1 = tokio::spawn(async move {
-            while let Some(mut packet) = local_r.next().await {
+            let mut backlog = VecDeque::new();
+            loop {
+                let packet = match backlog.pop_front() {
+                    Some(packet) => Some(packet),
+                    None => local_r.next().await,
+                };
+                let Some(mut packet) = packet else {
+                    break;
+                };
                 let mut sess = sess.clone();
 
                 // Canonicalize IPv4-mapped IPv6 addresses (e.g. SS2022 on a
@@ -270,29 +350,114 @@ impl Dispatcher {
                     *addr = addr.to_canonical();
                     sess.resolved_ip = Some(addr.ip());
                 }
+                let flow_destination = packet
+                    .dst_addr
+                    .clone()
+                    .try_into_socket_addr()
+                    .map(|addr| addr.to_canonical());
+                let original_destination = packet.dst_addr.clone();
 
-                let dest = match reverse_lookup(&resolver, &packet.dst_addr).await {
-                    Some(dest) => dest,
-                    None => {
-                        warn!("failed to resolve destination {}", sess);
-                        continue;
-                    }
-                };
-
-                // Canonicalize IPv4-mapped IPv6 source addresses (e.g. a
-                // client connecting via IPv4 on a dual-stack inbound socket
-                // appears as ::ffff:x.x.x.x).  Without canonicalization,
-                // direct/mod.rs sees sess.source.is_ipv4() == false and picks
-                // bind_addr=:: while family_hint picks AF_INET for the
-                // destination — binding an AF_INET socket to [::]:0 fails with
-                // EAFNOSUPPORT (os error 97), silently dropping all UDP replies.
+                // Canonicalize IPv4-mapped IPv6 source addresses before
+                // process and sniffer lookups.
                 sess.source = packet
                     .src_addr
                     .clone()
                     .must_into_socket_addr()
                     .to_canonical();
+
+                let mut dest =
+                    match reverse_lookup(&resolver, &packet.dst_addr).await {
+                        Some(dest) => dest,
+                        None => {
+                            warn!("failed to resolve destination {}", sess);
+                            continue;
+                        }
+                    };
+
                 sess.destination = dest.clone();
                 sess.inbound_user = packet.inbound_user.clone();
+                if let Some(destination) = flow_destination
+                    && let Some(dscp) = crate::flow_metadata::dscp(
+                        crate::session::Network::Udp,
+                        sess.source,
+                        destination,
+                    )
+                {
+                    sess.dscp = dscp;
+                }
+                if crate::process_resolver::should_resolve_always() {
+                    crate::process_resolver::resolve_session(&mut sess);
+                }
+                if let Some(sniffer) = &sniffer {
+                    let status = sniffer.sniff_udp(
+                        &mut sess,
+                        &original_destination,
+                        &packet.data,
+                    );
+                    if status == UdpSniffStatus::Pending {
+                        let flow_source = sess.source;
+                        let deadline =
+                            tokio::time::Instant::now() + sniffer.udp_wait_timeout();
+                        let mut buffered = vec![packet];
+                        let mut matched = false;
+
+                        loop {
+                            let remaining = deadline.saturating_duration_since(
+                                tokio::time::Instant::now(),
+                            );
+                            if remaining.is_zero() {
+                                break;
+                            }
+                            let next =
+                                tokio::time::timeout(remaining, local_r.next())
+                                    .await;
+                            let Ok(Some(mut next_packet)) = next else {
+                                break;
+                            };
+
+                            if let SocksAddr::Ip(addr) = &mut next_packet.dst_addr {
+                                *addr = addr.to_canonical();
+                            }
+                            let next_source = next_packet
+                                .src_addr
+                                .clone()
+                                .must_into_socket_addr()
+                                .to_canonical();
+                            if next_source != flow_source
+                                || next_packet.dst_addr != original_destination
+                            {
+                                backlog.push_back(next_packet);
+                                continue;
+                            }
+
+                            let mut sniff_session = sess.clone();
+                            sniff_session.source = next_source;
+                            let next_status = sniffer.sniff_udp(
+                                &mut sniff_session,
+                                &original_destination,
+                                &next_packet.data,
+                            );
+                            buffered.push(next_packet);
+                            match next_status {
+                                UdpSniffStatus::Matched => {
+                                    matched = true;
+                                    break;
+                                }
+                                UdpSniffStatus::NotApplicable => break,
+                                UdpSniffStatus::Pending => {}
+                            }
+                        }
+
+                        if !matched {
+                            sniffer.finish_udp_wait(&sess, &original_destination);
+                        }
+                        for buffered_packet in buffered.into_iter().rev() {
+                            backlog.push_front(buffered_packet);
+                        }
+                        continue;
+                    }
+                    dest = sess.destination.clone();
+                }
 
                 let mode = *mode.read().await;
 

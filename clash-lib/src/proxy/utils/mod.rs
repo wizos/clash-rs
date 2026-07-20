@@ -2,6 +2,7 @@
 pub mod test_utils;
 
 mod platform;
+mod quinn_datagram;
 
 pub mod provider_helper;
 mod proxy_connector;
@@ -9,6 +10,7 @@ mod shared_handler;
 mod socket_helpers;
 
 pub use proxy_connector::*;
+pub use quinn_datagram::QuinnDatagramSocket;
 pub use shared_handler::{
     OutboundHandlerRegistry, SharedOutboundHandler, direct_only_registry,
 };

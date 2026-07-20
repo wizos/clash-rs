@@ -48,6 +48,7 @@ const MATCH: &str = "MATCH";
 impl Router {
     pub async fn new(
         rules: Vec<RuleType>,
+        sub_rules: HashMap<String, Vec<RuleType>>,
         rule_providers: HashMap<String, RuleProviderDef>,
         dns_resolver: ThreadSafeDNSResolver,
         country_mmdb: Option<MmdbLookup>,
@@ -68,18 +69,47 @@ impl Router {
         .await
         .ok();
 
+        let sub_rule_registry = rules::subrule::SubRuleRegistry::default();
+        let rules = rules
+            .into_iter()
+            .map(|r| {
+                map_rule_type(
+                    r,
+                    country_mmdb.clone(),
+                    asn_mmdb.clone(),
+                    geodata.clone(),
+                    Some(&rule_provider_registry),
+                    Some(&sub_rule_registry),
+                )
+            })
+            .collect();
+        let converted_sub_rules = sub_rules
+            .into_iter()
+            .map(|(name, rules)| {
+                let rules = rules
+                    .into_iter()
+                    .map(|rule| {
+                        map_rule_type(
+                            rule,
+                            country_mmdb.clone(),
+                            asn_mmdb.clone(),
+                            geodata.clone(),
+                            Some(&rule_provider_registry),
+                            Some(&sub_rule_registry),
+                        )
+                    })
+                    .collect();
+                (name, rules)
+            })
+            .collect();
+        sub_rule_registry
+            .set(converted_sub_rules)
+            .unwrap_or_else(|_| {
+                unreachable!("new sub-rule registry was already set")
+            });
+
         Self {
-            rules: rules
-                .into_iter()
-                .map(|r| {
-                    map_rule_type(
-                        r,
-                        country_mmdb.clone(),
-                        geodata.clone(),
-                        Some(&rule_provider_registry),
-                    )
-                })
-                .collect(),
+            rules,
             dns_resolver,
 
             country_mmdb,
@@ -100,6 +130,11 @@ impl Router {
         let mut sess_resolved = false;
 
         for r in self.rules.iter() {
+            if r.should_resolve_process()
+                && crate::process_resolver::should_resolve_for_rule()
+            {
+                crate::process_resolver::resolve_session(sess);
+            }
             // Resolve IP when needed
             if sess.destination.is_domain()
                 && r.should_resolve_ip()
@@ -123,14 +158,9 @@ impl Router {
                 );
             }
 
-            if r.apply(sess) {
-                info!(
-                    "matched {} to target {}[{}]",
-                    &sess,
-                    r.target(),
-                    r.type_name()
-                );
-                return (r.target(), Some(r));
+            if let Some(target) = r.route_target(sess) {
+                info!("matched {} to target {}[{}]", &sess, target, r.type_name());
+                return (target, Some(r));
             }
         }
 
@@ -202,9 +232,11 @@ impl Router {
             match provider {
                 RuleProviderDef::Http(http) => {
                     let vehicle = http_vehicle::Vehicle::new(
-                        http.url.parse::<Uri>().unwrap_or_else(|_| {
-                            print_and_exit!("invalid provider url: {}", http.url)
-                        }),
+                        http.url.parse::<Uri>().map_err(|error| {
+                            Error::InvalidConfig(format!(
+                                "invalid URL for rule provider `{name}`: {error}"
+                            ))
+                        })?,
                         http.path,
                         Some(cwd.clone()),
                         resolver.clone(),
@@ -301,8 +333,10 @@ impl Router {
 pub fn map_rule_type(
     rule_type: RuleType,
     mmdb: Option<MmdbLookup>,
+    asn_mmdb: Option<MmdbLookup>,
     geodata: Option<GeoDataLookup>,
     rule_provider_registry: Option<&HashMap<String, ThreadSafeRuleProvider>>,
+    sub_rule_registry: Option<&rules::subrule::SubRuleRegistry>,
 ) -> Box<dyn RuleMatcher> {
     match rule_type {
         RuleType::Domain { domain, target } => {
@@ -325,15 +359,19 @@ pub fn map_rule_type(
             keyword: domain_keyword,
             target,
         }),
+        RuleType::DomainWildcard { pattern, target } => {
+            Box::new(rules::wildcard::DomainWildcard { pattern, target })
+        }
         RuleType::IpCidr {
             ipnet,
             target,
             no_resolve,
+            is_src,
         } => Box::new(IpCidr {
             ipnet,
             target,
             no_resolve,
-            match_src: false,
+            match_src: is_src,
         }),
         RuleType::SrcCidr {
             ipnet,
@@ -345,16 +383,58 @@ pub fn map_rule_type(
             no_resolve,
             match_src: true,
         }),
+        RuleType::IpSuffix {
+            ipnet,
+            target,
+            no_resolve,
+            is_src,
+        } => Box::new(rules::ipsuffix::IpSuffix {
+            ipnet,
+            target,
+            no_resolve,
+            is_src,
+        }),
 
         RuleType::GeoIP {
             target,
             country_code,
             no_resolve,
+            is_src,
         } => Box::new(rules::geoip::GeoIP {
             target,
             country_code,
             no_resolve,
+            is_src,
             mmdb: mmdb.clone(),
+        }),
+        RuleType::SrcGeoIP {
+            target,
+            country_code,
+        } => Box::new(rules::geoip::GeoIP {
+            target,
+            country_code,
+            no_resolve: true,
+            is_src: true,
+            mmdb: mmdb.clone(),
+        }),
+        RuleType::IpAsn {
+            target,
+            asn,
+            no_resolve,
+            is_src,
+        } => Box::new(rules::ipasn::IpAsn {
+            target,
+            asn,
+            no_resolve,
+            is_src,
+            mmdb: asn_mmdb.clone(),
+        }),
+        RuleType::SrcIpAsn { target, asn } => Box::new(rules::ipasn::IpAsn {
+            target,
+            asn,
+            no_resolve: true,
+            is_src: true,
+            mmdb: asn_mmdb.clone(),
         }),
         RuleType::GeoSite {
             target,
@@ -368,15 +448,35 @@ pub fn map_rule_type(
             .unwrap();
             Box::new(res) as _
         }
-        RuleType::SRCPort { target, port } => Box::new(rules::port::Port {
-            port,
+        RuleType::SRCPort {
             target,
-            is_src: true,
+            payload,
+            port_ranges,
+        } => Box::new(rules::port::Port {
+            payload,
+            port_ranges,
+            target,
+            kind: rules::port::PortKind::Source,
         }),
-        RuleType::DSTPort { target, port } => Box::new(rules::port::Port {
-            port,
+        RuleType::DSTPort {
             target,
-            is_src: false,
+            payload,
+            port_ranges,
+        } => Box::new(rules::port::Port {
+            payload,
+            port_ranges,
+            target,
+            kind: rules::port::PortKind::Destination,
+        }),
+        RuleType::InboundPort {
+            target,
+            payload,
+            port_ranges,
+        } => Box::new(rules::port::Port {
+            payload,
+            port_ranges,
+            target,
+            kind: rules::port::PortKind::Inbound,
         }),
         RuleType::ProcessName {
             process_name,
@@ -385,6 +485,8 @@ pub fn map_rule_type(
             name: process_name,
             target,
             name_only: true,
+            regex: None,
+            wildcard: false,
         }),
         RuleType::ProcessPath {
             process_path,
@@ -393,6 +495,85 @@ pub fn map_rule_type(
             name: process_path,
             target,
             name_only: false,
+            regex: None,
+            wildcard: false,
+        }),
+        RuleType::ProcessNameRegex { regex, target } => {
+            Box::new(rules::process::Process {
+                name: regex.as_str().to_string(),
+                target,
+                name_only: true,
+                regex: Some(regex),
+                wildcard: false,
+            })
+        }
+        RuleType::ProcessPathRegex { regex, target } => {
+            Box::new(rules::process::Process {
+                name: regex.as_str().to_string(),
+                target,
+                name_only: false,
+                regex: Some(regex),
+                wildcard: false,
+            })
+        }
+        RuleType::ProcessNameWildcard { pattern, target } => {
+            Box::new(rules::process::Process {
+                name: pattern,
+                target,
+                name_only: true,
+                regex: None,
+                wildcard: true,
+            })
+        }
+        RuleType::ProcessPathWildcard { pattern, target } => {
+            Box::new(rules::process::Process {
+                name: pattern,
+                target,
+                name_only: false,
+                regex: None,
+                wildcard: true,
+            })
+        }
+        RuleType::InboundType {
+            inbound_types,
+            target,
+        } => Box::new(rules::inbound::InboundType {
+            inbound_types,
+            target,
+        }),
+        RuleType::InboundUser {
+            inbound_users,
+            target,
+        } => Box::new(rules::inbound::InboundUser {
+            inbound_users,
+            target,
+        }),
+        RuleType::InboundName {
+            inbound_names,
+            target,
+        } => Box::new(rules::inbound::InboundName {
+            inbound_names,
+            target,
+        }),
+        RuleType::Uid {
+            payload,
+            uid_ranges,
+            target,
+        } => Box::new(rules::metadata::Metadata {
+            payload,
+            ranges: uid_ranges,
+            target,
+            kind: rules::metadata::MetadataKind::Uid,
+        }),
+        RuleType::Dscp {
+            payload,
+            dscp_ranges,
+            target,
+        } => Box::new(rules::metadata::Metadata {
+            payload,
+            ranges: dscp_ranges,
+            target,
+            kind: rules::metadata::MetadataKind::Dscp,
         }),
         RuleType::RuleSet { rule_set, target } => match rule_provider_registry {
             Some(rule_provider_registry) => Box::new(RuleSet::new(
@@ -424,6 +605,7 @@ pub fn map_rule_type(
                 &expression,
                 &target,
                 mmdb,
+                asn_mmdb,
                 geodata,
                 rule_provider_registry,
             ) {
@@ -439,6 +621,28 @@ pub fn map_rule_type(
                     })
                 }
             }
+        }
+        RuleType::SubRule {
+            condition,
+            payload,
+            sub_rule,
+        } => {
+            let registry = sub_rule_registry
+                .expect("SUB-RULE is not supported inside rule providers")
+                .clone();
+            Box::new(rules::subrule::SubRule {
+                condition: map_rule_type(
+                    *condition,
+                    mmdb,
+                    asn_mmdb,
+                    geodata,
+                    rule_provider_registry,
+                    Some(&registry),
+                ),
+                payload,
+                name: sub_rule,
+                registry,
+            })
         }
         RuleType::Match { target } => Box::new(Final { target }),
     }
@@ -510,6 +714,7 @@ mod tests {
                     target: "DIRECT".to_string(),
                     country_code: "CN".to_string(),
                     no_resolve: false,
+                    is_src: false,
                 },
                 RuleType::DomainRegex {
                     regex: regex::Regex::new(r"^regex").unwrap(),
@@ -523,12 +728,14 @@ mod tests {
                     ipnet: "149.154.0.0/16".parse().unwrap(),
                     target: "IC".to_string(),
                     no_resolve: false,
+                    is_src: false,
                 },
                 RuleType::DomainSuffix {
                     domain_suffix: "git.io".to_string(),
                     target: "DS2".to_string(),
                 },
             ],
+            Default::default(),
             Default::default(),
             mock_resolver,
             Some(Arc::new(mmdb)),
@@ -595,6 +802,7 @@ mod tests {
                 },
             ],
             Default::default(),
+            Default::default(),
             mock_resolver,
             None,
             None,
@@ -632,5 +840,57 @@ mod tests {
             "UDP-PROXY",
             "should match UDP network rule"
         );
+    }
+
+    #[tokio::test]
+    async fn test_sub_rule_routes_to_nested_target() {
+        initialize();
+
+        let mut mock_resolver = MockClashResolver::new();
+        mock_resolver.expect_resolve().returning(|_, _| Ok(None));
+        let mock_resolver = Arc::new(mock_resolver);
+        let sub_rules = std::collections::HashMap::from([(
+            "tcp-branch".to_string(),
+            vec![
+                RuleType::Domain {
+                    domain: "example.com".to_string(),
+                    target: "DIRECT".to_string(),
+                },
+                RuleType::Match {
+                    target: "REJECT".to_string(),
+                },
+            ],
+        )]);
+        let router = super::Router::new(
+            vec![RuleType::SubRule {
+                condition: Box::new(RuleType::Network {
+                    network: crate::session::Network::Tcp,
+                    target: String::new(),
+                }),
+                payload: "(NETWORK,TCP)".to_string(),
+                sub_rule: "tcp-branch".to_string(),
+            }],
+            sub_rules,
+            Default::default(),
+            mock_resolver,
+            None,
+            None,
+            None,
+            std::env::temp_dir().to_str().unwrap().to_string(),
+        )
+        .await;
+
+        let mut session = Session {
+            network: crate::session::Network::Tcp,
+            destination: crate::session::SocksAddr::Domain(
+                "example.com".to_string(),
+                443,
+            ),
+            ..Default::default()
+        };
+        assert_eq!(router.match_route(&mut session).await.0, "DIRECT");
+
+        session.network = crate::session::Network::Udp;
+        assert_eq!(router.match_route(&mut session).await.0, "MATCH");
     }
 }

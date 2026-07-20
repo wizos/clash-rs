@@ -1,6 +1,9 @@
+use std::time::Duration;
+
 use tracing::warn;
 
 use crate::{
+    Error,
     config::internal::proxy::OutboundAnytls,
     proxy::{
         HandlerCommonOptions,
@@ -30,21 +33,6 @@ impl TryFrom<&OutboundAnytls> for Handler {
                 s.common_opts.server
             );
         }
-        if s.fingerprint.is_some() || s.client_fingerprint.is_some() {
-            warn!(
-                "anytls fingerprint fields are parsed but not applied yet for {}",
-                s.common_opts.name
-            );
-        }
-        if s.idle_session_check_interval.is_some()
-            || s.idle_session_timeout.is_some()
-            || s.min_idle_session.is_some()
-        {
-            warn!(
-                "anytls idle-session fields are parsed but not applied yet for {}",
-                s.common_opts.name
-            );
-        }
         Ok(Handler::new(HandlerOptions {
             name: s.common_opts.name.to_owned(),
             common_opts: HandlerCommonOptions {
@@ -56,7 +44,7 @@ impl TryFrom<&OutboundAnytls> for Handler {
             password: s.password.clone(),
             udp: s.udp.unwrap_or_default(),
             tls: {
-                let client = TlsClient::new(
+                let client = TlsClient::new_mihomo(
                     skip_cert_verify,
                     s.sni
                         .clone()
@@ -65,12 +53,30 @@ impl TryFrom<&OutboundAnytls> for Handler {
                         .clone()
                         .or(Some(DEFAULT_ALPN.map(str::to_owned).to_vec())),
                     None,
+                    s.fingerprint.clone(),
+                    s.client_fingerprint.as_deref(),
+                    super::utils::tls_ech_options(s.ech_opts.as_ref()),
                     s.tls_cert.as_deref(),
                     s.tls_key.as_deref(),
                 )?;
-                Some(Box::new(client))
+                Some(client)
             },
             transport: None,
+            idle_session_check_interval: Duration::from_secs(
+                s.idle_session_check_interval.unwrap_or_default(),
+            ),
+            idle_session_timeout: Duration::from_secs(
+                s.idle_session_timeout.unwrap_or_default(),
+            ),
+            min_idle_session: usize::try_from(
+                s.min_idle_session.unwrap_or_default(),
+            )
+            .map_err(|_| {
+                Error::InvalidConfig(
+                    "anytls min-idle-session exceeds this platform's limit"
+                        .to_owned(),
+                )
+            })?,
         }))
     }
 }

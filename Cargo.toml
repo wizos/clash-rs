@@ -9,6 +9,7 @@ members = [
     "clash-dns",
     "clash-netstack"
 ]
+exclude = ["vendor/tuic"]
 
 
 [workspace.package]
@@ -25,6 +26,14 @@ lto = "fat"
 strip = "symbols"
 debug = 0
 panic = "abort"
+
+[profile.dev]
+debug = 1
+incremental = false
+
+[profile.test]
+debug = 1
+incremental = false
 
 [profile.detailed-release]
 inherits = "release"
@@ -53,4 +62,3 @@ tokio-rustls = { git = "https://github.com/Watfaq/tokio-rustls.git", branch = "w
 # The fix is in the main branch but not yet released as a new crate version.
 shadowquic = { git = "https://github.com/spongebob888/shadowquic.git", rev = "295034e1b6478706a4348565bfc3ecea8378da98" }
 shadowquic-macros = { git = "https://github.com/spongebob888/shadowquic.git", rev = "295034e1b6478706a4348565bfc3ecea8378da98" }
-

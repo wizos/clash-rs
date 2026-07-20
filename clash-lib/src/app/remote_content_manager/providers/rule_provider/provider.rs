@@ -82,6 +82,35 @@ pub enum RuleContent {
     Classical(Vec<Box<dyn RuleMatcher>>),
 }
 
+impl RuleContent {
+    fn len(&self) -> usize {
+        match self {
+            Self::Domain(set) => set.len(),
+            Self::Ipcidr(trie) => trie.len(),
+            Self::Classical(rules) => rules.len(),
+        }
+    }
+
+    fn should_resolve_ip(&self) -> bool {
+        match self {
+            Self::Domain(_) => false,
+            Self::Ipcidr(_) => true,
+            Self::Classical(rules) => {
+                rules.iter().any(|rule| rule.should_resolve_ip())
+            }
+        }
+    }
+
+    fn should_resolve_process(&self) -> bool {
+        match self {
+            Self::Classical(rules) => {
+                rules.iter().any(|rule| rule.should_resolve_process())
+            }
+            _ => false,
+        }
+    }
+}
+
 struct Inner {
     content: RuleContent,
 }
@@ -91,6 +120,8 @@ pub trait RuleProvider: Provider {
     fn search(&self, sess: &Session) -> bool;
     fn behavior(&self) -> RuleSetBehavior;
     fn format(&self) -> RuleSetFormat;
+    fn should_resolve_ip(&self) -> bool;
+    fn should_resolve_process(&self) -> bool;
     /// Returns up to `limit` rules as strings. Only Classical providers return
     /// non-empty results; Domain/IPCIDR data structures don't support
     /// enumeration.
@@ -273,7 +304,9 @@ impl RuleProvider for RuleProviderImpl {
 
         match inner {
             Ok(inner) => match &inner.content {
-                RuleContent::Domain(set) => set.has(&sess.destination.host()),
+                RuleContent::Domain(set) => {
+                    sess.rule_host().is_some_and(|host| set.has(host))
+                }
                 RuleContent::Ipcidr(trie) => trie.contains(
                     sess.destination
                         .ip()
@@ -301,6 +334,18 @@ impl RuleProvider for RuleProviderImpl {
 
     fn format(&self) -> RuleSetFormat {
         self.format
+    }
+
+    fn should_resolve_ip(&self) -> bool {
+        self.inner
+            .try_read()
+            .is_ok_and(|inner| inner.content.should_resolve_ip())
+    }
+
+    fn should_resolve_process(&self) -> bool {
+        self.inner
+            .try_read()
+            .is_ok_and(|inner| inner.content.should_resolve_process())
     }
 
     async fn list_rules(&self, limit: usize) -> Vec<String> {
@@ -390,10 +435,26 @@ impl Provider for RuleProviderImpl {
             if !same && let Some(updater) = fetcher.on_update.as_ref() {
                 updater(ele).await; // Directly pass RuleContent
             }
+            crate::app::events::emit("loaded", self.name());
         } else {
             trace!("no fetcher for rule provider {}", self.name());
         }
 
+        Ok(())
+    }
+
+    async fn side_update(&self, data: &[u8]) -> std::io::Result<()> {
+        let Some(fetcher) = &self.fetcher else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "inline rule provider does not support side-load",
+            ));
+        };
+        let (rules, same) = fetcher.side_update(data).await.map_err(map_io_error)?;
+        if !same && let Some(updater) = fetcher.on_update.as_ref() {
+            updater(rules).await;
+        }
+        crate::app::events::emit("loaded", self.name());
         Ok(())
     }
 
@@ -409,7 +470,13 @@ impl Provider for RuleProviderImpl {
 
         if let Some(fetcher) = &self.fetcher {
             m.insert("updatedAt".to_owned(), Box::new(fetcher.updated_at().await));
+            m.insert("path".to_owned(), Box::new(fetcher.path().to_string()));
         }
+
+        m.insert(
+            "count".to_owned(),
+            Box::new(self.inner.read().await.content.len()),
+        );
 
         m.insert("behavior".to_owned(), Box::new(self.behavior().to_string()));
         m.insert("format".to_owned(), Box::new(self.format().to_string()));
@@ -475,8 +542,14 @@ fn make_classical_rules(
             _ => Err(Error::InvalidConfig(format!("invalid rule line: {rule}"))),
         }?;
 
-        let rule_matcher =
-            map_rule_type(rule_type, mmdb.clone(), geodata.clone(), None);
+        let rule_matcher = map_rule_type(
+            rule_type,
+            mmdb.clone(),
+            None,
+            geodata.clone(),
+            None,
+            None,
+        );
         rv.push(rule_matcher);
     }
     Ok(rv)

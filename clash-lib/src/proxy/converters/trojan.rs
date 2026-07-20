@@ -3,12 +3,14 @@ use tracing::warn;
 const DEFAULT_ALPN: [&str; 2] = ["h2", "http/1.1"];
 const DEFAULT_WS_ALPN: [&str; 1] = ["http/1.1"];
 
+#[cfg(feature = "shadowsocks")]
+use crate::proxy::trojan::SsCipherOptions;
 use crate::{
     Error,
     config::internal::proxy::OutboundTrojan,
     proxy::{
         HandlerCommonOptions,
-        transport::{GrpcClient, TlsClient, WsClient},
+        transport::{GrpcClient, RealityClient, TlsClient, Transport, WsClient},
         trojan::{Handler, HandlerOptions},
     },
 };
@@ -25,12 +27,50 @@ impl TryFrom<&OutboundTrojan> for Handler {
     type Error = crate::Error;
 
     fn try_from(s: &OutboundTrojan) -> Result<Self, Self::Error> {
+        #[cfg(feature = "shadowsocks")]
+        let ss_cipher = if let Some(options) = s.ss_opts.as_ref()
+            && options.enabled
+        {
+            let method = options.method.clone().ok_or_else(|| {
+                Error::InvalidConfig(
+                    "trojan ss-opts.method is required when enabled".to_owned(),
+                )
+            })?;
+            crate::proxy::shadowsocks::map_cipher(&method).map_err(|error| {
+                Error::InvalidConfig(format!("invalid trojan ss-opts: {error}"))
+            })?;
+            Some(SsCipherOptions {
+                method,
+                password: options.password.clone().ok_or_else(|| {
+                    Error::InvalidConfig(
+                        "trojan ss-opts.password is required when enabled"
+                            .to_owned(),
+                    )
+                })?,
+            })
+        } else {
+            None
+        };
+        #[cfg(not(feature = "shadowsocks"))]
+        if s.ss_opts.as_ref().is_some_and(|options| options.enabled) {
+            return Err(Error::InvalidConfig(
+                "trojan ss-opts requires the shadowsocks feature".to_owned(),
+            ));
+        }
+
         let skip_cert_verify = s.skip_cert_verify.unwrap_or_default();
         if skip_cert_verify {
             warn!(
                 "skipping TLS cert verification for {}",
                 s.common_opts.server
             );
+        }
+        if s.reality_opts.is_some()
+            && !matches!(s.network.as_deref(), None | Some("" | "tcp"))
+        {
+            return Err(Error::InvalidConfig(
+                "trojan reality-opts currently require network: tcp".to_owned(),
+            ));
         }
 
         let h = Handler::new(HandlerOptions {
@@ -44,34 +84,48 @@ impl TryFrom<&OutboundTrojan> for Handler {
             password: s.password.clone(),
             udp: s.udp.unwrap_or_default(),
             tls: {
-                let client = TlsClient::new(
-                    skip_cert_verify,
-                    s.sni
-                        .as_ref()
-                        .map(|x| x.to_owned())
-                        .unwrap_or(s.common_opts.server.to_owned()),
-                    s.alpn.clone().or(Some({
-                        let network = s.network.as_deref();
-                        let alpn: &[&str] = if let Some("ws") = network {
-                            &DEFAULT_WS_ALPN
-                        } else {
-                            &DEFAULT_ALPN
-                        };
-
-                        alpn.iter()
-                            .copied()
-                            .map(|x| x.to_owned())
-                            .collect::<Vec<String>>()
-                    })),
-                    None,
-                    s.tls_cert.as_deref(),
-                    s.tls_key.as_deref(),
-                )?;
-                Some(Box::new(client))
+                let sni = s
+                    .sni
+                    .clone()
+                    .unwrap_or_else(|| s.common_opts.server.clone());
+                let alpn = s.alpn.clone().or(Some({
+                    let network = s.network.as_deref();
+                    let alpn: &[&str] = if let Some("ws") = network {
+                        &DEFAULT_WS_ALPN
+                    } else {
+                        &DEFAULT_ALPN
+                    };
+                    alpn.iter().copied().map(str::to_owned).collect()
+                }));
+                let client: Box<dyn Transport> =
+                    if let Some(reality_opts) = s.reality_opts.as_ref() {
+                        let public_key = super::utils::decode_base64_public_key(
+                            &reality_opts.public_key,
+                        )?;
+                        let short_id =
+                            super::utils::decode_short_id(&reality_opts.short_id)?;
+                        Box::new(RealityClient::new_with_alpn(
+                            sni, public_key, short_id, alpn,
+                        ))
+                    } else {
+                        TlsClient::new_mihomo(
+                            skip_cert_verify,
+                            sni,
+                            alpn,
+                            None,
+                            s.fingerprint.clone(),
+                            s.client_fingerprint.as_deref(),
+                            super::utils::tls_ech_options(s.ech_opts.as_ref()),
+                            s.tls_cert.as_deref(),
+                            s.tls_key.as_deref(),
+                        )?
+                    };
+                Some(client)
             },
             transport: s
                 .network
                 .as_ref()
+                .filter(|network| !matches!(network.as_str(), "" | "tcp"))
                 .map(|x| match x.as_str() {
                     "ws" => s
                         .ws_opts
@@ -103,6 +157,8 @@ impl TryFrom<&OutboundTrojan> for Handler {
                     ))),
                 })
                 .transpose()?,
+            #[cfg(feature = "shadowsocks")]
+            ss_cipher,
         });
         Ok(h)
     }

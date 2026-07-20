@@ -1,0 +1,19 @@
+Sudoku protocol module provenance
+=================================
+
+This directory contains code derived from the Sudoku protocol implementation in:
+
+  H-gripe-proxy
+  https://github.com/tanzanite2025/H-gripe-proxy
+  revision 9dcb5bc2cbf36d1f13089af09c7536ecbb764787
+  copyright Hack-Gripe and contributors
+  license GNU General Public License version 3
+
+The code was adapted in July 2026 for FlClash-rs: clash-rs stream/address types,
+outbound handler integration, configuration conversion, UDP packet semantics,
+table rotation, HTTP mask tunnel modes, tests, and mobile build compatibility.
+
+This module is GPL-3.0-only. The surrounding FlClash application is GPLv3. The
+unmodified upstream clash-rs code outside this module retains its Apache-2.0
+license; this local combined clash-lib build is distributed as part of FlClash
+under GPLv3-compatible terms.

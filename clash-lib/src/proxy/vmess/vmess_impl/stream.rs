@@ -1,11 +1,16 @@
 use std::{fmt::Debug, pin::Pin, task::Poll, time::SystemTime};
 
+use aes::cipher::KeyIvInit as _;
 use aes_gcm::Aes128Gcm;
-use bytes::{BufMut, BytesMut};
+use bytes::{Buf, BufMut, BytesMut};
 use chacha20poly1305::ChaCha20Poly1305;
 use futures::ready;
 
 use md5::Md5;
+use sha3::{
+    Shake128, Shake128Reader,
+    digest::{ExtendableOutput, XofReader},
+};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use crate::{
@@ -19,8 +24,10 @@ use crate::{
 };
 
 use super::{
-    CHUNK_SIZE, COMMAND_TCP, COMMAND_UDP, OPTION_CHUNK_STREAM, SECURITY_AES_128_GCM,
-    SECURITY_CHACHA20_POLY1305, SECURITY_NONE, Security, VERSION,
+    CHUNK_SIZE, COMMAND_MUX, COMMAND_TCP, COMMAND_UDP, OPTION_AUTHENTICATED_LENGTH,
+    OPTION_CHUNK_MASKING, OPTION_CHUNK_STREAM, OPTION_GLOBAL_PADDING,
+    SECURITY_AES_128_CFB, SECURITY_AES_128_GCM, SECURITY_CHACHA20_POLY1305,
+    SECURITY_NONE, Security, VERSION,
     cipher::{AeadCipher, VmessSecurity},
     header,
     kdf::{
@@ -46,6 +53,18 @@ pub struct VmessStream<S> {
     security: u8,
     is_aead: bool,
     is_udp: bool,
+    is_xudp: bool,
+    options: u8,
+    chunk_stream: bool,
+    chunk_masking: bool,
+    global_padding: bool,
+    authenticated_length: bool,
+    read_length_cipher: Option<AeadCipher>,
+    write_length_cipher: Option<AeadCipher>,
+    read_length_generator: Option<Shake128Reader>,
+    write_length_generator: Option<Shake128Reader>,
+    legacy_read_cipher: Option<cfb_mode::BufDecryptor<aes::Aes128>>,
+    legacy_write_cipher: Option<cfb_mode::BufEncryptor<aes::Aes128>>,
 
     read_state: ReadState,
     read_pos: usize,
@@ -69,8 +88,10 @@ enum ReadState {
     AeadWaitingHeaderSize,
     AeadWaitingHeader(usize),
     StreamWaitingLength,
-    StreamWaitingData(usize),
+    StreamWaitingData { wire_size: usize, data_size: usize },
     StreamFlushingData(usize),
+    Raw,
+    Eof,
 }
 
 enum WriteState {
@@ -99,6 +120,9 @@ where
         security: &Security,
         is_aead: bool,
         is_udp: bool,
+        is_xudp: bool,
+        global_padding: bool,
+        authenticated_length: bool,
     ) -> std::io::Result<VmessStream<S>> {
         let mut rand_bytes = [0u8; 33];
         utils::rand_fill(&mut rand_bytes[..]);
@@ -154,10 +178,70 @@ where
 
                 (Some(read_cipher), Some(write_cipher))
             }
+            SECURITY_AES_128_CFB => (None, None),
             _ => {
                 return Err(std::io::Error::other("unsupported security"));
             }
         };
+
+        let encrypted_body =
+            matches!(*security, SECURITY_AES_128_GCM | SECURITY_CHACHA20_POLY1305);
+        let legacy_body = *security == SECURITY_AES_128_CFB;
+        let chunk_stream = encrypted_body
+            || legacy_body
+            || (*security == SECURITY_NONE && is_udp && !is_xudp);
+        let chunk_masking = encrypted_body;
+        let global_padding = encrypted_body && global_padding;
+        let authenticated_length = encrypted_body && authenticated_length;
+        let mut options = if chunk_stream { OPTION_CHUNK_STREAM } else { 0 };
+        if chunk_masking {
+            options |= OPTION_CHUNK_MASKING;
+        }
+        if global_padding {
+            options |= OPTION_GLOBAL_PADDING;
+        }
+        if authenticated_length {
+            options |= OPTION_AUTHENTICATED_LENGTH;
+        }
+
+        let (read_length_cipher, write_length_cipher) = if authenticated_length {
+            (
+                Some(new_authenticated_length_cipher(
+                    *security,
+                    &req_body_key,
+                    &req_body_iv,
+                )?),
+                Some(new_authenticated_length_cipher(
+                    *security,
+                    &req_body_key,
+                    &req_body_iv,
+                )?),
+            )
+        } else {
+            (None, None)
+        };
+        let read_length_generator = (global_padding || chunk_masking)
+            .then(|| new_length_generator(&resp_body_iv));
+        let write_length_generator = (global_padding || chunk_masking)
+            .then(|| new_length_generator(&req_body_iv));
+        let legacy_read_cipher = legacy_body
+            .then(|| {
+                cfb_mode::BufDecryptor::<aes::Aes128>::new_from_slices(
+                    &resp_body_key,
+                    &resp_body_iv,
+                )
+            })
+            .transpose()
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let legacy_write_cipher = legacy_body
+            .then(|| {
+                cfb_mode::BufEncryptor::<aes::Aes128>::new_from_slices(
+                    &req_body_key,
+                    &req_body_iv,
+                )
+            })
+            .transpose()
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
 
         let mut stream = Self {
             stream,
@@ -173,6 +257,18 @@ where
             security: *security,
             is_aead,
             is_udp,
+            is_xudp,
+            options,
+            chunk_stream,
+            chunk_masking,
+            global_padding,
+            authenticated_length,
+            read_length_cipher,
+            write_length_cipher,
+            read_length_generator,
+            write_length_generator,
+            legacy_read_cipher,
+            legacy_write_cipher,
 
             read_state: ReadState::AeadWaitingHeaderSize,
             read_pos: 0,
@@ -204,6 +300,8 @@ where
             ref dst,
             ref is_aead,
             ref is_udp,
+            ref is_xudp,
+            ref options,
             ref id,
             ..
         } = self;
@@ -228,20 +326,24 @@ where
         buf.put_slice(req_body_iv);
         buf.put_slice(req_body_key);
         buf.put_u8(*resp_v);
-        buf.put_u8(OPTION_CHUNK_STREAM);
+        buf.put_u8(*options);
 
         let p = utils::rand_range(0..16);
         buf.put_u8((p << 4) as u8 | security);
 
         buf.put_u8(0);
 
-        if *is_udp {
+        if *is_xudp {
+            buf.put_u8(COMMAND_MUX);
+        } else if *is_udp {
             buf.put_u8(COMMAND_UDP);
         } else {
             buf.put_u8(COMMAND_TCP);
         }
 
-        dst.write_to_buf_vmess(&mut buf);
+        if !*is_xudp {
+            dst.write_to_buf_vmess(&mut buf);
+        }
 
         if p > 0 {
             let mut padding = vec![0u8; p as usize];
@@ -300,12 +402,16 @@ where
                     if !this.is_aead {
                         ready!(this.poll_read_exact(cx, 4))?;
                         let mut buf = this.read_buf.split().freeze().to_vec();
-                        crypto::aes_cfb_decrypt(
-                            &resp_body_key,
-                            &resp_body_iv,
-                            &mut buf,
-                        )
-                        .map_err(map_io_error)?;
+                        if let Some(cipher) = this.legacy_read_cipher.as_mut() {
+                            cipher.decrypt(&mut buf);
+                        } else {
+                            crypto::aes_cfb_decrypt(
+                                &resp_body_key,
+                                &resp_body_iv,
+                                &mut buf,
+                            )
+                            .map_err(map_io_error)?;
+                        }
                         if buf[0] != resp_v {
                             return Poll::Ready(Err(std::io::Error::new(
                                 std::io::ErrorKind::InvalidData,
@@ -320,7 +426,11 @@ where
                             )));
                         }
 
-                        this.read_state = ReadState::StreamWaitingLength;
+                        this.read_state = if this.chunk_stream {
+                            ReadState::StreamWaitingLength
+                        } else {
+                            ReadState::Raw
+                        };
                     } else {
                         ready!(this.poll_read_exact(cx, 18))?;
 
@@ -408,40 +518,116 @@ where
                         )));
                     }
 
-                    this.read_state = ReadState::StreamWaitingLength;
+                    this.read_state = if this.chunk_stream {
+                        ReadState::StreamWaitingLength
+                    } else {
+                        ReadState::Raw
+                    };
                 }
 
                 ReadState::StreamWaitingLength => {
                     let this = &mut *self;
-                    ready!(this.poll_read_exact(cx, 2))?;
-                    let len = u16::from_be_bytes(
-                        this.read_buf.split().as_ref().try_into().unwrap(),
-                    ) as usize;
+                    let length_header_size =
+                        if this.authenticated_length { 2 + 16 } else { 2 };
+                    ready!(this.poll_read_exact(cx, length_header_size))?;
+                    let mut length_header = this.read_buf.split().freeze().to_vec();
+                    if let Some(cipher) = this.legacy_read_cipher.as_mut() {
+                        cipher.decrypt(&mut length_header);
+                    } else if let Some(cipher) = this.read_length_cipher.as_mut() {
+                        cipher.decrypt_inplace(&mut length_header)?;
+                    }
+                    let mut length =
+                        u16::from_be_bytes([length_header[0], length_header[1]]);
+                    let padding_length = if this.global_padding {
+                        next_length_value(&mut this.read_length_generator)? % 64
+                    } else {
+                        0
+                    } as usize;
+                    if this.chunk_masking && !this.authenticated_length {
+                        length ^=
+                            next_length_value(&mut this.read_length_generator)?;
+                    }
 
-                    if len > MAX_CHUNK_SIZE {
+                    let body_overhead = this
+                        .aead_read_cipher
+                        .as_ref()
+                        .map(|cipher| cipher.security.overhead_len())
+                        .unwrap_or_default();
+                    let encoded_length = length as usize;
+                    let data_size = if this.authenticated_length {
+                        encoded_length
+                            .checked_add(body_overhead)
+                            .and_then(|length| length.checked_sub(padding_length))
+                    } else {
+                        encoded_length.checked_sub(padding_length)
+                    }
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "VMess chunk padding exceeds encoded length",
+                        )
+                    })?;
+                    if data_size == 0 {
+                        this.read_state = ReadState::Eof;
+                        return Poll::Ready(Ok(()));
+                    }
+                    let wire_size = data_size + padding_length;
+                    if data_size > MAX_CHUNK_SIZE {
                         return Poll::Ready(Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
                             "invalid response - chunk size too large",
                         )));
                     }
 
-                    this.read_state = ReadState::StreamWaitingData(len);
+                    this.read_state = ReadState::StreamWaitingData {
+                        wire_size,
+                        data_size,
+                    };
                 }
 
-                ReadState::StreamWaitingData(size) => {
+                ReadState::StreamWaitingData {
+                    wire_size,
+                    data_size,
+                } => {
                     let this = &mut *self;
-                    ready!(this.poll_read_exact(cx, size))?;
+                    ready!(this.poll_read_exact(cx, wire_size))?;
+                    this.read_buf.truncate(data_size);
 
-                    match this.aead_read_cipher {
-                        Some(ref mut cipher) => {
-                            cipher.decrypt_inplace(&mut this.read_buf)?;
-                            let data_len = size - cipher.security.overhead_len();
-                            this.read_buf.truncate(data_len);
-                            this.read_state =
-                                ReadState::StreamFlushingData(data_len);
+                    if let Some(cipher) = this.legacy_read_cipher.as_mut() {
+                        cipher.decrypt(&mut this.read_buf);
+                        if this.read_buf.len() < 4 {
+                            return Poll::Ready(Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "VMess legacy chunk is missing its checksum",
+                            )));
                         }
-                        _ => {
-                            this.read_state = ReadState::StreamFlushingData(size);
+                        let expected = u32::from_be_bytes(
+                            this.read_buf[..4].try_into().unwrap(),
+                        );
+                        let actual = fnv1a32(&this.read_buf[4..]);
+                        if expected != actual {
+                            return Poll::Ready(Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "VMess legacy chunk checksum mismatch",
+                            )));
+                        }
+                        this.read_buf.advance(4);
+                        this.read_state =
+                            ReadState::StreamFlushingData(data_size - 4);
+                    } else {
+                        match this.aead_read_cipher {
+                            Some(ref mut cipher) => {
+                                cipher.decrypt_inplace(&mut this.read_buf)?;
+                                let data_len =
+                                    data_size - cipher.security.overhead_len();
+                                this.read_buf.truncate(data_len);
+                                this.read_state =
+                                    ReadState::StreamFlushingData(data_len);
+                            }
+                            _ => {
+                                this.read_state =
+                                    ReadState::StreamFlushingData(data_size);
+                            }
                         }
                     }
                 }
@@ -461,6 +647,10 @@ where
 
                     return Poll::Ready(Ok(()));
                 }
+                ReadState::Raw => {
+                    return Pin::new(&mut self.stream).poll_read(cx, buf);
+                }
+                ReadState::Eof => return Poll::Ready(Ok(())),
             }
         }
     }
@@ -475,34 +665,87 @@ where
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize, std::io::Error>> {
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        if !self.chunk_stream {
+            return Pin::new(&mut self.stream).poll_write(cx, buf);
+        }
         loop {
             match self.write_state {
                 WriteState::BuildingData => {
                     let this = &mut *self;
-                    let mut overhead_len = 0;
-                    if let Some(ref mut cipher) = this.aead_write_cipher {
-                        overhead_len = cipher.security.overhead_len();
+                    if let Some(cipher) = this.legacy_write_cipher.as_mut() {
+                        let consume_len = std::cmp::min(buf.len(), CHUNK_SIZE - 4);
+                        this.write_buf.clear();
+                        this.write_buf.put_u16((consume_len + 4) as u16);
+                        this.write_buf.put_u32(fnv1a32(&buf[..consume_len]));
+                        this.write_buf.extend_from_slice(&buf[..consume_len]);
+                        cipher.encrypt(&mut this.write_buf);
+                        self.write_state = WriteState::FlushingData(
+                            consume_len,
+                            (this.write_buf.len(), 0),
+                        );
+                        continue;
                     }
+                    let overhead_len = this
+                        .aead_write_cipher
+                        .as_ref()
+                        .map(|cipher| cipher.security.overhead_len())
+                        .unwrap_or_default();
 
                     let max_payload_size = CHUNK_SIZE - overhead_len;
                     let consume_len = std::cmp::min(buf.len(), max_payload_size);
-                    let payload_len = consume_len + overhead_len;
-
-                    let size_bytes = 2;
-                    this.write_buf.reserve(size_bytes + payload_len);
-                    this.write_buf.put_u16(payload_len as u16);
-
-                    let mut piece2 = this.write_buf.split_off(size_bytes);
-
-                    piece2.put_slice(&buf[..consume_len]);
+                    let mut body =
+                        BytesMut::with_capacity(consume_len + overhead_len);
+                    body.put_slice(&buf[..consume_len]);
                     if let Some(ref mut cipher) = this.aead_write_cipher {
-                        piece2.extend_from_slice(
+                        body.extend_from_slice(
                             vec![0u8; cipher.security.overhead_len()].as_ref(),
                         );
-                        cipher.encrypt_inplace(&mut piece2)?;
+                        cipher.encrypt_inplace(&mut body)?;
                     }
 
-                    this.write_buf.unsplit(piece2);
+                    let padding_length = if this.global_padding {
+                        next_length_value(&mut this.write_length_generator)? % 64
+                    } else {
+                        0
+                    } as usize;
+                    this.write_buf.clear();
+                    if this.authenticated_length {
+                        let encoded_length = body
+                            .len()
+                            .checked_add(padding_length)
+                            .and_then(|length| length.checked_sub(overhead_len))
+                            .ok_or_else(|| {
+                                std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "invalid VMess authenticated chunk length",
+                                )
+                            })?;
+                        let mut length_header = BytesMut::with_capacity(18);
+                        length_header.put_u16(encoded_length as u16);
+                        length_header.resize(18, 0);
+                        this.write_length_cipher
+                            .as_mut()
+                            .expect("authenticated length cipher must exist")
+                            .encrypt_inplace(&mut length_header)?;
+                        this.write_buf.extend_from_slice(&length_header);
+                    } else {
+                        let mut encoded_length =
+                            (body.len() + padding_length) as u16;
+                        if this.chunk_masking {
+                            encoded_length ^=
+                                next_length_value(&mut this.write_length_generator)?;
+                        }
+                        this.write_buf.put_u16(encoded_length);
+                    }
+                    this.write_buf.extend_from_slice(&body);
+                    if padding_length > 0 {
+                        let start = this.write_buf.len();
+                        this.write_buf.resize(start + padding_length, 0);
+                        utils::rand_fill(&mut this.write_buf[start..]);
+                    }
 
                     // ready to write data
                     self.write_state = WriteState::FlushingData(
@@ -564,6 +807,61 @@ where
     }
 }
 
+fn new_authenticated_length_cipher(
+    security: Security,
+    request_key: &[u8],
+    request_iv: &[u8],
+) -> std::io::Result<AeadCipher> {
+    let derived = kdf::vmess_kdf_1_one_shot(request_key, b"auth_len");
+    let cipher = match security {
+        SECURITY_AES_128_GCM => {
+            VmessSecurity::Aes128Gcm(Aes128Gcm::new_with_slice(&derived[..16]))
+        }
+        SECURITY_CHACHA20_POLY1305 => {
+            let mut key = [0u8; 32];
+            key[..16].copy_from_slice(&derived[..16]);
+            key[16..].copy_from_slice(&utils::md5(&derived[..16]));
+            VmessSecurity::ChaCha20Poly1305(ChaCha20Poly1305::new_with_slice(&key))
+        }
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "authenticated VMess length requires an AEAD cipher",
+            ));
+        }
+    };
+    Ok(AeadCipher::new(request_iv, cipher))
+}
+
+fn new_length_generator(iv: &[u8]) -> Shake128Reader {
+    let mut shake = Shake128::default();
+    sha3::digest::Update::update(&mut shake, iv);
+    shake.finalize_xof()
+}
+
+fn next_length_value(
+    generator: &mut Option<Shake128Reader>,
+) -> std::io::Result<u16> {
+    let generator = generator.as_mut().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "VMess length generator is not initialized",
+        )
+    })?;
+    let mut value = [0; 2];
+    generator.read(&mut value);
+    Ok(u16::from_be_bytes(value))
+}
+
+fn fnv1a32(data: &[u8]) -> u32 {
+    let mut hash = 0x811c9dc5u32;
+    for byte in data {
+        hash ^= *byte as u32;
+        hash = hash.wrapping_mul(0x01000193);
+    }
+    hash
+}
+
 fn hash_timestamp(timestamp: u64) -> [u8; 16] {
     use md5::Digest;
     let mut hasher = md5::Md5::new();
@@ -573,4 +871,122 @@ fn hash_timestamp(timestamp: u64) -> [u8; 16] {
     hasher.update(timestamp.to_be_bytes());
     hasher.update(timestamp.to_be_bytes());
     hasher.finalize().into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proxy::vmess::vmess_impl::user::new_id;
+
+    async fn test_stream(
+        security: Security,
+        udp: bool,
+        xudp: bool,
+        global_padding: bool,
+        authenticated_length: bool,
+    ) -> VmessStream<tokio::io::DuplexStream> {
+        let (client, _server) = tokio::io::duplex(4096);
+        let uuid =
+            uuid::Uuid::parse_str("b831381d-6324-4d53-ad4f-8cda48b30811").unwrap();
+        VmessStream::new(
+            client,
+            &new_id(&uuid),
+            &SocksAddr::Domain("example.org".to_owned(), 443),
+            &security,
+            true,
+            udp,
+            xudp,
+            global_padding,
+            authenticated_length,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn mihomo_aead_options_enable_masking_and_requested_extensions() {
+        let standard =
+            test_stream(SECURITY_AES_128_GCM, false, false, false, false).await;
+        assert!(standard.chunk_stream);
+        assert!(standard.chunk_masking);
+        assert_eq!(standard.options, OPTION_CHUNK_STREAM | OPTION_CHUNK_MASKING);
+
+        let extended =
+            test_stream(SECURITY_AES_128_GCM, false, false, true, true).await;
+        assert!(extended.global_padding);
+        assert!(extended.authenticated_length);
+        assert_eq!(
+            extended.options,
+            OPTION_CHUNK_STREAM
+                | OPTION_CHUNK_MASKING
+                | OPTION_GLOBAL_PADDING
+                | OPTION_AUTHENTICATED_LENGTH
+        );
+    }
+
+    #[tokio::test]
+    async fn mihomo_none_security_uses_raw_tcp_and_mux_but_chunks_udp() {
+        let tcp = test_stream(SECURITY_NONE, false, false, false, false).await;
+        assert!(!tcp.chunk_stream);
+        assert_eq!(tcp.options, 0);
+
+        let udp = test_stream(SECURITY_NONE, true, false, false, false).await;
+        assert!(udp.chunk_stream);
+        assert_eq!(udp.options, OPTION_CHUNK_STREAM);
+
+        let xudp = test_stream(SECURITY_NONE, true, true, false, false).await;
+        assert!(!xudp.chunk_stream);
+        assert_eq!(xudp.options, 0);
+    }
+
+    #[tokio::test]
+    async fn legacy_cfb_uses_checksum_chunks() {
+        let stream =
+            test_stream(SECURITY_AES_128_CFB, false, false, true, true).await;
+        assert!(stream.chunk_stream);
+        assert_eq!(stream.options, OPTION_CHUNK_STREAM);
+        assert!(stream.legacy_read_cipher.is_some());
+        assert!(stream.legacy_write_cipher.is_some());
+        assert_eq!(fnv1a32(b"hello"), 0x4f9f2cab);
+    }
+
+    #[test]
+    fn shake128_length_mask_matches_go_reference() {
+        let iv: Vec<u8> = (0..16).collect();
+        let mut generator = Some(new_length_generator(&iv));
+        let values = [
+            next_length_value(&mut generator).unwrap(),
+            next_length_value(&mut generator).unwrap(),
+            next_length_value(&mut generator).unwrap(),
+            next_length_value(&mut generator).unwrap(),
+        ];
+        assert_eq!(values, [0x9848, 0x1946, 0xde85, 0xc670]);
+    }
+
+    #[test]
+    fn authenticated_length_matches_go_reference() {
+        let iv: Vec<u8> = (0..16).collect();
+        let key: Vec<u8> = (16..32).collect();
+        assert_eq!(
+            &kdf::vmess_kdf_1_one_shot(&key, b"auth_len")[..16],
+            &hex::decode("49d3958e625ef844be78bb41a9df9743").unwrap()
+        );
+
+        let mut encrypt =
+            new_authenticated_length_cipher(SECURITY_AES_128_GCM, &key, &iv)
+                .unwrap();
+        let mut encrypted = vec![0x12, 0x34];
+        encrypted.resize(18, 0);
+        encrypt.encrypt_inplace(&mut encrypted).unwrap();
+        assert_eq!(
+            hex::encode(&encrypted),
+            "ba2ea2fd705bdf80228329c880adba070de6"
+        );
+
+        let mut decrypt =
+            new_authenticated_length_cipher(SECURITY_AES_128_GCM, &key, &iv)
+                .unwrap();
+        decrypt.decrypt_inplace(&mut encrypted).unwrap();
+        assert_eq!(&encrypted[..2], &[0x12, 0x34]);
+    }
 }

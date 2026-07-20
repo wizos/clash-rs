@@ -37,6 +37,15 @@ impl<T: AsRef<[u8]> + Copy> IpPacket<T> {
             IpPacket::Ipv6(ref packet) => packet.next_header(),
         }
     }
+
+    /// Return the six-bit differentiated-services code point from IPv4 TOS or
+    /// IPv6 traffic class, excluding the two ECN bits.
+    pub fn dscp(&self) -> u8 {
+        match *self {
+            IpPacket::Ipv4(ref packet) => packet.dscp(),
+            IpPacket::Ipv6(ref packet) => packet.traffic_class() >> 2,
+        }
+    }
 }
 
 impl<'a, T: AsRef<[u8]> + ?Sized> IpPacket<&'a T> {

@@ -133,10 +133,24 @@ pub fn build_tls_client_config(
     tls_cert: Option<&str>,
     tls_key: Option<&str>,
 ) -> std::io::Result<rustls::ClientConfig> {
+    build_tls_client_config_with_protocol_versions(
+        verifier,
+        tls_cert,
+        tls_key,
+        rustls::DEFAULT_VERSIONS,
+    )
+}
+
+pub fn build_tls_client_config_with_protocol_versions(
+    verifier: Arc<dyn ServerCertVerifier>,
+    tls_cert: Option<&str>,
+    tls_key: Option<&str>,
+    versions: &[&'static rustls::SupportedProtocolVersion],
+) -> std::io::Result<rustls::ClientConfig> {
     match (tls_cert, tls_key) {
         (Some(cert), Some(key)) => {
             let (certs, private_key) = load_cert_and_key(cert, key)?;
-            rustls::ClientConfig::builder()
+            rustls::ClientConfig::builder_with_protocol_versions(versions)
                 .dangerous()
                 .with_custom_certificate_verifier(verifier)
                 .with_client_auth_cert(certs, private_key)
@@ -147,10 +161,71 @@ pub fn build_tls_client_config(
                     )
                 })
         }
-        (None, None) => Ok(rustls::ClientConfig::builder()
+        (None, None) => Ok(rustls::ClientConfig::builder_with_protocol_versions(
+            versions,
+        )
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth()),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "tls-cert and tls-key must both be set or both omitted",
+        )),
+    }
+}
+
+/// Build a TLS 1.3-only client config with Encrypted Client Hello enabled.
+///
+/// `ech_config_list` is the binary ECHConfigList, including its two-byte
+/// length prefix, as carried by the HTTPS DNS record or Mihomo's base64
+/// `ech-opts.config` value.
+pub fn build_tls_client_config_with_ech(
+    verifier: Arc<dyn ServerCertVerifier>,
+    tls_cert: Option<&str>,
+    tls_key: Option<&str>,
+    ech_config_list: Vec<u8>,
+) -> std::io::Result<rustls::ClientConfig> {
+    use rustls::{
+        client::{EchConfig, EchMode},
+        crypto::aws_lc_rs::{default_provider, hpke::ALL_SUPPORTED_SUITES},
+        pki_types::EchConfigListBytes,
+    };
+
+    let ech_config = EchConfig::new(
+        EchConfigListBytes::from(ech_config_list),
+        ALL_SUPPORTED_SUITES,
+    )
+    .map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid or unsupported ECH config list: {error}"),
+        )
+    })?;
+    let builder =
+        rustls::ClientConfig::builder_with_provider(Arc::new(default_provider()))
+            .with_ech(EchMode::from(ech_config))
+            .map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("failed to enable ECH: {error}"),
+                )
+            })?
             .dangerous()
-            .with_custom_certificate_verifier(verifier)
-            .with_no_client_auth()),
+            .with_custom_certificate_verifier(verifier);
+
+    match (tls_cert, tls_key) {
+        (Some(cert), Some(key)) => {
+            let (certs, private_key) = load_cert_and_key(cert, key)?;
+            builder
+                .with_client_auth_cert(certs, private_key)
+                .map_err(|error| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("invalid mTLS client cert/key: {error}"),
+                    )
+                })
+        }
+        (None, None) => Ok(builder.with_no_client_auth()),
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "tls-cert and tls-key must both be set or both omitted",
@@ -168,13 +243,54 @@ pub struct DefaultTlsVerifier {
 impl DefaultTlsVerifier {
     pub fn new(fingerprint: Option<String>, skip: bool) -> Self {
         Self {
-            fingerprint,
+            fingerprint: fingerprint
+                .map(|value| value.trim().replace(':', "").to_ascii_lowercase()),
             skip,
             pki: WebPkiServerVerifier::builder(GLOBAL_ROOT_STORE.clone())
                 .build()
                 .unwrap(),
         }
     }
+
+    pub fn try_new(
+        fingerprint: Option<String>,
+        skip: bool,
+    ) -> std::io::Result<Self> {
+        let fingerprint = fingerprint
+            .map(|value| normalize_certificate_fingerprint(&value))
+            .transpose()?;
+        Ok(Self::new(fingerprint, skip))
+    }
+}
+
+pub fn normalize_certificate_fingerprint(value: &str) -> std::io::Result<String> {
+    let value = value.trim().replace(':', "").to_ascii_lowercase();
+    if matches!(
+        value.as_str(),
+        "chrome"
+            | "firefox"
+            | "safari"
+            | "ios"
+            | "android"
+            | "edge"
+            | "360"
+            | "qq"
+            | "random"
+            | "randomized"
+    ) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "`fingerprint` pins a TLS certificate; use `client-fingerprint` for a \
+             browser fingerprint",
+        ));
+    }
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "TLS certificate fingerprint must be a 32-byte SHA-256 hex string",
+        ));
+    }
+    Ok(value)
 }
 
 impl ServerCertVerifier for DefaultTlsVerifier {
@@ -187,13 +303,42 @@ impl ServerCertVerifier for DefaultTlsVerifier {
         now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
         if let Some(ref fingerprint) = self.fingerprint {
-            let cert_hex =
-                super::utils::encode_hex(&super::utils::sha256(end_entity.as_ref()));
-            if &cert_hex != fingerprint {
-                return Err(rustls::Error::General(format!(
-                    "cert hash mismatch: found: {cert_hex}\nexcept: {fingerprint}"
-                )));
+            let matched = std::iter::once(end_entity)
+                .chain(intermediates.iter())
+                .position(|certificate| {
+                    super::utils::encode_hex(&super::utils::sha256(
+                        certificate.as_ref(),
+                    )) == *fingerprint
+                });
+            let Some(index) = matched else {
+                return Err(rustls::Error::General(
+                    "certificate fingerprints do not match".to_string(),
+                ));
+            };
+            if index == 0 {
+                return Ok(rustls::client::danger::ServerCertVerified::assertion());
             }
+
+            // Mihomo also accepts a pinned intermediate/root, but still verifies
+            // the leaf chain and hostname up to that pinned certificate.
+            let mut roots = RootCertStore::empty();
+            roots
+                .add(intermediates[index - 1].clone())
+                .map_err(|error| {
+                    rustls::Error::General(format!(
+                        "invalid pinned certificate in peer chain: {error}"
+                    ))
+                })?;
+            let verifier = WebPkiServerVerifier::builder(Arc::new(roots))
+                .build()
+                .map_err(|error| rustls::Error::General(error.to_string()))?;
+            return verifier.verify_server_cert(
+                end_entity,
+                &intermediates[..index - 1],
+                server_name,
+                ocsp_response,
+                now,
+            );
         }
 
         if self.skip {
@@ -298,5 +443,26 @@ impl ServerCertVerifier for NoHostnameTlsVerifier {
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         self.0.supported_verify_schemes()
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_tests {
+    use super::normalize_certificate_fingerprint;
+
+    #[test]
+    fn accepts_mihomo_sha256_fingerprint_syntax() {
+        let raw = "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:\
+                   FF:00:11:22:33:44:55:66:77:88:99";
+        assert_eq!(
+            normalize_certificate_fingerprint(raw).unwrap(),
+            "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899",
+        );
+    }
+
+    #[test]
+    fn rejects_browser_name_in_certificate_fingerprint_field() {
+        let error = normalize_certificate_fingerprint("chrome").unwrap_err();
+        assert!(error.to_string().contains("client-fingerprint"));
     }
 }

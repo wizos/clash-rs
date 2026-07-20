@@ -11,6 +11,7 @@ use std::{
 pub struct TcpStream {
     pub(crate) local_addr: SocketAddr,
     pub(crate) remote_addr: SocketAddr,
+    pub(crate) dscp: u8,
 
     pub(crate) handle: Arc<TcpStreamHandle>,
     pub(crate) stack_notifier:
@@ -44,6 +45,10 @@ impl TcpStream {
 
     pub fn remote_addr(&self) -> SocketAddr {
         self.remote_addr
+    }
+
+    pub fn dscp(&self) -> u8 {
+        self.dscp
     }
 
     pub fn split(self) -> (tokio::io::ReadHalf<Self>, tokio::io::WriteHalf<Self>) {
@@ -196,6 +201,7 @@ mod tests {
             TcpStream {
                 local_addr: "127.0.0.1:12345".parse().unwrap(),
                 remote_addr: "127.0.0.1:80".parse().unwrap(),
+                dscp: 0,
                 handle: Arc::new(TcpStreamHandle::new()),
                 stack_notifier: tx,
             },

@@ -8,21 +8,26 @@ authors = { workspace = true }
 
 [features]
 default = ["standard", "aws-lc-rs", "dashboard"]
-standard = ["shadowsocks", "tuic", "ssh", "shadowquic", "wireguard", "tailscale", "clash-lib/zero_copy", "tproxy", "tun", "redir"]
+standard = ["shadowsocks", "tuic", "ssh", "sudoku", "shadowquic", "wireguard", "openvpn", "tailscale", "clash-lib/zero_copy", "tproxy", "tun", "redir"]
 
 plus = ["standard", "onion"]
 perf = ["plus", "jemallocator"]
 
-android = ["shadowsocks", "tuic", "aws-lc-rs", "wireguard", "clash-lib/zero_copy", "tproxy"] # Android build failed with libc
+android = ["shadowsocks", "tuic", "aws-lc-rs", "wireguard", "openvpn", "clash-lib/zero_copy", "tproxy"] # Android build failed with libc
 bsd = ["shadowsocks", "tuic", "ring", "clash-lib/zero_copy"] # BSD build failed with aws-lc-rs, and cross compile also fail with missing headers for tun->route_manager
 
 shadowsocks = ["clash-lib/shadowsocks"]
+masque = ["clash-lib/masque"]
+mieru = ["clash-lib/mieru"]
 ssh = ["clash-lib/ssh"]
+sudoku = ["clash-lib/sudoku"]
 tuic = ["clash-lib/tuic"]
 onion = ["clash-lib/onion"]
 shadowquic = ["clash-lib/shadowquic"]
 wireguard = ["clash-lib/wireguard"]
+openvpn = ["clash-lib/openvpn"]
 tailscale = ["clash-lib/tailscale"]
+utls = ["clash-lib/utls"]
 tproxy = ["clash-lib/tproxy"]
 redir = ["clash-lib/redir"]
 tun = ["clash-lib/tun"]

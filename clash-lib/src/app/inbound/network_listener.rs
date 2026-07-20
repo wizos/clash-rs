@@ -36,6 +36,7 @@ pub(crate) fn build_network_listeners(
     let name = &inbound_opts.common_opts().name;
     let addr = inbound_opts.common_opts().listen.0;
     let port = inbound_opts.common_opts().port;
+    let dispatcher = Arc::new(dispatcher.with_inbound_metadata(name.clone(), port));
 
     if let Some(handler) =
         build_handler(inbound_opts, dispatcher, authenticator, users_rx)

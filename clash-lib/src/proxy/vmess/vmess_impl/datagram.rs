@@ -14,6 +14,7 @@ use crate::{
 pub struct OutboundDatagramVmess {
     inner: AnyStream,
     remote_addr: SocksAddr,
+    packet_addr: bool,
 
     written: Option<usize>,
     flushed: bool,
@@ -22,10 +23,11 @@ pub struct OutboundDatagramVmess {
 }
 
 impl OutboundDatagramVmess {
-    pub fn new(inner: AnyStream, remote_addr: SocksAddr) -> Self {
+    pub fn new(inner: AnyStream, remote_addr: SocksAddr, packet_addr: bool) -> Self {
         Self {
             inner,
             remote_addr,
+            packet_addr,
             written: None,
             flushed: true,
             pkt: None,
@@ -53,9 +55,13 @@ impl Sink<UdpPacket> for OutboundDatagramVmess {
 
     fn start_send(
         self: std::pin::Pin<&mut Self>,
-        item: UdpPacket,
+        mut item: UdpPacket,
     ) -> Result<(), Self::Error> {
         let pin = self.get_mut();
+        if pin.packet_addr {
+            item.data =
+                super::super::super::packetaddr::encode(&item.dst_addr, &item.data)?;
+        }
         pin.pkt = Some(item);
         pin.flushed = false;
         Ok(())
@@ -147,6 +153,7 @@ impl Stream for OutboundDatagramVmess {
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Option<Self::Item>> {
+        let packet_addr = self.packet_addr;
         let Self {
             ref mut buf,
             ref mut inner,
@@ -161,12 +168,28 @@ impl Stream for OutboundDatagramVmess {
         let rv = ready!(inner.poll_read(cx, &mut buf));
 
         match rv {
-            Ok(()) => Poll::Ready(Some(UdpPacket {
-                data: buf.filled().to_vec(),
-                src_addr: remote_addr.clone(),
-                dst_addr: SocksAddr::any_ipv4(),
-                inbound_user: None,
-            })),
+            Ok(()) if buf.filled().is_empty() => Poll::Ready(None),
+            Ok(()) => {
+                let (src_addr, data) = if packet_addr {
+                    match super::super::super::packetaddr::decode(buf.filled()) {
+                        Ok((address, payload)) => (address, payload.to_vec()),
+                        Err(error) => {
+                            debug!(
+                                "failed to decode VMess packetaddr packet: {error}"
+                            );
+                            return Poll::Ready(None);
+                        }
+                    }
+                } else {
+                    (remote_addr.clone(), buf.filled().to_vec())
+                };
+                Poll::Ready(Some(UdpPacket {
+                    data,
+                    src_addr,
+                    dst_addr: SocksAddr::any_ipv4(),
+                    inbound_user: None,
+                }))
+            }
             Err(_) => Poll::Ready(None),
         }
     }

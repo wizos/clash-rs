@@ -39,7 +39,7 @@ pub struct EnhancedResolver {
     fallback_domain_filters: Option<Vec<Box<dyn FallbackDomainFilter>>>,
     fallback_ip_filters: Option<Vec<Box<dyn FallbackIPFilter>>>,
 
-    lru_cache: Option<hickory_resolver::ResponseCache>,
+    lru_cache: Option<RwLock<hickory_resolver::ResponseCache>>,
     policy: Option<trie::StringTrie<Vec<ThreadSafeDNSClient>>>,
 
     proxy_resolver: Option<Vec<ThreadSafeDNSClient>>,
@@ -240,10 +240,10 @@ impl EnhancedResolver {
             } else {
                 None
             },
-            lru_cache: Some(hickory_resolver::ResponseCache::new(
+            lru_cache: Some(RwLock::new(hickory_resolver::ResponseCache::new(
                 4096,
                 hickory_resolver::TtlConfig::default(),
-            )),
+            ))),
             policy: if !cfg.nameserver_policy.is_empty() {
                 let mut p = trie::StringTrie::new();
                 for (domain, ns) in &cfg.nameserver_policy {
@@ -386,9 +386,10 @@ impl EnhancedResolver {
 
         // Cache hit — return early
         if let Some(lru) = &self.lru_cache
-            && let Some(Ok(cached)) = lru.get(q, Instant::now()).map(|c| {
-                c.inspect_err(|x| warn!("failed to get cached message: {}", x))
-            })
+            && let Some(Ok(cached)) =
+                lru.read().await.get(q, Instant::now()).map(|c| {
+                    c.inspect_err(|x| warn!("failed to get cached message: {}", x))
+                })
         {
             trace!(
                 q = q.to_string(),
@@ -444,7 +445,9 @@ impl EnhancedResolver {
                 ips.is_empty() || ips.iter().any(|ip| !ip.is_unspecified())
             }
         {
-            lru.insert(q.clone(), Ok(msg.clone()), Instant::now());
+            lru.read()
+                .await
+                .insert(q.clone(), Ok(msg.clone()), Instant::now());
         }
 
         rv
@@ -724,6 +727,18 @@ impl ClashResolver for EnhancedResolver {
         self.ipv6.store(enable, Relaxed);
     }
 
+    async fn flush_cache(&self) {
+        if let Some(cache) = &self.lru_cache {
+            *cache.write().await = hickory_resolver::ResponseCache::new(
+                4096,
+                hickory_resolver::TtlConfig::default(),
+            );
+        }
+        if let Some(cache) = &self.reverse_lookup_cache {
+            cache.write().await.clear();
+        }
+    }
+
     fn kind(&self) -> ResolverKind {
         ResolverKind::Clash
     }
@@ -761,6 +776,7 @@ mod tests {
         rr,
     };
     use std::{net::Ipv4Addr, sync::Arc, time::Instant};
+    use tokio::sync::RwLock;
 
     use crate::{
         app::dns::{
@@ -835,10 +851,11 @@ mod tests {
 
         let mut resolver = EnhancedResolver::new_default().await;
         resolver.main.clear(); // ensure cache miss would fail deterministically
-        resolver.lru_cache = Some(hickory_resolver::ResponseCache::new(
-            16,
-            hickory_resolver::TtlConfig::default(),
-        ));
+        resolver.lru_cache =
+            Some(RwLock::new(hickory_resolver::ResponseCache::new(
+                16,
+                hickory_resolver::TtlConfig::default(),
+            )));
 
         let mut request = op::Message::query();
         let mut query = op::Query::new();
@@ -861,7 +878,7 @@ mod tests {
 
         let lru = resolver.lru_cache.as_ref().unwrap();
         let q = request.queries.first().unwrap().clone();
-        lru.insert(q, Ok(cached), Instant::now());
+        lru.write().await.insert(q, Ok(cached), Instant::now());
 
         let response = resolver
             .exchange(&request)

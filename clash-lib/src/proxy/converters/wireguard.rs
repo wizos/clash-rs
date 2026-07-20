@@ -1,4 +1,5 @@
 use ipnet::IpNet;
+use std::net::IpAddr;
 
 use crate::{
     Error,
@@ -29,39 +30,22 @@ impl TryFrom<&OutboundWireguard> for Handler {
             },
             server: s.common_opts.server.to_owned(),
             port: s.common_opts.port,
-            ip: s
-                .ip
-                .parse::<IpNet>()
-                .map(|x| match x.addr() {
-                    std::net::IpAddr::V4(v4) => Ok(v4),
-                    std::net::IpAddr::V6(_) => Err(Error::InvalidConfig(
-                        "invalid ip address: put an v4 address here".to_owned(),
-                    )),
-                })
-                .map_err(|x| {
-                    Error::InvalidConfig(format!(
-                        "invalid ip address: {}, {}",
-                        x, s.ip
-                    ))
-                })??,
+            ip: match parse_wireguard_address(&s.ip, "ip")? {
+                IpAddr::V4(ip) => ip,
+                IpAddr::V6(_) => {
+                    return Err(Error::InvalidConfig(
+                        "WireGuard `ip` must be an IPv4 address".to_owned(),
+                    ));
+                }
+            },
             ipv6: s
                 .ipv6
-                .as_ref()
-                .and_then(|x| {
-                    x.parse::<IpNet>()
-                        .map(|x| match x.addr() {
-                            std::net::IpAddr::V4(_) => Err(Error::InvalidConfig(
-                                "invalid ip address: put an v6 address here"
-                                    .to_owned(),
-                            )),
-                            std::net::IpAddr::V6(v6) => Ok(v6),
-                        })
-                        .map_err(|e| {
-                            Error::InvalidConfig(format!(
-                                "invalid ipv6 address: {e}, {x}"
-                            ))
-                        })
-                        .ok()
+                .as_deref()
+                .map(|value| match parse_wireguard_address(value, "ipv6")? {
+                    IpAddr::V6(ip) => Ok(ip),
+                    IpAddr::V4(_) => Err(Error::InvalidConfig(
+                        "WireGuard `ipv6` must be an IPv6 address".to_owned(),
+                    )),
                 })
                 .transpose()?,
             private_key: s.private_key.to_owned(),
@@ -75,5 +59,50 @@ impl TryFrom<&OutboundWireguard> for Handler {
             reserved_bits: s.reserved_bits.as_ref().map(|x| x.to_owned()),
         });
         Ok(h)
+    }
+}
+
+/// Mihomo accepts both host addresses and CIDR prefixes in WireGuard's `ip`
+/// and `ipv6` fields, normalizing bare hosts to /32 or /128 internally.
+fn parse_wireguard_address(value: &str, field: &str) -> Result<IpAddr, Error> {
+    value
+        .parse::<IpNet>()
+        .map(|network| network.addr())
+        .or_else(|_| value.parse::<IpAddr>())
+        .map_err(|error| {
+            Error::InvalidConfig(format!(
+                "invalid WireGuard `{field}` address `{value}`: {error}"
+            ))
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_wireguard_address;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn accepts_mihomo_wireguard_host_and_prefix_addresses() {
+        assert_eq!(
+            parse_wireguard_address("100.80.234.177", "ip").unwrap(),
+            IpAddr::V4(Ipv4Addr::new(100, 80, 234, 177))
+        );
+        assert_eq!(
+            parse_wireguard_address("100.80.234.177/32", "ip").unwrap(),
+            IpAddr::V4(Ipv4Addr::new(100, 80, 234, 177))
+        );
+        assert_eq!(
+            parse_wireguard_address("fd00::1", "ipv6").unwrap(),
+            IpAddr::V6("fd00::1".parse::<Ipv6Addr>().unwrap())
+        );
+        assert_eq!(
+            parse_wireguard_address("fd00::1/128", "ipv6").unwrap(),
+            IpAddr::V6("fd00::1".parse::<Ipv6Addr>().unwrap())
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_wireguard_addresses() {
+        assert!(parse_wireguard_address("not-an-ip", "ip").is_err());
     }
 }

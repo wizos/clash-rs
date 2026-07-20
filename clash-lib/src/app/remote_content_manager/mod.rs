@@ -1,6 +1,6 @@
 use super::dns::ThreadSafeDNSResolver;
 use crate::{
-    app::net::DEFAULT_OUTBOUND_INTERFACE,
+    app::net::outbound_interface_snapshot,
     common::{
         errors::{IntoIoResultExt as _, new_io_error},
         timed_future::TimedFuture,
@@ -31,6 +31,8 @@ use tracing::{debug, instrument, trace, warn};
 
 pub mod healthcheck;
 pub mod providers;
+
+const MAX_CONCURRENT_HEALTHCHECKS: usize = 16;
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct TrafficStats {
@@ -99,9 +101,11 @@ struct ProxyState {
 #[derive(Clone)]
 pub struct ProxyManager {
     proxy_state: Arc<RwLock<HashMap<String, ProxyState>>>,
+    healthcheck_semaphore: Arc<tokio::sync::Semaphore>,
     dns_resolver: ThreadSafeDNSResolver,
     /// Firewall Mark for url test
     fw_mark: Option<u32>,
+    unified_delay: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Default)]
@@ -117,7 +121,23 @@ impl ProxyManager {
         Self {
             dns_resolver,
             proxy_state: Default::default(),
+            healthcheck_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                MAX_CONCURRENT_HEALTHCHECKS,
+            )),
             fw_mark,
+            unified_delay: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn set_unified_delay(&self, enabled: bool) {
+        self.unified_delay.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn selected_delay(&self, actual: Duration, overall: Duration) -> Duration {
+        if self.unified_delay.load(Ordering::Relaxed) {
+            actual
+        } else {
+            overall
         }
     }
 
@@ -129,12 +149,17 @@ impl ProxyManager {
         url: &str,
         timeout: Option<Duration>,
     ) -> Vec<std::io::Result<(Duration, Duration)>> {
+        let semaphore = self.healthcheck_semaphore.clone();
         let mut futs = vec![];
         for outbound in outbounds {
             let outbound = outbound.clone();
             let url = url.to_owned();
             let manager = self.clone();
+            let semaphore = semaphore.clone();
             futs.push(tokio::spawn(async move {
+                let _permit = semaphore.acquire_owned().await.map_err(|err| {
+                    new_io_error(format!("healthcheck semaphore closed: {err}"))
+                })?;
                 let proxy_name = outbound.name().to_owned();
                 manager
                     .url_test(outbound, url.as_str(), timeout)
@@ -733,7 +758,7 @@ impl ProxyManager {
                 destination: (host.to_owned(), port)
                     .try_into()
                     .expect("must be valid destination"),
-                iface: DEFAULT_OUTBOUND_INTERFACE.read().await.clone(),
+                iface: outbound_interface_snapshot().await,
                 so_mark: self.fw_mark,
                 ..Default::default()
             };
@@ -862,16 +887,27 @@ impl ProxyManager {
         };
 
         let result = tester.await;
+        let selected_delay = result
+            .as_ref()
+            .map(|(actual, overall)| self.selected_delay(*actual, *overall));
+
+        crate::app::events::emit(
+            "delay",
+            serde_json::json!({
+                "url": url,
+                "name": name.clone(),
+                "value": selected_delay
+                    .map(|delay| delay.as_millis().min(i32::MAX as u128) as i32)
+                    .unwrap_or(-1),
+            }),
+        );
 
         self.report_alive(
             &name,
             result.is_ok(),
             Some(DelayHistory {
                 time: Utc::now(),
-                delay: result
-                    .as_ref()
-                    .map(|(actual, _)| *actual)
-                    .unwrap_or_default(),
+                delay: selected_delay.unwrap_or_default(),
             }),
         )
         .await;
@@ -1019,6 +1055,24 @@ mod tests {
     use futures::TryFutureExt;
     use httpmock::{Method::GET, MockServer};
     use std::{net::Ipv4Addr, sync::Arc, time::Duration};
+
+    #[test]
+    fn cloned_proxy_managers_share_healthcheck_limit() {
+        let manager = remote_content_manager::ProxyManager::new(
+            Arc::new(MockClashResolver::new()),
+            None,
+        );
+        let clone = manager.clone();
+
+        assert!(Arc::ptr_eq(
+            &manager.healthcheck_semaphore,
+            &clone.healthcheck_semaphore,
+        ));
+        assert_eq!(
+            manager.healthcheck_semaphore.available_permits(),
+            super::MAX_CONCURRENT_HEALTHCHECKS,
+        );
+    }
 
     #[tokio::test]
     async fn test_proxy_manager_alive() {

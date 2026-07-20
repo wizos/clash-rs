@@ -4,7 +4,7 @@ use axum::{
     Json, Router,
     extract::{Query, State},
     response::IntoResponse,
-    routing::get,
+    routing::{get, post},
 };
 
 use http::StatusCode;
@@ -19,6 +19,7 @@ use crate::{
         dispatcher,
         dns::{ThreadSafeDNSResolver, config::DNSListenAddr},
         inbound::manager::{InboundEndpoint, InboundManager, Ports},
+        outbound::manager::ThreadSafeOutboundManager,
     },
     config::{def, internal::config::BindAddress},
 };
@@ -45,6 +46,7 @@ struct ConfigState {
     dns_resolver: ThreadSafeDNSResolver,
     dns_listen_addr: DNSListenAddr,
     dns_enabled: bool,
+    outbound_manager: ThreadSafeOutboundManager,
 }
 
 pub fn routes(
@@ -54,12 +56,15 @@ pub fn routes(
     dns_resolver: ThreadSafeDNSResolver,
     dns_listen_addr: DNSListenAddr,
     dns_enabled: bool,
+    outbound_manager: ThreadSafeOutboundManager,
 ) -> Router<Arc<AppState>> {
     Router::new()
         .route(
             "/",
             get(get_configs).put(update_configs).patch(patch_configs),
         )
+        .route("/listeners/start", post(start_listeners))
+        .route("/listeners/stop", post(stop_listeners))
         .with_state(ConfigState {
             inbound_manager,
             dispatcher,
@@ -67,14 +72,45 @@ pub fn routes(
             dns_resolver,
             dns_listen_addr,
             dns_enabled,
+            outbound_manager,
         })
+}
+
+async fn start_listeners(State(state): State<ConfigState>) -> impl IntoResponse {
+    match state.inbound_manager.restart().await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to start listeners: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+async fn stop_listeners(State(state): State<ConfigState>) -> impl IntoResponse {
+    state.inbound_manager.stop_listeners().await;
+    StatusCode::NO_CONTENT
 }
 
 async fn get_configs(State(state): State<ConfigState>) -> impl IntoResponse {
     let run_mode = state.dispatcher.get_mode().await;
-    let log_level = {
+    let (
+        log_level,
+        reload_generation,
+        reload_attempt,
+        reload_completed,
+        reload_error,
+        reload_phase,
+    ) = {
         let global_state = state.global_state.lock().await;
-        global_state.log_level
+        (
+            global_state.log_level,
+            global_state.reload_generation,
+            global_state.reload_attempt,
+            global_state.reload_completed,
+            global_state.reload_error.clone(),
+            global_state.reload_phase.clone(),
+        )
     };
     let inbound_manager = state.inbound_manager.clone();
 
@@ -135,6 +171,11 @@ async fn get_configs(State(state): State<ConfigState>) -> impl IntoResponse {
         listeners: Some(listeners),
         lan_ips,
         dns_listen,
+        reload_generation,
+        reload_attempt,
+        reload_completed,
+        reload_error,
+        reload_phase,
     })
 }
 
@@ -197,21 +238,31 @@ async fn update_configs(
         },
     };
 
-    let (done, wait) = tokio::sync::oneshot::channel();
-    match reload_tx.send((cfg, done)).await {
-        Ok(_) => match wait.await {
-            Ok(_) => StatusCode::NO_CONTENT.into_response(),
-            Err(_) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "config reload did not complete",
-            )
-                .into_response(),
-        },
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "could not signal config reload",
+    // A reload replaces the API server itself. Waiting for completion in this
+    // request creates a cycle: the reload waits for the old server to stop,
+    // while the old server keeps this request alive waiting for the reload.
+    // Acknowledge the queued attempt and let clients observe the terminal state
+    // through GET /configs.
+    let reload_attempt = {
+        let mut global_state = state.global_state.lock().await;
+        global_state.reload_attempt = global_state.reload_attempt.saturating_add(1);
+        global_state.reload_phase = "queued".to_owned();
+        global_state.reload_attempt
+    };
+    match reload_tx.send((reload_attempt, cfg)).await {
+        Ok(_) => (
+            StatusCode::ACCEPTED,
+            Json(json!({"reload-attempt": reload_attempt})),
         )
             .into_response(),
+        Err(_) => {
+            let error = "could not signal config reload".to_string();
+            let mut global_state = state.global_state.lock().await;
+            global_state.reload_completed = reload_attempt;
+            global_state.reload_error = Some(error.clone());
+            global_state.reload_phase = "failed".to_owned();
+            (StatusCode::INTERNAL_SERVER_ERROR, error).into_response()
+        }
     }
 }
 
@@ -234,6 +285,12 @@ struct GetConfigResponse {
     lan_ips: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     dns_listen: Option<DnsListenInfo>,
+    reload_generation: u64,
+    reload_attempt: u64,
+    reload_completed: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reload_error: Option<String>,
+    reload_phase: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -249,6 +306,12 @@ struct PatchConfigRequest {
     log_level: Option<def::LogLevel>,
     ipv6: Option<bool>,
     allow_lan: Option<bool>,
+    sniffing: Option<bool>,
+    tcp_concurrent: Option<bool>,
+    interface_name: Option<String>,
+    unified_delay: Option<bool>,
+    find_process_mode: Option<def::FindProcessMode>,
+    suspended: Option<bool>,
 }
 
 impl PatchConfigRequest {
@@ -309,6 +372,28 @@ async fn patch_configs(
     // established after the restart immediately use the updated mode.
     if let Some(mode) = payload.mode {
         state.dispatcher.set_mode(mode).await;
+    }
+
+    if let Some(sniffing) = payload.sniffing {
+        state.dispatcher.set_sniffing(sniffing);
+    }
+    if let Some(tcp_concurrent) = payload.tcp_concurrent {
+        crate::proxy::utils::set_tcp_concurrent(tcp_concurrent);
+    }
+    if let Some(interface_name) = payload.interface_name
+        && let Err(error) =
+            crate::app::net::set_outbound_interface(Some(&interface_name)).await
+    {
+        return (StatusCode::BAD_REQUEST, error).into_response();
+    }
+    if let Some(unified_delay) = payload.unified_delay {
+        state.outbound_manager.set_unified_delay(unified_delay);
+    }
+    if let Some(find_process_mode) = payload.find_process_mode {
+        crate::process_resolver::set_find_process_mode(find_process_mode);
+    }
+    if let Some(suspended) = payload.suspended {
+        state.dispatcher.set_suspended(suspended);
     }
 
     if need_restart {

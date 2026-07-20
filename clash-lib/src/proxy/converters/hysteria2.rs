@@ -127,6 +127,7 @@ impl TryFrom<OutboundHysteria2> for Handler {
             disable_mtu_discovery: value.disable_mtu_discovery.unwrap_or(false),
             tls_cert: value.tls_cert,
             tls_key: value.tls_key,
+            ech: super::utils::tls_ech_options(value.ech_opts.as_ref()),
         };
 
         Ok(Handler::new(opts)?)

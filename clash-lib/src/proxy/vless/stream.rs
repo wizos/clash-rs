@@ -13,6 +13,7 @@ use crate::{proxy::AnyStream, session::SocksAddr};
 const VLESS_VERSION: u8 = 0;
 const VLESS_COMMAND_TCP: u8 = 1;
 const VLESS_COMMAND_UDP: u8 = 2;
+const VLESS_COMMAND_MUX: u8 = 3;
 
 pub struct VlessStream {
     inner: AnyStream,
@@ -22,6 +23,7 @@ pub struct VlessStream {
     uuid: uuid::Uuid,
     destination: SocksAddr,
     is_udp: bool,
+    is_xudp: bool,
     flow: Option<String>,
 }
 
@@ -31,6 +33,7 @@ impl VlessStream {
         uuid: &str,
         destination: &SocksAddr,
         is_udp: bool,
+        is_xudp: bool,
         flow: Option<String>,
     ) -> io::Result<Self> {
         let uuid = uuid::Uuid::parse_str(uuid).map_err(|_| {
@@ -47,6 +50,7 @@ impl VlessStream {
             uuid,
             destination: destination.clone(),
             is_udp,
+            is_xudp,
             flow,
         })
     }
@@ -69,13 +73,17 @@ impl VlessStream {
             buf.put_u8(0); // No addon
         }
 
-        if self.is_udp {
+        if self.is_xudp {
+            buf.put_u8(VLESS_COMMAND_MUX);
+        } else if self.is_udp {
             buf.put_u8(VLESS_COMMAND_UDP);
         } else {
             buf.put_u8(VLESS_COMMAND_TCP);
         }
 
-        self.destination.write_to_buf_vmess(&mut buf);
+        if !self.is_xudp {
+            self.destination.write_to_buf_vmess(&mut buf);
+        }
         buf
     }
 
@@ -267,6 +275,7 @@ mod tests {
             "5415d8e0-df92-3655-afa4-b79de66413f5",
             &tcp_dest(),
             false,
+            false,
             None,
         )
         .unwrap();
@@ -282,6 +291,7 @@ mod tests {
             dummy_stream(),
             "5415d8e0-df92-3655-afa4-b79de66413f5",
             &tcp_dest(),
+            false,
             false,
             Some(flow.to_string()),
         )
@@ -299,8 +309,30 @@ mod tests {
 
     #[test]
     fn test_new_invalid_uuid() {
-        let result =
-            VlessStream::new(dummy_stream(), "not-a-uuid", &tcp_dest(), false, None);
+        let result = VlessStream::new(
+            dummy_stream(),
+            "not-a-uuid",
+            &tcp_dest(),
+            false,
+            false,
+            None,
+        );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn xudp_uses_mux_command_without_destination() {
+        let stream = VlessStream::new(
+            dummy_stream(),
+            "5415d8e0-df92-3655-afa4-b79de66413f5",
+            &tcp_dest(),
+            true,
+            true,
+            None,
+        )
+        .unwrap();
+        let header = stream.build_handshake_header();
+        assert_eq!(header.len(), 19);
+        assert_eq!(header[18], VLESS_COMMAND_MUX);
     }
 }

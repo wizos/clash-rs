@@ -75,6 +75,7 @@ impl TryFrom<&OutboundTuic> for Handler {
             .unwrap_or(VarInt::MAX),
             tls_cert: s.tls_cert.clone(),
             tls_key: s.tls_key.clone(),
+            ech: super::utils::tls_ech_options(s.ech_opts.as_ref()),
         }))
     }
 }

@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
+
+#[cfg(target_family = "unix")]
+use std::os::fd::{BorrowedFd, IntoRawFd};
 
 use futures::{FutureExt, SinkExt, StreamExt, future::BoxFuture};
 use tokio_util::sync::CancellationToken;
@@ -17,8 +20,10 @@ use crate::{
 
 /// Maximum number of attempts to wait for a newly created TUN interface to
 /// become visible via NetworkInterface::show().
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 const TUN_VISIBILITY_MAX_ATTEMPTS: u32 = 40;
 /// Interval in milliseconds between each visibility poll attempt.
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 const TUN_VISIBILITY_POLL_INTERVAL_MS: u64 = 50;
 
 #[derive(Default)]
@@ -34,9 +39,24 @@ pub struct TunRunner {
     dispatcher: Arc<Dispatcher>,
     resolver: ThreadSafeDNSResolver,
     cancellation_token: CancellationToken,
+    task_handle: StdMutex<Option<tokio::task::JoinHandle<Result<(), Error>>>>,
 }
 
 impl TunRunner {
+    #[cfg(target_family = "unix")]
+    fn duplicate_external_fd(fd: std::os::fd::RawFd) -> std::io::Result<i32> {
+        // `fd://` is supplied and owned by the embedding application (on
+        // Android, VpnService). tun-rs::AsyncDevice::from_fd takes ownership,
+        // so handing it the original descriptor closes the application's FD
+        // when a runner is replaced. A hot reload can then register the same
+        // now-invalid number and make Tokio abort while waking its I/O driver.
+        // Give every runner an independently owned duplicate instead.
+        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+        borrowed
+            .try_clone_to_owned()
+            .map(|owned| owned.into_raw_fd())
+    }
+
     pub fn new(
         cfg: TunConfig,
         dispatcher: Arc<Dispatcher>,
@@ -45,9 +65,10 @@ impl TunRunner {
     ) -> Result<TunRunner, Error> {
         Ok(Self {
             cfg,
-            dispatcher,
+            dispatcher: Arc::new(dispatcher.with_inbound_metadata("DEFAULT-TUN", 0)),
             resolver,
             cancellation_token: cancellation_token.unwrap_or_default(),
+            task_handle: StdMutex::new(None),
         })
     }
 
@@ -118,7 +139,8 @@ impl TunRunner {
                 #[cfg(target_family = "unix")]
                 {
                     info!("tun started with fd {}", fd);
-                    unsafe { tun_rs::AsyncDevice::from_fd(fd as _)? }
+                    let owned_fd = Self::duplicate_external_fd(fd as _)?;
+                    unsafe { tun_rs::AsyncDevice::from_fd(owned_fd)? }
                 }
 
                 #[cfg(not(target_family = "unix"))]
@@ -252,6 +274,23 @@ impl TunRunner {
     }
 }
 
+#[cfg(all(test, target_family = "unix"))]
+mod fd_tests {
+    use super::TunRunner;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    #[test]
+    fn duplicate_external_fd_preserves_the_callers_descriptor() {
+        let (caller, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let original = caller.as_raw_fd();
+        let duplicate = TunRunner::duplicate_external_fd(original).unwrap();
+
+        assert_ne!(duplicate, original);
+        drop(unsafe { OwnedFd::from_raw_fd(duplicate) });
+        assert_ne!(unsafe { libc::fcntl(original, libc::F_GETFD) }, -1);
+    }
+}
+
 impl Runner for TunRunner {
     fn run_async(&self) {
         if !self.cfg.enable {
@@ -266,7 +305,7 @@ impl Runner for TunRunner {
         let dns_hijack = self.cfg.dns_hijack;
         let cancellation_token = self.cancellation_token.clone();
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let (tun, stack, mut tcp_listener, udp_socket) =
                 TunRunner::new_internal(&cfg)
                     .await
@@ -403,6 +442,7 @@ impl Runner for TunRunner {
                 }
             }
         });
+        *self.task_handle.lock().unwrap() = Some(handle);
     }
 
     fn shutdown(&self) {
@@ -417,6 +457,15 @@ impl Runner for TunRunner {
     }
 
     fn join(&self) -> BoxFuture<'_, Result<(), Error>> {
-        async move { Ok(()) }.boxed()
+        async move {
+            let handle = self.task_handle.lock().unwrap().take();
+            match handle {
+                Some(handle) => handle.await.map_err(|error| {
+                    Error::Operation(format!("tun task join failed: {error}"))
+                })?,
+                None => Ok(()),
+            }
+        }
+        .boxed()
     }
 }

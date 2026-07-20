@@ -14,6 +14,54 @@ pub(super) fn convert(c: &def::Config) -> Result<General, crate::Error> {
     } else {
         c.bind_address
     };
+
+    // Merge geox-url nested values with flat fields (nested takes precedence)
+    let (mmdb_download_url, asn_mmdb_download_url, geosite_download_url) =
+        if let Some(ref geox) = c.geox_url {
+            (
+                geox.mmdb
+                    .as_deref()
+                    .or(c.mmdb_download_url.as_deref())
+                    .map(String::from),
+                geox.asn
+                    .as_deref()
+                    .or(c.asn_mmdb_download_url.as_deref())
+                    .map(String::from),
+                geox.geosite
+                    .as_deref()
+                    .or(c.geosite_download_url.as_deref())
+                    .map(String::from),
+            )
+        } else {
+            (
+                c.mmdb_download_url.clone(),
+                c.asn_mmdb_download_url.clone(),
+                c.geosite_download_url.clone(),
+            )
+        };
+
+    // Merge external-controller-cors nested values with flat cors-allow-origins
+    let cors_allow_origins = c
+        .external_controller_cors
+        .as_ref()
+        .and_then(|cors| cors.allow_origins.clone())
+        .or(c.cors_allow_origins.clone());
+    let mmdb = c.mmdb.clone().or_else(|| {
+        mmdb_download_url
+            .as_ref()
+            .map(|_| "Country.mmdb".to_owned())
+    });
+    let asn_mmdb = c.asn_mmdb.clone().or_else(|| {
+        asn_mmdb_download_url
+            .as_ref()
+            .map(|_| "ASN.mmdb".to_owned())
+    });
+    let geosite = c.geosite.clone().or_else(|| {
+        geosite_download_url
+            .as_ref()
+            .map(|_| "GEOSITE.dat".to_owned())
+    });
+
     Ok(General {
         authentication: c.authentication.clone(),
         controller: Controller {
@@ -21,7 +69,7 @@ pub(super) fn convert(c: &def::Config) -> Result<General, crate::Error> {
             external_ui: c.external_ui.clone(),
             external_ui_download_url: c.external_ui_url.clone(),
             secret: c.secret.clone(),
-            cors_allow_origins: c.cors_allow_origins.clone(),
+            cors_allow_origins,
             external_controller_ipc: c.external_controller_ipc.clone(),
         },
         mode: c.mode,
@@ -35,12 +83,16 @@ pub(super) fn convert(c: &def::Config) -> Result<General, crate::Error> {
             }
         }),
         routing_mask: c.routing_mark,
-        mmdb: c.mmdb.to_owned(),
-        mmdb_download_url: c.mmdb_download_url.to_owned(),
-        asn_mmdb: c.asn_mmdb.to_owned(),
-        asn_mmdb_download_url: c.asn_mmdb_download_url.to_owned(),
-        geosite: c.geosite.to_owned(),
-        geosite_download_url: c.geosite_download_url.to_owned(),
+        mmdb,
+        mmdb_download_url,
+        asn_mmdb,
+        asn_mmdb_download_url,
+        geosite,
+        geosite_download_url,
         bind_address,
+        unified_delay: c.unified_delay,
+        tcp_concurrent: c.tcp_concurrent,
+        find_process_mode: c.find_process_mode,
+        sniffer: c.sniffer.clone(),
     })
 }

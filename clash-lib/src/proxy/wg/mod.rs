@@ -29,11 +29,11 @@ use std::{
 };
 use tokio::sync::OnceCell;
 
-mod device;
-mod events;
+pub(crate) mod device;
+pub(crate) mod events;
 mod keys;
 mod ports;
-mod stack;
+pub(crate) mod stack;
 mod wireguard;
 
 pub struct HandlerOptions {
@@ -184,7 +184,7 @@ impl Handler {
                 );
 
                 let device_manager = Arc::new(device::DeviceManager::new(
-                    self.opts.ip,
+                    Some(self.opts.ip),
                     self.opts.ipv6,
                     resolver,
                     if self.opts.remote_dns_resolve {
@@ -280,7 +280,7 @@ impl OutboundHandler for Handler {
 
         let remote = (ip, sess.destination.port()).into();
 
-        let socket = inner.device_manager.new_tcp_socket(remote).await;
+        let socket = inner.device_manager.new_tcp_socket(remote).await?;
         let chained = ChainedStreamWrapper::new(socket);
         chained.append_to_chain(self.name()).await;
         Ok(Box::new(chained))

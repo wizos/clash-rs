@@ -21,7 +21,7 @@ use std::{collections::HashMap, io, sync::Arc};
 use tracing::debug;
 use vmess_impl::OutboundDatagramVmess;
 
-mod vmess_impl;
+pub(crate) mod vmess_impl;
 
 pub struct HandlerOptions {
     pub name: String,
@@ -32,6 +32,10 @@ pub struct HandlerOptions {
     pub alter_id: u16,
     pub security: String,
     pub udp: bool,
+    pub packet_addr: bool,
+    pub xudp: bool,
+    pub global_padding: bool,
+    pub authenticated_length: bool,
     pub transport: Option<Box<dyn Transport>>,
     // maybe shadow-tls?
     pub tls: Option<Box<dyn Transport>>,
@@ -79,12 +83,20 @@ impl Handler {
             s
         };
 
+        let destination = if udp && self.opts.packet_addr {
+            super::packetaddr::magic_destination()
+        } else {
+            sess.destination.clone()
+        };
         let vmess_builder = vmess_impl::Builder::new(&vmess_impl::VmessOption {
             uuid: self.opts.uuid.to_owned(),
             alter_id: self.opts.alter_id,
             security: self.opts.security.to_owned(),
             udp,
-            dst: sess.destination.clone(),
+            xudp: udp && self.opts.xudp,
+            global_padding: self.opts.global_padding,
+            authenticated_length: self.opts.authenticated_length,
+            dst: destination,
         })?;
 
         vmess_builder.proxy_stream(s).await
@@ -201,11 +213,25 @@ impl OutboundHandler for Handler {
 
         let stream = self.inner_proxy_stream(stream, sess, true).await?;
 
-        let d = OutboundDatagramVmess::new(stream, sess.destination.clone());
-
-        let chained = ChainedDatagramWrapper::new(d);
-        chained.append_to_chain(self.name()).await;
-        Ok(Box::new(chained))
+        if self.opts.xudp {
+            let datagram = super::xudp::OutboundDatagramXudp::new(
+                stream,
+                sess.destination.clone(),
+                sess.source,
+            );
+            let chained = ChainedDatagramWrapper::new(datagram);
+            chained.append_to_chain(self.name()).await;
+            Ok(Box::new(chained))
+        } else {
+            let datagram = OutboundDatagramVmess::new(
+                stream,
+                sess.destination.clone(),
+                self.opts.packet_addr,
+            );
+            let chained = ChainedDatagramWrapper::new(datagram);
+            chained.append_to_chain(self.name()).await;
+            Ok(Box::new(chained))
+        }
     }
 
     fn try_as_plain_handler(&self) -> Option<&dyn PlainProxyAPIResponse> {
@@ -428,6 +454,10 @@ mod tests {
             alter_id: 0,
             security: "auto".into(),
             udp: true,
+            packet_addr: false,
+            xudp: false,
+            global_padding: false,
+            authenticated_length: false,
             tls: tls_client(None),
             transport: Some(Box::new(ws_client)),
         };
@@ -476,6 +506,10 @@ mod tests {
             alter_id: 0,
             security: "auto".into(),
             udp: true,
+            packet_addr: false,
+            xudp: false,
+            global_padding: false,
+            authenticated_length: false,
             tls: tls_client(None),
             transport: Some(Box::new(grpc_client)),
         };
@@ -525,6 +559,10 @@ mod tests {
             alter_id: 0,
             security: "auto".into(),
             udp: false,
+            packet_addr: false,
+            xudp: false,
+            global_padding: false,
+            authenticated_length: false,
             tls: tls_client(Some(vec!["h2".to_string()])),
             transport: Some(Box::new(h2_client)),
         };

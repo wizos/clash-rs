@@ -6,13 +6,15 @@ use std::{
     task::{Context, Poll},
 };
 
-use bytes::BytesMut;
+use bytes::{BufMut, BytesMut};
 use futures::{
     Sink, SinkExt, Stream, StreamExt, ready,
     stream::{SplitSink, SplitStream},
 };
 use shadowsocks::{
     ProxySocket,
+    context::Context as ShadowsocksContext,
+    crypto::{CipherCategory, CipherKind, v1::Cipher},
     relay::udprelay::{
         DatagramReceive, DatagramSend, options::UdpSocketControlData,
     },
@@ -22,9 +24,205 @@ use tracing::{debug, error, instrument};
 
 use crate::{
     common::errors::new_io_error,
-    proxy::{AnyOutboundDatagram, datagram::UdpPacket},
+    proxy::{
+        AnyOutboundDatagram, datagram::UdpPacket,
+        shadowsocks::ssr_protocol::SsrUdpProtocol,
+    },
     session::SocksAddr,
 };
+
+pub(crate) struct OutboundDatagramShadowsocksR {
+    inner: AnyOutboundDatagram,
+    remote_addr: SocketAddr,
+    context: std::sync::Arc<ShadowsocksContext>,
+    method: CipherKind,
+    key: Vec<u8>,
+    protocol: SsrUdpProtocol,
+    flushed: bool,
+    wire_started: bool,
+    packet: Option<UdpPacket>,
+}
+
+impl OutboundDatagramShadowsocksR {
+    pub(crate) fn new(
+        inner: AnyOutboundDatagram,
+        remote_addr: SocketAddr,
+        context: std::sync::Arc<ShadowsocksContext>,
+        method: CipherKind,
+        key: Vec<u8>,
+        protocol: SsrUdpProtocol,
+    ) -> Self {
+        Self {
+            inner,
+            remote_addr,
+            context,
+            method,
+            key,
+            protocol,
+            flushed: true,
+            wire_started: false,
+            packet: None,
+        }
+    }
+
+    fn encode_packet(&self, packet: &UdpPacket) -> io::Result<Vec<u8>> {
+        let mut plaintext =
+            BytesMut::with_capacity(packet.dst_addr.size() + packet.data.len() + 8);
+        packet.dst_addr.write_buf(&mut plaintext);
+        plaintext.put_slice(&packet.data);
+        self.protocol.encode(&mut plaintext);
+
+        match self.method.category() {
+            CipherCategory::None => Ok(plaintext.to_vec()),
+            CipherCategory::Stream => {
+                let iv_length = self.method.iv_len();
+                let mut encrypted =
+                    BytesMut::with_capacity(iv_length + plaintext.len());
+                encrypted.resize(iv_length, 0);
+                self.context.generate_nonce(
+                    self.method,
+                    &mut encrypted[..iv_length],
+                    false,
+                );
+                let mut cipher =
+                    Cipher::new(self.method, &self.key, &encrypted[..iv_length]);
+                encrypted.put_slice(&plaintext);
+                cipher.encrypt_packet(&mut encrypted[iv_length..]);
+                Ok(encrypted.to_vec())
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SSR requires a stream cipher or dummy cipher",
+            )),
+        }
+    }
+
+    fn decode_packet(&self, mut packet: UdpPacket) -> io::Result<UdpPacket> {
+        let iv_length = self.method.iv_len();
+        if packet.data.len() < iv_length {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "SSR UDP packet is shorter than its IV",
+            ));
+        }
+        let plaintext = match self.method.category() {
+            CipherCategory::None => packet.data.as_mut_slice(),
+            CipherCategory::Stream => {
+                let (iv, data) = packet.data.split_at_mut(iv_length);
+                let mut cipher = Cipher::new(self.method, &self.key, iv);
+                if !cipher.decrypt_packet(data) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "failed to decrypt SSR UDP packet",
+                    ));
+                }
+                data
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "SSR requires a stream cipher or dummy cipher",
+                ));
+            }
+        };
+        let plaintext = self.protocol.decode(plaintext)?;
+        let source = SocksAddr::peek_read(plaintext)?;
+        let address_length = source.size();
+        if plaintext.len() < address_length {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "SSR UDP response address is truncated",
+            ));
+        }
+        Ok(UdpPacket {
+            data: plaintext[address_length..].to_vec(),
+            src_addr: source,
+            dst_addr: SocksAddr::any_ipv4(),
+            inbound_user: None,
+        })
+    }
+}
+
+impl Sink<UdpPacket> for OutboundDatagramShadowsocksR {
+    type Error = io::Error;
+
+    fn poll_ready(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
+        if !self.flushed {
+            ready!(self.as_mut().poll_flush(cx))?;
+        }
+        Pin::new(&mut self.get_mut().inner).poll_ready(cx)
+    }
+
+    fn start_send(self: Pin<&mut Self>, item: UdpPacket) -> Result<(), Self::Error> {
+        let this = self.get_mut();
+        this.packet = Some(item);
+        this.flushed = false;
+        this.wire_started = false;
+        Ok(())
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
+        let this = self.get_mut();
+        if this.flushed {
+            return Poll::Ready(Ok(()));
+        }
+        if !this.wire_started {
+            ready!(Pin::new(&mut this.inner).poll_ready(cx))?;
+            let source = this
+                .packet
+                .as_ref()
+                .ok_or_else(|| io::Error::other("no SSR UDP packet to send"))?;
+            let wire = this.encode_packet(source)?;
+            Pin::new(&mut this.inner).start_send(UdpPacket {
+                data: wire,
+                src_addr: SocksAddr::any_ipv4(),
+                dst_addr: this.remote_addr.into(),
+                inbound_user: None,
+            })?;
+            this.wire_started = true;
+        }
+        ready!(Pin::new(&mut this.inner).poll_flush(cx))?;
+        this.packet = None;
+        this.flushed = true;
+        this.wire_started = false;
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_close(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
+        ready!(self.as_mut().poll_flush(cx))?;
+        Pin::new(&mut self.get_mut().inner).poll_close(cx)
+    }
+}
+
+impl Stream for OutboundDatagramShadowsocksR {
+    type Item = UdpPacket;
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        match ready!(Pin::new(&mut this.inner).poll_next(cx)) {
+            Some(packet) => match this.decode_packet(packet) {
+                Ok(packet) => Poll::Ready(Some(packet)),
+                Err(error) => {
+                    error!("failed to decode SSR UDP response: {error}");
+                    Poll::Ready(None)
+                }
+            },
+            None => Poll::Ready(None),
+        }
+    }
+}
 
 /// OutboundDatagram wrapper for shadowsocks socket, that takes ShadowsocksUdpIo
 /// as underlying I/O

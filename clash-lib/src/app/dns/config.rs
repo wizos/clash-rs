@@ -12,7 +12,8 @@ use std::{
     net::{IpAddr, SocketAddr},
     sync::Arc,
 };
-use tracing::warn;
+#[allow(unused_imports)]
+use tracing::info;
 use url::Url;
 pub use watfaq_dns::{DNSListenAddr, DoH3Config, DoHConfig, DoTConfig};
 
@@ -78,7 +79,13 @@ impl Config {
             let mut server = server.clone();
 
             if server == "system" {
-                warn!("'system' is not supported as dns nameserver, skipping");
+                nameservers.push(NameServer {
+                    net: DNSNetMode::System,
+                    host: url::Host::Domain("system".to_string()),
+                    port: 0,
+                    interface: None,
+                    proxy: None,
+                });
                 continue;
             }
 
@@ -142,6 +149,10 @@ impl Config {
                     port = url.port().unwrap_or(0);
                     net = "DHCP";
                 }
+                "system" => {
+                    port = 0;
+                    net = "System";
+                }
 
                 _ => {
                     return Err(Error::InvalidConfig(format!(
@@ -180,13 +191,32 @@ impl Config {
     }
 
     pub fn parse_nameserver_policy(
-        policy_map: &HashMap<String, String>,
+        policy_map: &HashMap<String, serde_yaml::Value>,
     ) -> Result<HashMap<String, NameServer>, Error> {
         let mut policy = HashMap::new();
 
-        for (domain, server) in policy_map {
-            let nameservers =
-                Config::parse_nameserver(std::slice::from_ref(server))?;
+        for (domain, value) in policy_map {
+            // Value can be a single string or an array of strings (mihomo compat)
+            let servers: Vec<String> = match value {
+                serde_yaml::Value::String(s) => vec![s.clone()],
+                serde_yaml::Value::Sequence(seq) => seq
+                    .iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect(),
+                _ => {
+                    return Err(Error::InvalidConfig(format!(
+                        "DNS nameserver-policy value must be a string or array of \
+                         strings: {}",
+                        domain
+                    )));
+                }
+            };
+
+            let nameservers = Config::parse_nameserver(&servers)?;
+
+            if nameservers.is_empty() {
+                continue;
+            }
 
             let (_, valid) = trie::valid_and_split_domain(domain);
             if !valid {
@@ -307,6 +337,10 @@ impl TryFrom<&crate::config::def::Config> for Config {
         let default_nameserver = Config::parse_nameserver(&dc.default_nameserver)?;
 
         for ns in &default_nameserver {
+            // System DNS and DHCP don't need to be IP addresses
+            if ns.net == DNSNetMode::System || ns.net == DNSNetMode::Dhcp {
+                continue;
+            }
             if let url::Host::Domain(_) = ns.host {
                 return Err(Error::InvalidConfig(String::from(
                     "default dns must be ip address",

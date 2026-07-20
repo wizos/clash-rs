@@ -38,6 +38,16 @@ impl RuleExpression {
             RuleExpression::Not(expr) => !expr.evaluate(sess),
         }
     }
+
+    fn should_resolve_process(&self) -> bool {
+        match self {
+            RuleExpression::Rule(matcher) => matcher.should_resolve_process(),
+            RuleExpression::And(expressions) | RuleExpression::Or(expressions) => {
+                expressions.iter().any(Self::should_resolve_process)
+            }
+            RuleExpression::Not(expression) => expression.should_resolve_process(),
+        }
+    }
 }
 
 pub struct CompositeRule {
@@ -59,6 +69,7 @@ impl CompositeRule {
         expression: &str,
         target: &str,
         mmdb: Option<MmdbLookup>,
+        asn_mmdb: Option<MmdbLookup>,
         geodata: Option<GeoDataLookup>,
         rule_provider_registry: Option<&HashMap<String, ThreadSafeRuleProvider>>,
     ) -> Result<Self, crate::Error> {
@@ -66,6 +77,7 @@ impl CompositeRule {
             operator,
             expression,
             mmdb,
+            asn_mmdb,
             geodata,
             rule_provider_registry,
         )?;
@@ -84,6 +96,7 @@ impl CompositeRule {
         operator: &str,
         expression: &str,
         mmdb: Option<MmdbLookup>,
+        asn_mmdb: Option<MmdbLookup>,
         geodata: Option<GeoDataLookup>,
         rule_provider_registry: Option<&HashMap<String, ThreadSafeRuleProvider>>,
     ) -> Result<RuleExpression, crate::Error> {
@@ -100,6 +113,7 @@ impl CompositeRule {
         let sub_exprs = Self::parse_sub_expressions(
             inner,
             mmdb,
+            asn_mmdb,
             geodata,
             rule_provider_registry,
         )?;
@@ -130,6 +144,7 @@ impl CompositeRule {
     fn parse_sub_expressions(
         input: &str,
         mmdb: Option<MmdbLookup>,
+        asn_mmdb: Option<MmdbLookup>,
         geodata: Option<GeoDataLookup>,
         rule_provider_registry: Option<&HashMap<String, ThreadSafeRuleProvider>>,
     ) -> Result<Vec<RuleExpression>, crate::Error> {
@@ -180,6 +195,7 @@ impl CompositeRule {
             expressions.push(Self::parse_one_expression(
                 &expr_str,
                 mmdb.clone(),
+                asn_mmdb.clone(),
                 geodata.clone(),
                 rule_provider_registry,
             )?);
@@ -199,6 +215,7 @@ impl CompositeRule {
     fn parse_one_expression(
         expr_str: &str,
         mmdb: Option<MmdbLookup>,
+        asn_mmdb: Option<MmdbLookup>,
         geodata: Option<GeoDataLookup>,
         rule_provider_registry: Option<&HashMap<String, ThreadSafeRuleProvider>>,
     ) -> Result<RuleExpression, crate::Error> {
@@ -245,6 +262,7 @@ impl CompositeRule {
                 rule_type,
                 rest,
                 mmdb,
+                asn_mmdb,
                 geodata,
                 rule_provider_registry,
             );
@@ -252,7 +270,14 @@ impl CompositeRule {
 
         // It's a leaf rule - parse as RuleType
         let rule = RuleType::new(rule_type, rest, "", None)?;
-        let matcher = map_rule_type(rule, mmdb, geodata, rule_provider_registry);
+        let matcher = map_rule_type(
+            rule,
+            mmdb,
+            asn_mmdb,
+            geodata,
+            rule_provider_registry,
+            None,
+        );
         Ok(RuleExpression::Rule(matcher))
     }
 }
@@ -295,6 +320,10 @@ impl RuleMatcher for CompositeRule {
     fn type_name(&self) -> &str {
         &self.operator
     }
+
+    fn should_resolve_process(&self) -> bool {
+        self.expression.should_resolve_process()
+    }
 }
 
 #[cfg(test)]
@@ -319,6 +348,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -334,6 +364,7 @@ mod tests {
             "AND",
             "((DOMAIN,baidu.com),(NETWORK,UDP))",
             "DIRECT",
+            None,
             None,
             None,
             None,
@@ -355,6 +386,7 @@ mod tests {
             "OR",
             "((DOMAIN,baidu.com),(NETWORK,UDP))",
             "DIRECT",
+            None,
             None,
             None,
             None,
@@ -383,6 +415,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -396,6 +429,7 @@ mod tests {
             "NOT",
             "((DOMAIN,baidu.com))",
             "PROXY",
+            None,
             None,
             None,
             None,
@@ -419,6 +453,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         assert!(result.is_err());
@@ -437,6 +472,7 @@ mod tests {
             "AND",
             "((DOMAIN,example.com),(OR,((NETWORK,UDP),(NETWORK,TCP))))",
             "DIRECT",
+            None,
             None,
             None,
             None,
@@ -465,6 +501,7 @@ mod tests {
             "((AND,((DOMAIN,a.com),(NETWORK,UDP))),(AND,((DOMAIN,b.com),(NETWORK,\
              TCP))))",
             "PROXY",
+            None,
             None,
             None,
             None,
@@ -497,6 +534,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -518,6 +556,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -533,6 +572,7 @@ mod tests {
             "AND",
             "((DOMAIN-SUFFIX,example.com),(NETWORK,TCP))",
             "DIRECT",
+            None,
             None,
             None,
             None,
@@ -566,6 +606,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -596,6 +637,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -610,6 +652,7 @@ mod tests {
             "AND",
             "(DOMAIN,baidu.com),(NETWORK,UDP)",
             "DIRECT",
+            None,
             None,
             None,
             None,
@@ -630,6 +673,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         assert!(result.is_err());
@@ -644,6 +688,7 @@ mod tests {
             "AND",
             "((DOMAIN,baidu.com),(NETWORK,UDP)",
             "DIRECT",
+            None,
             None,
             None,
             None,
@@ -667,6 +712,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         assert!(result.is_err());
@@ -680,7 +726,8 @@ mod tests {
 
     #[test]
     fn test_error_empty_expression() {
-        let result = CompositeRule::new("AND", "()", "DIRECT", None, None, None);
+        let result =
+            CompositeRule::new("AND", "()", "DIRECT", None, None, None, None);
 
         assert!(result.is_err());
     }
@@ -688,8 +735,9 @@ mod tests {
     #[test]
     fn test_payload_and_display() {
         let expression = "((DOMAIN,baidu.com),(NETWORK,UDP))";
-        let rule = CompositeRule::new("AND", expression, "DIRECT", None, None, None)
-            .unwrap();
+        let rule =
+            CompositeRule::new("AND", expression, "DIRECT", None, None, None, None)
+                .unwrap();
 
         assert_eq!(rule.payload(), expression);
         assert!(rule.to_string().contains("DIRECT"));
@@ -704,6 +752,7 @@ mod tests {
             "((AND,((DOMAIN,a.com),(NETWORK,TCP))),(AND,((DOMAIN,b.com),(NETWORK,\
              UDP))))",
             "COMPLEX",
+            None,
             None,
             None,
             None,

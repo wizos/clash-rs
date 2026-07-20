@@ -10,6 +10,7 @@ pub struct UdpPacket {
     pub local_addr: SocketAddr,
     /// dst of the packet
     pub remote_addr: SocketAddr,
+    pub dscp: u8,
 }
 impl std::fmt::Debug for UdpPacket {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -30,6 +31,7 @@ where
             data: data.into(),
             local_addr,
             remote_addr,
+            dscp: 0,
         }
     }
 }
@@ -79,6 +81,7 @@ impl SplitRead {
 
             let src_ip = packet.src_addr();
             let dst_ip = packet.dst_addr();
+            let dscp = packet.dscp();
             let payload = packet.payload();
 
             let packet = match smoltcp::wire::UdpPacket::new_checked(payload) {
@@ -103,6 +106,7 @@ impl SplitRead {
                 data: Packet::new(packet.payload().to_vec()),
                 local_addr: src_addr,
                 remote_addr: dst_addr,
+                dscp,
             })
         })
     }

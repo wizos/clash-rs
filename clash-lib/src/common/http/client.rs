@@ -1,5 +1,5 @@
 use crate::{
-    app::dns::ThreadSafeDNSResolver,
+    app::dns::{RuleDispatch, ThreadSafeDNSResolver},
     common::tls::GLOBAL_ROOT_STORE,
     config::internal::proxy::PROXY_DIRECT,
     proxy::{AnyOutboundHandler, direct, utils::OutboundHandlerRegistry},
@@ -21,6 +21,7 @@ pub(crate) struct ClashHTTPClientExt {
 pub struct HttpClient {
     dns_resolver: ThreadSafeDNSResolver,
     outbounds: Option<OutboundHandlerRegistry>,
+    rule_dispatch: Option<Arc<RuleDispatch>>,
     tls_config: Arc<rustls::ClientConfig>,
     timeout: tokio::time::Duration,
 }
@@ -41,9 +42,15 @@ impl HttpClient {
         Ok(HttpClient {
             dns_resolver,
             outbounds: bootstrap_outbounds,
+            rule_dispatch: None,
             tls_config: Arc::new(tls_config),
             timeout: timeout.unwrap_or(tokio::time::Duration::from_secs(10)),
         })
+    }
+
+    pub fn with_rule_dispatch(mut self, rule_dispatch: Arc<RuleDispatch>) -> Self {
+        self.rule_dispatch = Some(rule_dispatch);
+        self
     }
 
     pub async fn request<T>(
@@ -97,6 +104,12 @@ impl HttpClient {
             .and_then(|ext| ext.outbound.clone());
         let make_direct =
             || Arc::new(direct::Handler::new(PROXY_DIRECT)) as AnyOutboundHandler;
+        let mut sess = Session {
+            network: crate::session::Network::Tcp,
+            typ: crate::session::Type::Ignore,
+            destination: crate::session::SocksAddr::Domain(host.clone(), port),
+            ..Default::default()
+        };
         let outbound: AnyOutboundHandler = if let Some(name) = outbound_name {
             if let Some(registry) = &self.outbounds {
                 registry
@@ -105,20 +118,29 @@ impl HttpClient {
                     .get(&name)
                     .cloned()
                     .unwrap_or_else(make_direct)
+            } else if let Some(rule_dispatch) = &self.rule_dispatch
+                && let Some(manager) = rule_dispatch.outbound_manager.get()
+            {
+                manager
+                    .get_outbound(&name)
+                    .await
+                    .unwrap_or_else(make_direct)
             } else {
                 make_direct()
             }
+        } else if let Some(rule_dispatch) = &self.rule_dispatch
+            && let (Some(router), Some(manager)) = (
+                rule_dispatch.router.get(),
+                rule_dispatch.outbound_manager.get(),
+            )
+        {
+            let (name, _) = router.match_route(&mut sess).await;
+            manager.get_outbound(name).await.unwrap_or_else(make_direct)
         } else {
             make_direct()
         };
 
         trace!(outbound = %outbound.name(), "using outbound");
-        let sess = Session {
-            network: crate::session::Network::Tcp,
-            typ: crate::session::Type::Ignore,
-            destination: crate::session::SocksAddr::Domain(host.clone(), port),
-            ..Default::default()
-        };
         let stream = tokio::time::timeout(
             self.timeout,
             outbound.connect_stream(&sess, self.dns_resolver.clone()),
