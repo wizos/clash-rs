@@ -45,13 +45,14 @@ fn stop_running_instance() -> bool {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn clash_set_android_process_resolver(
     context: *mut c_void,
+    api_level: c_int,
     resolver: Option<clash_lib::process_resolver::AndroidProcessResolver>,
     free: Option<clash_lib::process_resolver::AndroidStringFree>,
     protect: Option<clash_lib::process_resolver::AndroidSocketProtector>,
 ) {
     unsafe {
         clash_lib::process_resolver::set_android_resolver(
-            context, resolver, free, protect,
+            context, api_level, resolver, free, protect,
         );
     }
 }

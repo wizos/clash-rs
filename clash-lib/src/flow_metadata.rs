@@ -2,12 +2,16 @@ use std::{
     collections::HashMap,
     net::SocketAddr,
     sync::{Mutex, OnceLock},
-    time::{Duration, Instant},
 };
+
+#[cfg(any(test, feature = "tun"))]
+use std::time::{Duration, Instant};
 
 use crate::session::Network;
 
+#[cfg(any(test, feature = "tun"))]
 const MAX_FLOWS: usize = 4096;
+#[cfg(any(test, feature = "tun"))]
 const FLOW_TTL: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
@@ -20,6 +24,7 @@ struct FlowKey {
 #[derive(Clone, Copy)]
 struct FlowValue {
     dscp: u8,
+    #[cfg(any(test, feature = "tun"))]
     updated_at: Instant,
 }
 
@@ -28,6 +33,7 @@ fn flows() -> &'static Mutex<HashMap<FlowKey, FlowValue>> {
     FLOWS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[cfg(any(test, feature = "tun"))]
 pub fn record_dscp(
     network: Network,
     source: SocketAddr,
@@ -55,6 +61,7 @@ pub fn record_dscp(
         },
         FlowValue {
             dscp,
+            #[cfg(any(test, feature = "tun"))]
             updated_at: now,
         },
     );

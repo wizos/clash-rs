@@ -14,12 +14,16 @@ use crate::{
     session::SocksAddr,
 };
 
+#[cfg(any(test, feature = "shadowsocks"))]
 pub(crate) const VERSION: u8 = 2;
+#[cfg(any(test, feature = "shadowsocks"))]
 pub(crate) const LEGACY_VERSION: u8 = 1;
 pub(crate) const MAGIC_ADDRESS: &str = "sp.v2.udp-over-tcp.arpa";
+#[cfg(any(test, feature = "shadowsocks"))]
 pub(crate) const LEGACY_MAGIC_ADDRESS: &str = "sp.udp-over-tcp.arpa";
 const MAX_PACKET_LENGTH: usize = u16::MAX as usize;
 
+#[cfg(any(test, feature = "shadowsocks"))]
 pub(crate) fn request_destination(version: u8) -> io::Result<SocksAddr> {
     let host = match version {
         VERSION => MAGIC_ADDRESS,

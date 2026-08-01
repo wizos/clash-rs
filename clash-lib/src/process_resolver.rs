@@ -28,6 +28,8 @@ pub type AndroidSocketProtector =
 #[derive(Clone, Copy)]
 struct Resolver {
     context: usize,
+    #[cfg(target_os = "android")]
+    api_level: c_int,
     resolve: AndroidProcessResolver,
     free: Option<AndroidStringFree>,
     protect: Option<AndroidSocketProtector>,
@@ -67,12 +69,15 @@ pub fn should_resolve_for_rule() -> bool {
 /// `clear_android_resolver` is called.
 pub unsafe fn set_android_resolver(
     context: *mut c_void,
+    _api_level: c_int,
     resolve: Option<AndroidProcessResolver>,
     free: Option<AndroidStringFree>,
     protect: Option<AndroidSocketProtector>,
 ) {
     let value = resolve.map(|resolve| Resolver {
         context: context as usize,
+        #[cfg(target_os = "android")]
+        api_level: _api_level,
         resolve,
         free,
         protect,
@@ -127,10 +132,12 @@ pub fn resolve_session(sess: &mut Session) {
     #[cfg(target_os = "android")]
     let uid_hint = if sess.uid != 0 {
         sess.uid as c_int
-    } else {
+    } else if needs_procfs_uid_fallback(resolver.api_level) {
         find_android_uid(sess.network, sess.source.ip(), sess.source.port())
             .map(|uid| uid as c_int)
             .unwrap_or(-1)
+    } else {
+        -1
     };
     #[cfg(not(target_os = "android"))]
     let uid_hint = sess.uid as c_int;
@@ -161,6 +168,11 @@ pub fn resolve_session(sess: &mut Session) {
     } else {
         sess.process = value;
     }
+}
+
+#[cfg(any(test, target_os = "android"))]
+fn needs_procfs_uid_fallback(api_level: c_int) -> bool {
+    api_level < 29
 }
 
 /// Android < 10 has no `ConnectivityManager.getConnectionOwnerUid`. Mirror
@@ -276,6 +288,12 @@ mod tests {
         resolve_session(&mut session);
         assert!(session.process.is_empty());
         assert_eq!(session.uid, 0);
+    }
+
+    #[test]
+    fn uses_procfs_uid_fallback_only_before_android_10() {
+        assert!(needs_procfs_uid_fallback(28));
+        assert!(!needs_procfs_uid_fallback(29));
     }
 
     #[test]

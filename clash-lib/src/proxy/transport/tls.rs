@@ -69,6 +69,7 @@ pub struct EchOptions {
     pub query_server_name: Option<String>,
 }
 
+#[cfg(feature = "utls")]
 pub(super) fn build_alpn_wire(protocols: &[Vec<u8>]) -> io::Result<Vec<u8>> {
     let mut wire = Vec::new();
     for protocol in protocols {
