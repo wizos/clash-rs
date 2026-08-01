@@ -14,14 +14,14 @@ pub(super) enum Opcode {
     ControlHardResetClientV1 = 1,
     ControlHardResetServerV1 = 2,
     ControlSoftResetV1 = 3,
-    ControlV1          = 4,
-    AckV1              = 5,
-    DataV1             = 6,
+    ControlV1 = 4,
+    AckV1 = 5,
+    DataV1 = 6,
     ControlHardResetClientV2 = 7,
     ControlHardResetServerV2 = 8,
-    DataV2             = 9,
+    DataV2 = 9,
     ControlHardResetClientV3 = 10,
-    ControlWkcV1       = 11,
+    ControlWkcV1 = 11,
 }
 
 impl Opcode {

@@ -97,6 +97,12 @@ impl HttpClient {
                     .expect("must parse host header"),
             );
         }
+        *req.uri_mut() = uri
+            .path_and_query()
+            .map(|value| value.as_str())
+            .unwrap_or("/")
+            .parse()
+            .expect("path and query must be a valid request target");
 
         let outbound_name = req
             .extensions()

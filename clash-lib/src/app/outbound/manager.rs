@@ -165,6 +165,24 @@ impl OutboundManager {
         self.registry.read().await.get(name).cloned()
     }
 
+    pub async fn get_provider_proxy(
+        &self,
+        name: &str,
+    ) -> Option<AnyOutboundHandler> {
+        for provider in self.proxy_providers.values() {
+            if let Some(proxy) = provider
+                .proxies()
+                .await
+                .into_iter()
+                .find(|proxy| proxy.name() == name)
+            {
+                return Some(proxy);
+            }
+        }
+
+        None
+    }
+
     /// this doesn't populate history/liveness information
     pub fn get_proxy_provider(&self, name: &str) -> Option<ArcProxyProvider> {
         self.proxy_providers.get(name).cloned()
@@ -178,7 +196,7 @@ impl OutboundManager {
         self.selector_control.get(name).cloned()
     }
 
-    /// Get all proxies in the manager, excluding those in providers.
+    /// Get all proxies in the manager, including those in providers.
     pub async fn get_proxies(&self) -> HashMap<String, Box<dyn Serialize + Send>> {
         let mut r = HashMap::new();
 
@@ -203,6 +221,17 @@ impl OutboundManager {
             self.apply_common_proxy_fields(&mut m, &v, &k).await;
 
             r.insert(k.clone(), Box::new(m) as _);
+        }
+
+        for provider in self.proxy_providers.values() {
+            for proxy in provider.proxies().await {
+                let name = proxy.name().to_owned();
+                if r.contains_key(&name) {
+                    continue;
+                }
+
+                r.insert(name.clone(), Box::new(self.get_proxy(&proxy).await) as _);
+            }
         }
 
         r
@@ -611,6 +640,53 @@ impl OutboundManager {
                 }
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        app::dns::MockClashResolver,
+        proxy::{
+            OutboundType,
+            mocks::{MockDummyOutboundHandler, MockDummyProxyProvider},
+        },
+    };
+    use tokio::sync::RwLock;
+
+    #[tokio::test]
+    async fn provider_proxies_are_available_by_name_and_in_api_list() {
+        let mut provider_proxy = MockDummyOutboundHandler::new();
+        provider_proxy
+            .expect_name()
+            .return_const("provider-proxy".to_owned());
+        provider_proxy
+            .expect_proto()
+            .return_const(OutboundType::Direct);
+        provider_proxy.expect_support_udp().return_const(true);
+        let provider_proxy: AnyOutboundHandler = Arc::new(provider_proxy);
+        let proxy_for_provider = provider_proxy.clone();
+        let mut provider = MockDummyProxyProvider::new();
+        provider
+            .expect_proxies()
+            .returning(move || vec![proxy_for_provider.clone()]);
+
+        let manager = OutboundManager {
+            registry: Arc::new(RwLock::new(HashMap::new())),
+            proxy_providers: HashMap::from([(
+                "provider".to_owned(),
+                Arc::new(provider) as ArcProxyProvider,
+            )]),
+            proxy_manager: ProxyManager::new(
+                Arc::new(MockClashResolver::new()),
+                None,
+            ),
+            selector_control: HashMap::new(),
+        };
+
+        assert!(manager.get_provider_proxy("provider-proxy").await.is_some());
+        assert!(manager.get_proxies().await.contains_key("provider-proxy"));
     }
 }
 

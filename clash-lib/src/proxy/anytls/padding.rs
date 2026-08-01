@@ -11,8 +11,7 @@ use super::CMD_WASTE;
 
 const FRAME_HEADER_SIZE: usize = 7;
 
-pub(super) const DEFAULT_PADDING_SCHEME: &str =
-    "stop=8\n0=30-30\n1=100-400\n2=400-500,c,500-1000,c,500-1000,c,500-1000,c,\
+pub(super) const DEFAULT_PADDING_SCHEME: &str = "stop=8\n0=30-30\n1=100-400\n2=400-500,c,500-1000,c,500-1000,c,500-1000,c,\
      500-1000\n3=9-9,500-1000\n4=500-1000\n5=500-1000\n6=500-1000\n7=500-1000";
 
 pub(super) type SharedPadding = Arc<RwLock<Arc<PaddingFactory>>>;

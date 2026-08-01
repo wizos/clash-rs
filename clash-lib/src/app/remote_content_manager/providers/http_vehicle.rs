@@ -196,6 +196,10 @@ mod tests {
     use httpmock::{Method::GET, MockServer};
     use hyper::Uri;
     use std::{str, sync::Arc};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
 
     #[test]
     fn provider_http_timeout_matches_mihomo() {
@@ -243,6 +247,39 @@ mod tests {
         assert_eq!(vehicle.read().await.unwrap(), b"proxies: []");
         redirect.assert();
         provider.assert();
+    }
+
+    #[tokio::test]
+    async fn provider_http_uses_origin_form() {
+        initialize();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            let length = stream.read(&mut request).await.unwrap();
+            assert!(
+                str::from_utf8(&request[..length])
+                    .unwrap()
+                    .starts_with("GET /provider.yaml?source=test HTTP/1.1\r\n")
+            );
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-length: 11\r\n\r\nproxies: []",
+                )
+                .await
+                .unwrap();
+        });
+        let url = format!("http://{address}/provider.yaml?source=test")
+            .parse::<Uri>()
+            .unwrap();
+        let path = std::env::temp_dir().join("origin_form_http_vehicle");
+        let resolver = Arc::new(EnhancedResolver::new_default().await);
+        let vehicle =
+            super::Vehicle::new(url, path, None, resolver as ThreadSafeDNSResolver);
+
+        assert_eq!(vehicle.read().await.unwrap(), b"proxies: []");
+        server.await.unwrap();
     }
 
     #[test]

@@ -254,7 +254,7 @@ impl TryFrom<&OutboundVless> for Handler {
                         s.network
                             .as_ref()
                             .map(|x| match x.as_str() {
-                                "" | "tcp" => Ok(vec![]),
+                                "" | "tcp" | "raw" => Ok(vec![]),
                                 "ws" => Ok(vec!["http/1.1".to_owned()]),
                                 "http" => Ok(vec![]),
                                 "h2" | "grpc" | "xhttp" => Ok(vec!["h2".to_owned()]),
@@ -310,7 +310,7 @@ impl TryFrom<&OutboundVless> for Handler {
                 .network
                 .clone()
                 .map(|x| match x.as_str() {
-                    "" | "tcp" => Ok(None),
+                    "" | "tcp" | "raw" => Ok(None),
                     "ws" => s
                         .ws_opts
                         .as_ref()
@@ -551,33 +551,34 @@ mod tests {
     use crate::config::internal::proxy::CommonConfigOptions;
 
     #[test]
-    fn test_vless_network_tcp() {
+    fn test_vless_network_tcp_aliases() {
         crate::setup_default_crypto_provider();
-        // Test that network: tcp is accepted and results in successful parsing
-        let config = OutboundVless {
-            common_opts: CommonConfigOptions {
-                name: "test-tcp".to_string(),
-                server: "example.com".to_string(),
-                port: 443,
+        for network in ["tcp", "raw"] {
+            let config = OutboundVless {
+                common_opts: CommonConfigOptions {
+                    name: format!("test-{network}"),
+                    server: "example.com".to_string(),
+                    port: 443,
+                    ..Default::default()
+                },
+                uuid: "test-uuid".to_string(),
+                udp: Some(true),
+                tls: Some(true),
+                skip_cert_verify: Some(true),
+                server_name: Some("example.com".to_string()),
+                network: Some(network.to_string()),
+                ws_opts: None,
+                h2_opts: None,
+                grpc_opts: None,
                 ..Default::default()
-            },
-            uuid: "test-uuid".to_string(),
-            udp: Some(true),
-            tls: Some(true),
-            skip_cert_verify: Some(true),
-            server_name: Some("example.com".to_string()),
-            network: Some("tcp".to_string()),
-            ws_opts: None,
-            h2_opts: None,
-            grpc_opts: None,
-            ..Default::default()
-        };
+            };
 
-        let handler = Handler::try_from(&config);
-        assert!(
-            handler.is_ok(),
-            "VLess handler with network: tcp should parse successfully"
-        );
+            let handler = Handler::try_from(&config);
+            assert!(
+                handler.is_ok(),
+                "VLess handler with network: {network} should parse successfully"
+            );
+        }
     }
 
     #[test]

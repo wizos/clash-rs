@@ -2,15 +2,12 @@ use super::dns::ThreadSafeDNSResolver;
 use crate::{
     app::net::outbound_interface_snapshot,
     common::{
-        errors::{IntoIoResultExt as _, new_io_error},
-        timed_future::TimedFuture,
-        tls::GLOBAL_ROOT_STORE,
+        errors::new_io_error, timed_future::TimedFuture, tls::GLOBAL_ROOT_STORE,
         utils::serialize_duration,
     },
     proxy::AnyOutboundHandler,
     session::Session,
 };
-use anyhow::Context;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::{FutureExt, StreamExt, stream::FuturesOrdered};
@@ -32,7 +29,7 @@ use tracing::{debug, instrument, trace, warn};
 pub mod healthcheck;
 pub mod providers;
 
-const MAX_CONCURRENT_HEALTHCHECKS: usize = 16;
+const MAX_CONCURRENT_HEALTHCHECKS: usize = 50;
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct TrafficStats {
@@ -89,6 +86,7 @@ pub struct DelayHistory {
     time: DateTime<Utc>,
     #[serde(serialize_with = "serialize_duration")]
     delay: Duration,
+    url: String,
 }
 
 #[derive(Default)]
@@ -728,6 +726,7 @@ impl ProxyManager {
         let name_clone = name.clone();
         let default_timeout = Duration::from_secs(5);
         let timeout = timeout.unwrap_or(default_timeout);
+        let unified_delay = self.unified_delay.load(Ordering::Relaxed);
 
         let dns_resolver = self.dns_resolver.clone();
         let tester = async move {
@@ -763,28 +762,29 @@ impl ProxyManager {
                 ..Default::default()
             };
 
-            let (stream, connect_delay) = tokio::time::timeout(
-                timeout,
+            let started_at = tokio::time::Instant::now();
+            let deadline = started_at + timeout;
+            let (stream, _) = tokio::time::timeout_at(
+                deadline,
                 TimedFuture::new(outbound.connect_stream(&sess, dns_resolver)),
             )
             .await
-            .context("URL test timeout")
-            .into_io()?;
+            .map_err(|_| new_io_error(format!("timeout for {url}")))?;
             let stream = stream?;
 
-            let req = Request::get(url)
-                .header(hyper::header::HOST, host.as_str())
-                .header("Connection", "Close")
-                .version(hyper::Version::HTTP_11)
-                .body(Empty::<Bytes>::new())
-                .unwrap();
+            let request = || {
+                Request::head(url)
+                    .header(hyper::header::HOST, host.as_str())
+                    .version(hyper::Version::HTTP_11)
+                    .body(Empty::<Bytes>::new())
+                    .unwrap()
+            };
 
-            let mut tls_handshake_delay = None;
-            let resp = match uri.scheme() {
+            let mut sender = match uri.scheme() {
                 Some(scheme) if scheme == &http::uri::Scheme::HTTP => {
                     let io = TokioIo::new(stream);
-                    let (mut sender, conn) = tokio::time::timeout(
-                        timeout,
+                    let (sender, conn) = tokio::time::timeout_at(
+                        deadline,
                         hyper::client::conn::http1::handshake(io),
                     )
                     .await
@@ -799,7 +799,7 @@ impl ProxyManager {
                         }
                     });
 
-                    TimedFuture::new(sender.send_request(req).boxed())
+                    sender
                 }
                 Some(scheme) if scheme == &http::uri::Scheme::HTTPS => {
                     let mut tls_config = rustls::ClientConfig::builder()
@@ -814,21 +814,20 @@ impl ProxyManager {
                     let connector =
                         tokio_rustls::TlsConnector::from(Arc::new(tls_config));
 
-                    let (stream, delay) = tokio::time::timeout(
-                        timeout,
-                        TimedFuture::new(connector.connect(
-                            host.try_into().expect("must be valid SNI"),
+                    let stream = tokio::time::timeout_at(
+                        deadline,
+                        connector.connect(
+                            host.clone().try_into().expect("must be valid SNI"),
                             stream,
-                        )),
+                        ),
                     )
-                    .await?;
-
-                    let stream = stream?;
+                    .await
+                    .map_err(|_| new_io_error(format!("timeout for {url}")))??;
 
                     let io = TokioIo::new(stream);
 
-                    let (mut sender, conn) = tokio::time::timeout(
-                        timeout,
+                    let (sender, conn) = tokio::time::timeout_at(
+                        deadline,
                         hyper::client::conn::http1::handshake(io),
                     )
                     .await
@@ -843,9 +842,7 @@ impl ProxyManager {
                         }
                     });
 
-                    tls_handshake_delay = Some(delay);
-
-                    TimedFuture::new(sender.send_request(req).boxed())
+                    sender
                 }
                 _ => {
                     return Err(new_io_error(format!(
@@ -854,36 +851,45 @@ impl ProxyManager {
                 }
             };
 
-            let delay = match tokio::time::timeout(timeout, resp).await {
-                Ok((res, delay)) => match res {
-                    Ok(res) => {
-                        trace!(
-                            delay = ?delay,
-                            status = ?res.status(),
-                            "success"
-                        );
-                        Ok(delay)
-                    }
-                    Err(e) => {
-                        warn!(
-                            e = ?e,
-                            "failed"
-                        );
-                        Err(new_io_error(format!(
-                            "urltest for proxy {name} failed: {e}"
-                        )))
-                    }
-                },
-                Err(_) => {
-                    warn!("timed out");
-                    Err(new_io_error(format!("timeout for {url}").as_str()))
-                }
-            }?;
+            let (response, first_request_delay) = tokio::time::timeout_at(
+                deadline,
+                TimedFuture::new(sender.send_request(request()).boxed()),
+            )
+            .await
+            .map_err(|_| new_io_error(format!("timeout for {url}")))?;
+            let response = response.map_err(|error| {
+                new_io_error(format!("urltest for proxy {name} failed: {error}"))
+            })?;
+            let status = response.status();
+            drop(response);
+            trace!(delay = ?first_request_delay, status = ?status, "success");
 
-            Ok((
-                delay,
-                (connect_delay + tls_handshake_delay.unwrap_or_default() + delay),
-            ))
+            let overall_delay = started_at.elapsed();
+            let actual_delay = if unified_delay {
+                match tokio::time::timeout_at(
+                    deadline,
+                    TimedFuture::new(sender.send_request(request()).boxed()),
+                )
+                .await
+                {
+                    Ok((Ok(response), delay)) => {
+                        trace!(delay = ?delay, status = ?response.status(), "unified delay");
+                        delay
+                    }
+                    Ok((Err(error), _)) => {
+                        warn!(e = ?error, "unified delay request failed");
+                        started_at.elapsed()
+                    }
+                    Err(_) => {
+                        warn!("unified delay request timed out");
+                        started_at.elapsed()
+                    }
+                }
+            } else {
+                first_request_delay
+            };
+
+            Ok((actual_delay, overall_delay))
         };
 
         let result = tester.await;
@@ -908,6 +914,7 @@ impl ProxyManager {
             Some(DelayHistory {
                 time: Utc::now(),
                 delay: selected_delay.unwrap_or_default(),
+                url: url.to_owned(),
             }),
         )
         .await;
@@ -1053,7 +1060,7 @@ mod tests {
         tests::initialize,
     };
     use futures::TryFutureExt;
-    use httpmock::{Method::GET, MockServer};
+    use httpmock::{Method::HEAD, MockServer};
     use std::{net::Ipv4Addr, sync::Arc, time::Duration};
 
     #[test]
@@ -1080,7 +1087,7 @@ mod tests {
 
         let server = MockServer::start();
         server.mock(|when, then| {
-            when.method(GET).path("/generate_204");
+            when.method(HEAD).path("/generate_204");
             then.status(204);
         });
         let url = server.url("/generate_204");
@@ -1108,7 +1115,11 @@ mod tests {
                 .await
                 .is_some_and(|x| x.as_nanos() > 0)
         );
-        assert!(!manager.delay_history(PROXY_DIRECT).await.is_empty());
+        let history = manager.delay_history(PROXY_DIRECT).await;
+        assert_eq!(
+            history.last().map(|entry| entry.url.as_str()),
+            Some(url.as_str())
+        );
 
         manager.report_alive(PROXY_DIRECT, false, None).await;
         assert!(!manager.alive(PROXY_DIRECT).await);
@@ -1128,6 +1139,35 @@ mod tests {
                 .is_some_and(|x| x.as_nanos() > 0)
         );
         assert_eq!(manager.delay_history(PROXY_DIRECT).await.len(), 10);
+    }
+
+    #[tokio::test]
+    async fn unified_delay_sends_a_second_head_request() {
+        initialize();
+
+        let server = MockServer::start();
+        let request = server.mock(|when, then| {
+            when.method(HEAD).path("/generate_204");
+            then.status(204);
+        });
+        let url = server.url("/generate_204");
+
+        let mut mock_resolver = MockClashResolver::new();
+        mock_resolver
+            .expect_resolve()
+            .returning(|_, _| Ok(Some(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST))));
+        mock_resolver.expect_ipv6().return_const(false);
+
+        let manager =
+            remote_content_manager::ProxyManager::new(Arc::new(mock_resolver), None);
+        manager.set_unified_delay(true);
+
+        manager
+            .url_test(Arc::new(direct::Handler::new(PROXY_DIRECT)), &url, None)
+            .await
+            .expect("test failed");
+
+        request.assert_calls(2);
     }
 
     #[tokio::test]

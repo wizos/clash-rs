@@ -153,10 +153,10 @@ struct NoncePatternProto {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, prost::Enumeration)]
 #[repr(i32)]
 enum NonceTypeProto {
-    Random          = 0,
-    Printable       = 1,
+    Random = 0,
+    Printable = 1,
     PrintableSubset = 2,
-    Fixed           = 3,
+    Fixed = 3,
 }
 
 impl Handler {

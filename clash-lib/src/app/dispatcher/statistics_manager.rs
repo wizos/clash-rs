@@ -1,13 +1,17 @@
 use std::{
     collections::{HashMap, VecDeque},
-    sync::{Arc, atomic::Ordering},
+    sync::{Arc, Mutex as StdMutex, Weak, atomic::Ordering},
 };
 
 use chrono::Utc;
 use memory_stats::memory_stats;
 use portable_atomic::AtomicU64;
 use serde::Serialize;
-use tokio::sync::{Mutex, RwLock, oneshot::Sender};
+use tokio::{
+    sync::{Mutex, RwLock, oneshot::Sender},
+    task::JoinHandle,
+};
+use tokio_util::sync::CancellationToken;
 
 use crate::session::Session;
 
@@ -99,6 +103,8 @@ pub struct Manager {
     /// Bytes accumulated from **closed** connections, keyed by inbound_user.
     /// Drained (and reset) by [`Manager::drain_user_stats`].
     user_period_stats: Arc<Mutex<HashMap<String, UserTraffic>>>,
+    cancel_token: CancellationToken,
+    task_handle: StdMutex<Option<JoinHandle<()>>>,
 }
 
 impl Manager {
@@ -119,12 +125,25 @@ impl Manager {
             proxy_upload_total: AtomicU64::new(0),
             proxy_download_total: AtomicU64::new(0),
             user_period_stats: Arc::new(Mutex::new(HashMap::new())),
+            cancel_token: CancellationToken::new(),
+            task_handle: StdMutex::new(None),
         });
-        let c = v.clone();
-        tokio::spawn(async move {
-            c.kick_off().await;
+        let manager = Arc::downgrade(&v);
+        let cancel_token = v.cancel_token.clone();
+        let task_handle = tokio::spawn(async move {
+            Self::kick_off(manager, cancel_token).await;
         });
+        *v.task_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(task_handle);
         v
+    }
+
+    pub async fn shutdown(&self) {
+        self.cancel_token.cancel();
+        if let Some(task_handle) = self.take_task_handle() {
+            let _ = task_handle.await;
+        }
     }
 
     pub async fn track(&self, item: Tracked, close_notify: Sender<()>) {
@@ -356,28 +375,53 @@ impl Manager {
         entry.download += download;
     }
 
-    async fn kick_off(&self) {
+    async fn kick_off(manager: Weak<Self>, cancel_token: CancellationToken) {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
         loop {
-            ticker.tick().await;
-            self.upload_blip
-                .store(self.upload_temp.load(Ordering::Relaxed), Ordering::Relaxed);
-            self.upload_temp.store(0, Ordering::Relaxed);
-            self.download_blip.store(
-                self.download_temp.load(Ordering::Relaxed),
-                Ordering::Relaxed,
-            );
-            self.download_temp.store(0, Ordering::Relaxed);
-            self.proxy_upload_blip.store(
-                self.proxy_upload_temp.load(Ordering::Relaxed),
-                Ordering::Relaxed,
-            );
-            self.proxy_upload_temp.store(0, Ordering::Relaxed);
-            self.proxy_download_blip.store(
-                self.proxy_download_temp.load(Ordering::Relaxed),
-                Ordering::Relaxed,
-            );
-            self.proxy_download_temp.store(0, Ordering::Relaxed);
+            tokio::select! {
+                _ = cancel_token.cancelled() => break,
+                _ = ticker.tick() => {
+                    let Some(manager) = manager.upgrade() else {
+                        break;
+                    };
+                    manager.upload_blip.store(
+                        manager.upload_temp.load(Ordering::Relaxed),
+                        Ordering::Relaxed,
+                    );
+                    manager.upload_temp.store(0, Ordering::Relaxed);
+                    manager.download_blip.store(
+                        manager.download_temp.load(Ordering::Relaxed),
+                        Ordering::Relaxed,
+                    );
+                    manager.download_temp.store(0, Ordering::Relaxed);
+                    manager.proxy_upload_blip.store(
+                        manager.proxy_upload_temp.load(Ordering::Relaxed),
+                        Ordering::Relaxed,
+                    );
+                    manager.proxy_upload_temp.store(0, Ordering::Relaxed);
+                    manager.proxy_download_blip.store(
+                        manager.proxy_download_temp.load(Ordering::Relaxed),
+                        Ordering::Relaxed,
+                    );
+                    manager.proxy_download_temp.store(0, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    fn take_task_handle(&self) -> Option<JoinHandle<()>> {
+        self.task_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+}
+
+impl Drop for Manager {
+    fn drop(&mut self) {
+        self.cancel_token.cancel();
+        if let Some(task_handle) = self.take_task_handle() {
+            task_handle.abort();
         }
     }
 }
@@ -391,6 +435,19 @@ mod tests {
         let mgr = Manager::new();
         let stats = mgr.drain_user_stats().await;
         assert!(stats.is_empty(), "fresh manager should have no user stats");
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_releases_background_task() {
+        let mgr = Manager::new();
+        let weak = Arc::downgrade(&mgr);
+
+        mgr.shutdown().await;
+        assert!(mgr.cancel_token.is_cancelled());
+        assert!(mgr.take_task_handle().is_none());
+
+        drop(mgr);
+        assert!(weak.upgrade().is_none());
     }
 
     #[tokio::test]

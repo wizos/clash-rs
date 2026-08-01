@@ -70,7 +70,11 @@ async fn find_proxy_by_name(
     next: Next,
 ) -> Response {
     let outbound_manager = state.outbound_manager.clone();
-    match outbound_manager.get_outbound(&name).await {
+    let proxy = match outbound_manager.get_outbound(&name).await {
+        Some(proxy) => Some(proxy),
+        None => outbound_manager.get_provider_proxy(&name).await,
+    };
+    match proxy {
         Some(proxy) => {
             req.extensions_mut().insert(proxy);
             next.run(req).await

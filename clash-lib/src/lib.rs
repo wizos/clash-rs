@@ -510,6 +510,7 @@ impl RuntimeComponents {
         if let Err(error) = self.inbound_manager.join().await {
             warn!("failed to join inbound listeners: {error}");
         }
+        self.statistics_manager.shutdown().await;
     }
 }
 

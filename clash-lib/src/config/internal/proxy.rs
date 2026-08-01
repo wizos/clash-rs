@@ -959,6 +959,7 @@ pub struct OutboundHysteria2 {
     /// port hopping
     pub ports: Option<String>,
     pub password: String,
+    #[serde(default, deserialize_with = "deserialize_hysteria2_obfs")]
     pub obfs: Option<Hysteria2Obfs>,
     pub obfs_password: Option<String>,
     pub alpn: Option<Vec<String>>,
@@ -995,6 +996,21 @@ pub struct OutboundHysteria2 {
 #[serde(rename_all = "lowercase")]
 pub enum Hysteria2Obfs {
     Salamander,
+}
+
+fn deserialize_hysteria2_obfs<'de, D>(
+    deserializer: D,
+) -> Result<Option<Hysteria2Obfs>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match Option::<String>::deserialize(deserializer)?.as_deref() {
+        None | Some("") => Ok(None),
+        Some("salamander") => Ok(Some(Hysteria2Obfs::Salamander)),
+        Some(value) => {
+            Err(serde::de::Error::unknown_variant(value, &["salamander"]))
+        }
+    }
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize, Debug)]
@@ -1698,6 +1714,36 @@ where
     }
 
     deserializer.deserialize_any(BpsVisitor)
+}
+
+#[cfg(test)]
+mod hysteria2_compatibility_tests {
+    use super::{OutboundProxyProtocol, OutboundProxyProtocol::Hysteria2};
+
+    #[test]
+    fn treats_empty_mihomo_obfs_as_disabled() {
+        let yaml = r#"
+            name: hysteria2-empty-obfs
+            type: hysteria2
+            server: 192.0.2.1
+            port: 443
+            password: secret
+            obfs: ""
+            obfs-password: ""
+            up: ""
+            down: ""
+        "#;
+
+        let Hysteria2(config) =
+            serde_yaml::from_str::<OutboundProxyProtocol>(yaml).unwrap()
+        else {
+            panic!("expected Hysteria2 config");
+        };
+        assert!(config.obfs.is_none());
+        assert_eq!(config.obfs_password.as_deref(), Some(""));
+        assert!(config.up.is_none());
+        assert!(config.down.is_none());
+    }
 }
 
 #[cfg(all(test, feature = "tailscale"))]
