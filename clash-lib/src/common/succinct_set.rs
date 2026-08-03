@@ -287,6 +287,9 @@ impl<T> From<StringTrie<T>> for DomainSet {
         keys.sort();
 
         let mut rv = DomainSet::default();
+        if keys.is_empty() {
+            return rv;
+        }
 
         let mut l_idx = 0;
 
@@ -460,6 +463,14 @@ mod tests {
         assert!(!set.has("test.test.test.qq.com"));
 
         test_dump(&key_src, &set);
+    }
+
+    #[test]
+    fn test_empty_domain_set() {
+        let set = super::DomainSet::from(super::StringTrie::<()>::new());
+
+        assert_eq!(set.len(), 0);
+        assert!(!set.has("example.com"));
     }
 
     fn test_dump(data_src: &Vec<String>, set: &super::DomainSet) {
