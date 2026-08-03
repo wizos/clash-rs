@@ -10,7 +10,11 @@ function isDevMode(): boolean {
 }
 
 export function Settings() {
-  const [apiUrl, setApiUrlState] = useState(getApiUrl);
+  const [apiUrl, setApiUrlState] = useState(() =>
+    isDevMode() && !localStorage.getItem('clash-api-url')
+      ? 'http://127.0.0.1:9090'
+      : getApiUrl()
+  );
   const [secret, setSecretState] = useState(getSecret);
   const [saved, setSaved] = useState(false);
   const saveTimersRef = useRef<number[]>([]);
@@ -31,12 +35,6 @@ export function Settings() {
 
   const isConnected = !!data && !error;
   const showDevPrompt = isDevMode() && !isConnected && !localStorage.getItem('clash-api-url');
-
-  useEffect(() => {
-    if (isDevMode() && !localStorage.getItem('clash-api-url')) {
-      setApiUrlState('http://127.0.0.1:9090');
-    }
-  }, []);
 
   function handleSave() {
     setApiUrl(apiUrl);

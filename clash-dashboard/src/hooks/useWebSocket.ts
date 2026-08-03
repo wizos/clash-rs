@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useState } from 'react';
 
 export type ReadyState = 'CONNECTING' | 'OPEN' | 'CLOSING' | 'CLOSED';
 
@@ -10,70 +10,63 @@ interface UseWebSocketReturn<T> {
 export function useWebSocket<T = unknown>(url: string | null): UseWebSocketReturn<T> {
   const [lastMessage, setLastMessage] = useState<T | null>(null);
   const [readyState, setReadyState] = useState<ReadyState>('CLOSED');
-  const wsRef = useRef<WebSocket | null>(null);
-  const retryCount = useRef(0);
-  const retryTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const unmounted = useRef(false);
-
-  const connect = useCallback(() => {
-    if (!url) {
-      wsRef.current?.close();
-      wsRef.current = null;
-      retryCount.current = 0;
-      setReadyState('CLOSED');
-      setLastMessage(null);
-      return;
-    }
-    if (unmounted.current) return;
-
-    setReadyState('CONNECTING');
-    const ws = new WebSocket(url);
-    wsRef.current = ws;
-
-    ws.onopen = () => {
-      if (unmounted.current) { ws.close(); return; }
-      setReadyState('OPEN');
-      retryCount.current = 0;
-    };
-
-    ws.onmessage = (event) => {
-      if (unmounted.current) return;
-      try {
-        const data = JSON.parse(event.data) as T;
-        setLastMessage(data);
-      } catch {
-        // ignore parse errors
-      }
-    };
-
-    ws.onclose = () => {
-      if (unmounted.current) return;
-      setReadyState('CLOSED');
-      wsRef.current = null;
-
-      const delay = Math.min(1000 * 2 ** retryCount.current, 30000);
-      retryCount.current += 1;
-      retryTimeout.current = setTimeout(connect, delay);
-    };
-
-    ws.onerror = () => {
-      ws.close();
-    };
-  }, [url]);
 
   useEffect(() => {
-    unmounted.current = false;
+    let active = true;
+    let socket: WebSocket | null = null;
+    let retryCount = 0;
+    let retryTimeout: ReturnType<typeof setTimeout> | null = null;
+
+    function connect() {
+      if (!active) return;
+      if (!url) {
+        setReadyState('CLOSED');
+        setLastMessage(null);
+        return;
+      }
+
+      setReadyState('CONNECTING');
+      const ws = new WebSocket(url);
+      socket = ws;
+
+      ws.onopen = () => {
+        if (!active) {
+          ws.close();
+          return;
+        }
+        setReadyState('OPEN');
+        retryCount = 0;
+      };
+
+      ws.onmessage = (event) => {
+        if (!active) return;
+        try {
+          setLastMessage(JSON.parse(event.data) as T);
+        } catch {
+          // Ignore malformed messages and keep the connection alive.
+        }
+      };
+
+      ws.onclose = () => {
+        if (!active) return;
+        setReadyState('CLOSED');
+        socket = null;
+        const delay = Math.min(1000 * 2 ** retryCount, 30000);
+        retryCount += 1;
+        retryTimeout = setTimeout(connect, delay);
+      };
+
+      ws.onerror = () => ws.close();
+    }
+
     connect();
 
     return () => {
-      unmounted.current = true;
-      if (retryTimeout.current) clearTimeout(retryTimeout.current);
-      if (wsRef.current) {
-        wsRef.current.close();
-        wsRef.current = null;
-      }
+      active = false;
+      if (retryTimeout) clearTimeout(retryTimeout);
+      socket?.close();
     };
-  }, [connect]);
+  }, [url]);
 
   return { lastMessage, readyState };
 }

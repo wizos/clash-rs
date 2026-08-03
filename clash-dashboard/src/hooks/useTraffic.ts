@@ -20,17 +20,19 @@ export function useTraffic(): UseTrafficReturn {
   const url = getWsUrl('/ws/traffic');
   const { lastMessage } = useWebSocket<TrafficData>(url);
 
-  const [history, setHistory] = useState<TrafficHistory>({
-    up: new Array(HISTORY_LENGTH).fill(0),
-    down: new Array(HISTORY_LENGTH).fill(0),
-    timestamps: Array.from({ length: HISTORY_LENGTH }, (_, i) => Date.now() / 1000 - (HISTORY_LENGTH - 1 - i)),
+  const [history, setHistory] = useState<TrafficHistory>(() => {
+    const now = Date.now() / 1000;
+    return {
+      up: new Array(HISTORY_LENGTH).fill(0),
+      down: new Array(HISTORY_LENGTH).fill(0),
+      timestamps: Array.from({ length: HISTORY_LENGTH }, (_, i) => now - (HISTORY_LENGTH - 1 - i)),
+    };
   });
-
-  const [current, setCurrent] = useState<TrafficData>({ up: 0, down: 0 });
 
   useEffect(() => {
     if (!lastMessage) return;
-    setCurrent(lastMessage);
+    // WebSocket messages are external events accumulated into chart history.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setHistory((prev) => {
       const now = Date.now() / 1000;
       return {
@@ -41,5 +43,5 @@ export function useTraffic(): UseTrafficReturn {
     });
   }, [lastMessage]);
 
-  return { history, current };
+  return { history, current: lastMessage ?? { up: 0, down: 0 } };
 }

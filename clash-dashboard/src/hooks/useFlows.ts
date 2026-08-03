@@ -1,4 +1,3 @@
-import { useEffect, useState } from 'react';
 import { useWebSocket } from './useWebSocket';
 import { getWsUrl } from '../lib/api';
 
@@ -30,12 +29,5 @@ export function useFlows(includeClosed = true): UseFlowsReturn {
   const url = getWsUrl(`/ws/flows?interval=5&top=50&include_closed=${includeClosed}`);
   const { lastMessage, readyState } = useWebSocket<FlowRecord[]>(url);
 
-  const [flows, setFlows] = useState<FlowRecord[]>([]);
-
-  useEffect(() => {
-    if (!lastMessage) return;
-    setFlows(lastMessage);
-  }, [lastMessage]);
-
-  return { flows, readyState };
+  return { flows: lastMessage ?? [], readyState };
 }

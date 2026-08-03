@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { getMemory, getConfigs, patchConfigs, reloadConfigs, getWsUrl } from '../lib/api';
 import { useTraffic } from '../hooks/useTraffic';
@@ -101,7 +101,6 @@ function ToggleSwitch({ value, onChange }: { value: boolean; onChange: (v: boole
 
 function PortInput({ value, onCommit }: { value: number | undefined; onCommit: (v: number | null) => void }) {
   const [local, setLocal] = useState<string>(value != null && value !== 0 ? String(value) : '');
-  useEffect(() => { setLocal(value != null && value !== 0 ? String(value) : ''); }, [value]);
   return (
     <input
       type="number" min="0" max="65535" value={local}
@@ -116,7 +115,6 @@ function PortInput({ value, onCommit }: { value: number | undefined; onCommit: (
 
 function TextInput({ value, onCommit }: { value: string | undefined; onCommit: (v: string) => void }) {
   const [local, setLocal] = useState<string>(value ?? '');
-  useEffect(() => { setLocal(value ?? ''); }, [value]);
   return (
     <input
       type="text" value={local}
@@ -337,19 +335,19 @@ export function Overview() {
             {/* Ports */}
             <EditSection title="Ports">
               <EditRow label="HTTP" icon={<Globe size={14} color="white" />} iconBg="#0071e3">
-                <PortInput value={cfg.port} onCommit={(v) => patch({ port: v ?? 0 })} />
+                <PortInput key={`port-${cfg.port}`} value={cfg.port} onCommit={(v) => patch({ port: v ?? 0 })} />
               </EditRow>
               <EditRow label="SOCKS" icon={<Router size={14} color="white" />} iconBg="#af52de">
-                <PortInput value={cfg['socks-port']} onCommit={(v) => patch({ 'socks-port': v ?? 0 })} />
+                <PortInput key={`socks-${cfg['socks-port']}`} value={cfg['socks-port']} onCommit={(v) => patch({ 'socks-port': v ?? 0 })} />
               </EditRow>
               <EditRow label="Mixed" icon={<Sliders size={14} color="white" />} iconBg="#5ac8fa">
-                <PortInput value={cfg['mixed-port']} onCommit={(v) => patch({ 'mixed-port': v ?? 0 })} />
+                <PortInput key={`mixed-${cfg['mixed-port']}`} value={cfg['mixed-port']} onCommit={(v) => patch({ 'mixed-port': v ?? 0 })} />
               </EditRow>
               <EditRow label="Redir" icon={<Server size={14} color="white" />} iconBg="#8e8e93">
-                <PortInput value={cfg['redir-port']} onCommit={(v) => patch({ 'redir-port': v ?? 0 })} />
+                <PortInput key={`redir-${cfg['redir-port']}`} value={cfg['redir-port']} onCommit={(v) => patch({ 'redir-port': v ?? 0 })} />
               </EditRow>
               <EditRow label="TProxy" icon={<Server size={14} color="white" />} iconBg="#6e6e73">
-                <PortInput value={cfg['tproxy-port']} onCommit={(v) => patch({ 'tproxy-port': v ?? 0 })} />
+                <PortInput key={`tproxy-${cfg['tproxy-port']}`} value={cfg['tproxy-port']} onCommit={(v) => patch({ 'tproxy-port': v ?? 0 })} />
               </EditRow>
             </EditSection>
 
@@ -359,7 +357,7 @@ export function Overview() {
                 <ToggleSwitch value={cfg['allow-lan'] ?? false} onChange={(v) => patch({ 'allow-lan': v })} />
               </EditRow>
               <EditRow label="Bind Address" icon={<Shield size={14} color="white" />} iconBg="#5ac8fa">
-                <TextInput value={cfg['bind-address']} onCommit={(v) => patch({ 'bind-address': v })} />
+                <TextInput key={`bind-${cfg['bind-address']}`} value={cfg['bind-address']} onCommit={(v) => patch({ 'bind-address': v })} />
               </EditRow>
               <EditRow label="IPv6" icon={<Globe size={14} color="white" />} iconBg="#0071e3">
                 <ToggleSwitch value={cfg.ipv6 ?? false} onChange={(v) => patch({ ipv6: v })} />

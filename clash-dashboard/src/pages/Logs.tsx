@@ -55,6 +55,8 @@ export function Logs() {
 
   useEffect(() => {
     if (!lastMessage) return;
+    // WebSocket messages are external events accumulated into the visible log.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setLogs((prev) => [
       ...prev,
       { ...lastMessage, id: ++logId, ts: new Date().toLocaleTimeString() },
