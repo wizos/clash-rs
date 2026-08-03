@@ -76,6 +76,20 @@ pub struct TrackerInfo {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct ActivityEvent<'a> {
+    #[serde(flatten)]
+    tracker: &'a TrackerInfo,
+    status: &'a str,
+    revision: u8,
+    phase: &'a str,
+    failure_stage: &'a str,
+    error: &'a str,
+    route_proxy: &'a str,
+    end: Option<chrono::DateTime<Utc>>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Snapshot {
     download_total: u64,
     upload_total: u64,
@@ -151,7 +165,79 @@ impl Manager {
         let mut connections = self.connections.lock().await;
         connections.insert(item.id(), (item, close_notify));
         drop(connections);
-        crate::app::events::emit("request", event);
+        crate::app::events::emit("request", &event);
+        let route_proxy = event.proxy_chain.last().map(String::as_str).unwrap_or("");
+        Self::emit_activity(
+            &event,
+            "connected",
+            2,
+            "connected",
+            "",
+            "",
+            route_proxy,
+            None,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn emit_activity_for_session(
+        id: uuid::Uuid,
+        start_time: chrono::DateTime<Utc>,
+        session: &Session,
+        rule: &str,
+        rule_payload: &str,
+        route_proxy: &str,
+        status: &str,
+        revision: u8,
+        phase: &str,
+        failure_stage: &str,
+        error: &str,
+    ) {
+        let tracker = TrackerInfo {
+            uuid: id,
+            session: session.as_map(),
+            start_time,
+            rule: rule.to_owned(),
+            rule_payload: rule_payload.to_owned(),
+            ..Default::default()
+        };
+        let end = matches!(status, "failed" | "rejected").then(Utc::now);
+        Self::emit_activity(
+            &tracker,
+            status,
+            revision,
+            phase,
+            failure_stage,
+            error,
+            route_proxy,
+            end,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_activity(
+        tracker: &TrackerInfo,
+        status: &str,
+        revision: u8,
+        phase: &str,
+        failure_stage: &str,
+        error: &str,
+        route_proxy: &str,
+        end: Option<chrono::DateTime<Utc>>,
+    ) {
+        crate::app::events::emit(
+            "activity",
+            ActivityEvent {
+                tracker,
+                status,
+                revision,
+                phase,
+                failure_stage,
+                error,
+                route_proxy,
+                end,
+            },
+        );
     }
 
     /// Untrack a connection.
@@ -184,10 +270,25 @@ impl Manager {
 
                 // Push to the closed_flows ring buffer (cap 1000).
                 let mut ring = closed_flows.lock().await;
-                ring.push_back(info);
+                ring.push_back(info.clone());
                 if ring.len() > 1000 {
                     ring.pop_front();
                 }
+                drop(ring);
+
+                let event = Self::tracker_snapshot(&info).await;
+                let route_proxy =
+                    event.proxy_chain.last().map(String::as_str).unwrap_or("");
+                Self::emit_activity(
+                    &event,
+                    "closed",
+                    3,
+                    "closed",
+                    "",
+                    "",
+                    route_proxy,
+                    Some(Utc::now()),
+                );
             }
         });
     }
@@ -242,7 +343,20 @@ impl Manager {
 
     pub async fn close(&self, id: uuid::Uuid) -> bool {
         let mut connections = self.connections.lock().await;
-        if let Some((_, close_notify)) = connections.remove(&id) {
+        if let Some((tracked, close_notify)) = connections.remove(&id) {
+            let event = Self::tracker_snapshot(&tracked.tracker_info()).await;
+            let route_proxy =
+                event.proxy_chain.last().map(String::as_str).unwrap_or("");
+            Self::emit_activity(
+                &event,
+                "closed",
+                3,
+                "closed",
+                "",
+                "",
+                route_proxy,
+                Some(Utc::now()),
+            );
             let _ = close_notify.send(());
             true
         } else {
@@ -254,7 +368,20 @@ impl Manager {
         let connections = self.connections.clone();
 
         let mut connections = connections.lock().await;
-        for (_, (_, close_notify)) in connections.drain() {
+        for (_, (tracked, close_notify)) in connections.drain() {
+            let event = Self::tracker_snapshot(&tracked.tracker_info()).await;
+            let route_proxy =
+                event.proxy_chain.last().map(String::as_str).unwrap_or("");
+            Self::emit_activity(
+                &event,
+                "closed",
+                3,
+                "closed",
+                "",
+                "",
+                route_proxy,
+                Some(Utc::now()),
+            );
             let _ = close_notify.send(());
         }
     }

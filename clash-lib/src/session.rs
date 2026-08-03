@@ -367,6 +367,7 @@ impl TryFrom<SocksAddr> for SocketAddr {
 }
 
 #[derive(PartialEq, Eq, Hash, Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Network {
     Tcp,
     Udp,
@@ -548,6 +549,17 @@ impl Default for Session {
             process_path: String::new(),
             sniff_host: String::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod serialization_tests {
+    use super::Network;
+
+    #[test]
+    fn serializes_network_in_api_format() {
+        assert_eq!(serde_json::to_string(&Network::Tcp).unwrap(), "\"tcp\"");
+        assert_eq!(serde_json::to_string(&Network::Udp).unwrap(), "\"udp\"");
     }
 }
 

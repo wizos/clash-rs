@@ -1,5 +1,6 @@
 use std::{
     ffi::{CStr, CString, c_char, c_int, c_void},
+    net::SocketAddr,
     sync::{
         OnceLock, RwLock,
         atomic::{AtomicU8, Ordering},
@@ -108,10 +109,8 @@ pub fn resolve_session(sess: &mut Session) {
     {
         return;
     }
-    let target = match (&sess.destination, sess.resolved_ip) {
-        (SocksAddr::Ip(addr), _) => *addr,
-        (SocksAddr::Domain(_, port), Some(ip)) => (ip, *port).into(),
-        (SocksAddr::Domain(..), None) => return,
+    let Some(target) = android_lookup_target(sess) else {
+        return;
     };
     let source = match CString::new(sess.source.to_string()) {
         Ok(source) => source,
@@ -167,6 +166,17 @@ pub fn resolve_session(sess: &mut Session) {
         sess.process = package.to_string();
     } else {
         sess.process = value;
+    }
+}
+
+fn android_lookup_target(sess: &Session) -> Option<SocketAddr> {
+    if sess.source.ip().is_loopback() && sess.inbound_port != 0 {
+        return Some(SocketAddr::new(sess.source.ip(), sess.inbound_port));
+    }
+    match (&sess.destination, sess.resolved_ip) {
+        (SocksAddr::Ip(addr), _) => Some(*addr),
+        (SocksAddr::Domain(_, port), Some(ip)) => Some((ip, *port).into()),
+        (SocksAddr::Domain(..), None) => None,
     }
 }
 
@@ -288,6 +298,21 @@ mod tests {
         resolve_session(&mut session);
         assert!(session.process.is_empty());
         assert_eq!(session.uid, 0);
+    }
+
+    #[test]
+    fn uses_local_proxy_listener_for_android_process_lookup() {
+        let session = Session {
+            source: "127.0.0.1:45678".parse().unwrap(),
+            destination: SocksAddr::Domain("api.ip.sb".to_string(), 443),
+            inbound_port: 7890,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            android_lookup_target(&session),
+            Some("127.0.0.1:7890".parse().unwrap()),
+        );
     }
 
     #[test]

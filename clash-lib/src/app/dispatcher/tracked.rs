@@ -125,8 +125,9 @@ impl TrackedStream {
         manager: Arc<Manager>,
         sess: Session,
         rule: Option<&Box<dyn RuleMatcher>>,
+        uuid: uuid::Uuid,
+        start_time: chrono::DateTime<chrono::Utc>,
     ) -> Self {
-        let uuid = uuid::Uuid::new_v4();
         let chain = inner.chain().clone();
         let is_proxy = chain
             .snapshot()
@@ -141,7 +142,7 @@ impl TrackedStream {
                 uuid,
                 session_holder: sess,
 
-                start_time: chrono::Utc::now(),
+                start_time,
                 rule: rule
                     .as_ref()
                     .map(|x| x.type_name().to_owned())
@@ -467,8 +468,9 @@ impl TrackedDatagram {
         manager: Arc<Manager>,
         sess: Session,
         rule: Option<&Box<dyn RuleMatcher>>,
+        uuid: uuid::Uuid,
+        start_time: chrono::DateTime<chrono::Utc>,
     ) -> Self {
-        let uuid = uuid::Uuid::new_v4();
         let chain = inner.chain().clone();
         let is_proxy = chain
             .snapshot()
@@ -483,7 +485,7 @@ impl TrackedDatagram {
                 uuid,
                 session_holder: sess,
 
-                start_time: chrono::Utc::now(),
+                start_time,
                 rule: rule
                     .as_ref()
                     .map(|x| x.type_name().to_owned())
@@ -640,9 +642,15 @@ mod event_tests {
         let mut events = crate::app::events::subscribe();
         let (stream, _peer) = tokio::io::duplex(64);
         let stream: BoxedChainedStream = Box::new(ChainedStreamWrapper::new(stream));
-        let tracked =
-            TrackedStream::new(stream, Manager::new(), Session::default(), None)
-                .await;
+        let tracked = TrackedStream::new(
+            stream,
+            Manager::new(),
+            Session::default(),
+            None,
+            uuid::Uuid::new_v4(),
+            chrono::Utc::now(),
+        )
+        .await;
 
         let expected_id = tracked.id().to_string();
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
@@ -668,5 +676,40 @@ mod event_tests {
         })
         .await
         .expect("request event was not emitted at registration");
+
+        let connected =
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    let event: serde_json::Value =
+                        serde_json::from_str(&events.recv().await.unwrap()).unwrap();
+                    if event["type"] == "activity"
+                        && event["data"]["id"] == expected_id
+                        && event["data"]["status"] == "connected"
+                    {
+                        break event;
+                    }
+                }
+            })
+            .await
+            .expect("connected activity was not emitted");
+        assert_eq!(connected["data"]["revision"], 2);
+
+        drop(tracked);
+        let closed =
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    let event: serde_json::Value =
+                        serde_json::from_str(&events.recv().await.unwrap()).unwrap();
+                    if event["type"] == "activity"
+                        && event["data"]["id"] == expected_id
+                        && event["data"]["status"] == "closed"
+                    {
+                        break event;
+                    }
+                }
+            })
+            .await
+            .expect("closed activity was not emitted");
+        assert_eq!(closed["data"]["revision"], 3);
     }
 }

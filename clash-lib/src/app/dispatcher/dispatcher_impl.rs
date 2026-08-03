@@ -9,7 +9,7 @@ use crate::{
     common::io::copy_bidirectional,
     config::{
         def::RunMode,
-        internal::proxy::{PROXY_DIRECT, PROXY_GLOBAL},
+        internal::proxy::{PROXY_DIRECT, PROXY_GLOBAL, PROXY_REJECT},
     },
     proxy::{
         AnyInboundDatagram, ClientStream, datagram::UdpPacket, utils::ToCanonical,
@@ -181,6 +181,29 @@ impl Dispatcher {
                 mgr.get_outbound(PROXY_DIRECT).await.unwrap()
             }
         };
+        let activity_id = uuid::Uuid::new_v4();
+        let activity_start = chrono::Utc::now();
+        let rule_name = rule
+            .as_ref()
+            .map(|value| value.type_name())
+            .unwrap_or_default();
+        let rule_payload = rule
+            .as_ref()
+            .map(|value| value.payload())
+            .unwrap_or_default();
+        Manager::emit_activity_for_session(
+            activity_id,
+            activity_start,
+            &sess,
+            rule_name,
+            &rule_payload,
+            outbound_name,
+            "ongoing",
+            1,
+            "routed",
+            "",
+            "",
+        );
 
         match handler
             .connect_stream(&sess, self.resolver.clone())
@@ -194,6 +217,8 @@ impl Dispatcher {
                     self.manager.clone(),
                     sess.clone(),
                     rule,
+                    activity_id,
+                    activity_start,
                 )
                 .await;
                 match copy_bidirectional(
@@ -274,6 +299,24 @@ impl Dispatcher {
                 }
             }
             Err(err) => {
+                let status = if outbound_name == PROXY_REJECT {
+                    "rejected"
+                } else {
+                    "failed"
+                };
+                Manager::emit_activity_for_session(
+                    activity_id,
+                    activity_start,
+                    &sess,
+                    rule_name,
+                    &rule_payload,
+                    outbound_name,
+                    status,
+                    2,
+                    status,
+                    "connect",
+                    &err.to_string(),
+                );
                 warn!(
                     "failed to establish remote connection {}, error: {}",
                     sess, err
@@ -509,12 +552,53 @@ impl Dispatcher {
                 {
                     None => {
                         debug!("building {} outbound datagram connecting", sess);
+                        let activity_id = uuid::Uuid::new_v4();
+                        let activity_start = chrono::Utc::now();
+                        let rule_name = rule
+                            .as_ref()
+                            .map(|value| value.type_name())
+                            .unwrap_or_default();
+                        let rule_payload = rule
+                            .as_ref()
+                            .map(|value| value.payload())
+                            .unwrap_or_default();
+                        Manager::emit_activity_for_session(
+                            activity_id,
+                            activity_start,
+                            &sess,
+                            rule_name,
+                            &rule_payload,
+                            &outbound_name,
+                            "ongoing",
+                            1,
+                            "routed",
+                            "",
+                            "",
+                        );
                         let outbound_datagram = match handler
                             .connect_datagram(&sess, resolver.clone())
                             .await
                         {
                             Ok(v) => v,
                             Err(err) => {
+                                let status = if outbound_name == PROXY_REJECT {
+                                    "rejected"
+                                } else {
+                                    "failed"
+                                };
+                                Manager::emit_activity_for_session(
+                                    activity_id,
+                                    activity_start,
+                                    &sess,
+                                    rule_name,
+                                    &rule_payload,
+                                    &outbound_name,
+                                    status,
+                                    2,
+                                    status,
+                                    "connect",
+                                    &err.to_string(),
+                                );
                                 error!("failed to connect outbound: {}", err);
                                 continue;
                             }
@@ -527,6 +611,8 @@ impl Dispatcher {
                             manager.clone(),
                             sess.clone(),
                             rule,
+                            activity_id,
+                            activity_start,
                         )
                         .await;
 
