@@ -1,9 +1,11 @@
 use async_trait::async_trait;
 
-use std::fmt::Debug;
+use std::{
+    fmt::Debug,
+    sync::{Arc, LazyLock, OnceLock, RwLock},
+};
 
 use hickory_proto::op;
-use std::sync::Arc;
 
 #[cfg(test)]
 use mockall::automock;
@@ -25,6 +27,8 @@ pub use config::{Config, EdnsClientSubnet};
 pub use filters::PendingMmdb;
 pub use rule_dispatch::{PendingOutboundManager, PendingRouter, RuleDispatch};
 
+pub type PendingGeoData = Arc<OnceLock<crate::common::geodata::GeoDataLookup>>;
+
 pub use resolver::{EnhancedResolver, SystemResolver, new as new_resolver};
 
 pub use server::{DnsRunner, exchange_with_resolver};
@@ -45,6 +49,24 @@ pub enum ResolverKind {
 }
 
 pub type ThreadSafeDNSResolver = Arc<dyn ClashResolver>;
+
+// ponytail: the core owns one active runtime per process; plumb resolver
+// ownership through transports if concurrent runtimes are introduced.
+static ACTIVE_DNS_RESOLVER: LazyLock<RwLock<Option<ThreadSafeDNSResolver>>> =
+    LazyLock::new(|| RwLock::new(None));
+
+pub(crate) fn set_active_resolver(resolver: ThreadSafeDNSResolver) {
+    *ACTIVE_DNS_RESOLVER
+        .write()
+        .expect("active DNS resolver lock poisoned") = Some(resolver);
+}
+
+pub(crate) fn active_resolver() -> Option<ThreadSafeDNSResolver> {
+    ACTIVE_DNS_RESOLVER
+        .read()
+        .expect("active DNS resolver lock poisoned")
+        .clone()
+}
 
 /// A implementation of "anti-poisoning" Resolver
 /// it can hold multiple clients in different protocols
@@ -73,6 +95,14 @@ pub trait ClashResolver: Sync + Send {
 
     /// Used for DNS Server
     async fn exchange(&self, message: &op::Message) -> anyhow::Result<op::Message>;
+
+    /// Used for proxy-server metadata such as ECH HTTPS records.
+    async fn exchange_proxy_server(
+        &self,
+        message: &op::Message,
+    ) -> anyhow::Result<op::Message> {
+        self.exchange(message).await
+    }
 
     /// Only used for look up fake IP
     async fn reverse_lookup(&self, ip: std::net::IpAddr) -> Option<String>;

@@ -51,6 +51,7 @@ pub async fn make_clients(
             father: resolver.as_ref().cloned(),
             host: s.host.clone(),
             port,
+            path: s.path.clone(),
             net: s.net.to_owned(),
             iface: interface.inspect(|x| debug!("DNS client interface: {:?}", x)),
             proxy,

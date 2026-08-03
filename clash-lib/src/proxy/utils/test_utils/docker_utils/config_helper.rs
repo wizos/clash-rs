@@ -70,6 +70,7 @@ pub async fn build_dns_resolver() -> anyhow::Result<Arc<dyn ClashResolver>> {
             config.dns,
             cache_store,
             Some(pending_mmdb),
+            None,
             Arc::new(RwLock::new(HashMap::new())),
             None,
         )

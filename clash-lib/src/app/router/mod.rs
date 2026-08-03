@@ -26,6 +26,7 @@ mod rules;
 
 use crate::common::{geodata::GeoDataLookup, mmdb::MmdbLookup};
 pub use rules::RuleMatcher;
+pub(crate) use rules::geodata::GeoSiteMatcher;
 
 pub struct Router {
     rules: Vec<Box<dyn RuleMatcher>>,

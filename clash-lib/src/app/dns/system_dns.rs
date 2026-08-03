@@ -167,6 +167,7 @@ impl SystemDnsClient {
                 net: DNSNetMode::Udp,
                 host,
                 port: addr.port(),
+                path: String::new(),
                 iface: None,
                 proxy: proxy.clone(),
                 father: None,

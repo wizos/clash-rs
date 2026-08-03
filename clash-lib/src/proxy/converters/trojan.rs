@@ -97,6 +97,8 @@ impl TryFrom<&OutboundTrojan> for Handler {
                     };
                     alpn.iter().copied().map(str::to_owned).collect()
                 }));
+                let alpn =
+                    super::utils::tls_alpn_for_network(s.network.as_deref(), alpn);
                 let client: Box<dyn Transport> =
                     if let Some(reality_opts) = s.reality_opts.as_ref() {
                         let public_key = super::utils::decode_base64_public_key(

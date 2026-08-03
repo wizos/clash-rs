@@ -1,10 +1,14 @@
 use crate::{
     Error,
-    app::{dns::helper::build_dns_response_message, profile::ThreadSafeCacheFile},
+    app::{
+        dns::helper::build_dns_response_message, profile::ThreadSafeCacheFile,
+        router::GeoSiteMatcher,
+    },
     common::trie,
     config::def::DNSMode,
     dns::{
-        ClashResolver, Config, ResolverKind, RuleDispatch, ThreadSafeDNSClient,
+        ClashResolver, Config, PendingGeoData, ResolverKind, RuleDispatch,
+        ThreadSafeDNSClient,
         fakeip::{self, FileStore, InMemStore, ThreadSafeFakeDns},
         filters::{
             DomainFilter, FallbackDomainFilter, FallbackIPFilter, GeoIPFilter,
@@ -22,13 +26,47 @@ use rand::seq::IndexedRandom;
 use std::{
     net,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicBool, Ordering::Relaxed},
     },
     time::{Duration, Instant},
 };
 use tokio::sync::RwLock;
 use tracing::{debug, error, instrument, trace, warn};
+
+struct GeoSiteDnsPolicy {
+    country_code: String,
+    clients: Vec<ThreadSafeDNSClient>,
+    geodata: Option<PendingGeoData>,
+    matcher: OnceLock<Option<GeoSiteMatcher>>,
+}
+
+impl GeoSiteDnsPolicy {
+    fn matches(&self, domain: &str) -> bool {
+        let Some(loader) = self.geodata.as_ref().and_then(|pending| pending.get())
+        else {
+            return false;
+        };
+        self.matcher
+            .get_or_init(|| {
+                GeoSiteMatcher::new(
+                    self.country_code.clone(),
+                    String::new(),
+                    Some(loader),
+                )
+                .map_err(|error| {
+                    warn!(
+                        country = self.country_code,
+                        %error,
+                        "failed to initialize DNS geosite policy"
+                    );
+                })
+                .ok()
+            })
+            .as_ref()
+            .is_some_and(|matcher| matcher.matches_domain(domain))
+    }
+}
 
 pub struct EnhancedResolver {
     ipv6: AtomicBool,
@@ -41,6 +79,7 @@ pub struct EnhancedResolver {
 
     lru_cache: Option<RwLock<hickory_resolver::ResponseCache>>,
     policy: Option<trie::StringTrie<Vec<ThreadSafeDNSClient>>>,
+    geosite_policy: Vec<GeoSiteDnsPolicy>,
 
     proxy_resolver: Option<Vec<ThreadSafeDNSClient>>,
     proxy_server_domains: Option<trie::StringTrie<bool>>,
@@ -69,6 +108,7 @@ impl EnhancedResolver {
                     net: DNSNetMode::Udp,
                     host: url::Host::Ipv4(Ipv4Addr::from_octets([8, 8, 8, 8])),
                     port: 53,
+                    path: String::new(),
                     interface: None,
                     proxy: None,
                 }],
@@ -86,6 +126,7 @@ impl EnhancedResolver {
             fallback_ip_filters: None,
             lru_cache: None,
             policy: None,
+            geosite_policy: vec![],
 
             proxy_resolver: None,
             proxy_server_domains: None,
@@ -100,6 +141,7 @@ impl EnhancedResolver {
         cfg: Config,
         store: ThreadSafeCacheFile,
         mmdb: Option<PendingMmdb>,
+        geodata: Option<PendingGeoData>,
         outbounds: crate::proxy::utils::OutboundHandlerRegistry,
         rule_dispatch: Option<Arc<RuleDispatch>>,
     ) -> Self {
@@ -124,6 +166,7 @@ impl EnhancedResolver {
             fallback_ip_filters: None,
             lru_cache: None,
             policy: None,
+            geosite_policy: vec![],
 
             proxy_resolver: None,
             proxy_server_domains: None,
@@ -180,6 +223,32 @@ impl EnhancedResolver {
             } else {
                 None
             };
+
+        let mut domain_policy = trie::StringTrie::new();
+        let mut has_domain_policy = false;
+        let mut geosite_policy = vec![];
+        for (domain, nameservers) in &cfg.nameserver_policy {
+            let clients = make_clients(
+                nameservers.clone(),
+                Some(default_resolver.clone()),
+                outbounds.clone(),
+                edns_client_subnet.clone(),
+                cfg.fw_mark,
+                rule_dispatch.clone(),
+            )
+            .await;
+            if let Some(country_code) = domain.strip_prefix("geosite:") {
+                geosite_policy.push(GeoSiteDnsPolicy {
+                    country_code: country_code.to_owned(),
+                    clients,
+                    geodata: geodata.clone(),
+                    matcher: OnceLock::new(),
+                });
+            } else {
+                domain_policy.insert(domain, Arc::new(clients));
+                has_domain_policy = true;
+            }
+        }
 
         Self {
             ipv6: AtomicBool::new(cfg.ipv6),
@@ -244,28 +313,8 @@ impl EnhancedResolver {
                 4096,
                 hickory_resolver::TtlConfig::default(),
             ))),
-            policy: if !cfg.nameserver_policy.is_empty() {
-                let mut p = trie::StringTrie::new();
-                for (domain, ns) in &cfg.nameserver_policy {
-                    p.insert(
-                        domain.as_str(),
-                        Arc::new(
-                            make_clients(
-                                vec![ns.to_owned()],
-                                Some(default_resolver.clone()),
-                                outbounds.clone(),
-                                edns_client_subnet.clone(),
-                                cfg.fw_mark,
-                                rule_dispatch.clone(),
-                            )
-                            .await,
-                        ),
-                    );
-                }
-                Some(p)
-            } else {
-                None
-            },
+            policy: has_domain_policy.then_some(domain_policy),
+            geosite_policy,
             fake_dns: match cfg.enhance_mode {
                 DNSMode::FakeIp => Some(Arc::new(RwLock::new(
                     fakeip::FakeDns::new(fakeip::Opts {
@@ -454,13 +503,19 @@ impl EnhancedResolver {
     }
 
     fn match_policy(&self, m: &op::Message) -> Option<&Vec<ThreadSafeDNSClient>> {
-        if let (Some(_fallback), Some(_fallback_domain_filters), Some(policy)) =
-            (&self.fallback, &self.fallback_domain_filters, &self.policy)
-            && let Some(domain) = EnhancedResolver::domain_name_of_message(m)
+        let domain = EnhancedResolver::domain_name_of_message(m)?;
+        if let Some(clients) = self
+            .policy
+            .as_ref()
+            .and_then(|policy| policy.search(&domain))
+            .map(|node| node.get_data().unwrap())
         {
-            return policy.search(&domain).map(|n| n.get_data().unwrap());
+            return Some(clients);
         }
-        None
+        self.geosite_policy
+            .iter()
+            .find(|policy| policy.matches(&domain))
+            .map(|policy| &policy.clients)
     }
 
     #[instrument(skip_all, level = "trace")]
@@ -719,6 +774,17 @@ impl ClashResolver for EnhancedResolver {
         Ok(rv)
     }
 
+    async fn exchange_proxy_server(
+        &self,
+        message: &op::Message,
+    ) -> anyhow::Result<op::Message> {
+        EnhancedResolver::batch_exchange(
+            self.proxy_resolver.as_ref().unwrap_or(&self.main),
+            message,
+        )
+        .await
+    }
+
     fn ipv6(&self) -> bool {
         self.ipv6.load(Relaxed)
     }
@@ -769,25 +835,128 @@ impl ClashResolver for EnhancedResolver {
 
 #[cfg(test)]
 mod tests {
-
     use hickory_net::{DnsHandle, client, udp::UdpClientStream, xfer::FirstAnswer};
     use hickory_proto::{
         op::{self, DnsRequest, DnsRequestOptions},
         rr,
     };
-    use std::{net::Ipv4Addr, sync::Arc, time::Instant};
+    use std::{
+        net::Ipv4Addr,
+        sync::{Arc, OnceLock},
+        time::Instant,
+    };
     use tokio::sync::RwLock;
 
     use crate::{
         app::dns::{
-            ClashResolver, ThreadSafeDNSClient,
+            ClashResolver, Client as DnsClientTrait, PendingGeoData,
+            ThreadSafeDNSClient,
             config::{Config, NameServer},
             dns_client::{DNSNetMode, DnsClient, Opts},
             resolver::enhanced::EnhancedResolver,
             runtime::DnsRuntimeProvider,
         },
+        common::{
+            geodata::{MockGeoDataLookupTrait, geodata_proto},
+            trie,
+        },
         proxy,
     };
+
+    use super::GeoSiteDnsPolicy;
+
+    #[derive(Debug)]
+    struct EchoDnsClient;
+
+    #[async_trait::async_trait]
+    impl DnsClientTrait for EchoDnsClient {
+        fn id(&self) -> String {
+            "echo".to_owned()
+        }
+
+        async fn exchange(
+            &self,
+            message: &op::Message,
+        ) -> anyhow::Result<op::Message> {
+            Ok(message.clone())
+        }
+    }
+
+    fn dns_query(domain: &str) -> op::Message {
+        let mut message = op::Message::query();
+        let mut query = op::Query::new();
+        query.set_name(rr::Name::from_utf8(domain).unwrap());
+        query.set_query_type(rr::RecordType::A);
+        message.add_query(query);
+        message
+    }
+
+    async fn resolver_with_domain_policy(domain: &str) -> EnhancedResolver {
+        let mut resolver = EnhancedResolver::new_default().await;
+        let mut policy = trie::StringTrie::new();
+        policy.insert(domain, Arc::new(resolver.main.clone()));
+        resolver.policy = Some(policy);
+        resolver
+    }
+
+    #[tokio::test]
+    async fn domain_policy_matches_without_fallback() {
+        let resolver = resolver_with_domain_policy("example.com").await;
+
+        assert!(resolver.fallback.is_none());
+        assert!(resolver.match_policy(&dns_query("example.com")).is_some());
+    }
+
+    #[tokio::test]
+    async fn unmatched_domain_does_not_select_policy_without_fallback() {
+        let resolver = resolver_with_domain_policy("example.com").await;
+
+        assert!(resolver.fallback.is_none());
+        assert!(resolver.match_policy(&dns_query("x.com")).is_none());
+    }
+
+    #[tokio::test]
+    async fn proxy_server_exchange_uses_proxy_nameservers() {
+        let mut resolver = EnhancedResolver::new_default().await;
+        resolver.proxy_resolver = Some(vec![Arc::new(EchoDnsClient)]);
+        let mut message = dns_query("cloudflare-ech.com");
+        message.queries[0].set_query_type(rr::RecordType::HTTPS);
+
+        let response = resolver.exchange_proxy_server(&message).await.unwrap();
+
+        assert_eq!(response.queries[0].query_type(), rr::RecordType::HTTPS);
+    }
+
+    #[tokio::test]
+    async fn geosite_policy_matches_without_fallback_after_geodata_is_ready() {
+        let mut geodata = MockGeoDataLookupTrait::new();
+        geodata.expect_get().returning(|country| {
+            (country == "gfw").then(|| geodata_proto::GeoSite {
+                country_code: "GFW".to_owned(),
+                domain: vec![geodata_proto::Domain {
+                    r#type: geodata_proto::domain::Type::Domain.into(),
+                    value: "x.com".to_owned(),
+                    attribute: vec![],
+                }],
+            })
+        });
+        let pending: PendingGeoData = Arc::new(OnceLock::new());
+        let mut resolver = EnhancedResolver::new_default().await;
+        let policy = GeoSiteDnsPolicy {
+            country_code: "gfw".to_owned(),
+            clients: resolver.main.clone(),
+            geodata: Some(pending.clone()),
+            matcher: OnceLock::new(),
+        };
+        resolver.geosite_policy.push(policy);
+        let message = dns_query("api.x.com");
+
+        assert!(resolver.fallback.is_none());
+        assert!(resolver.match_policy(&message).is_none());
+        assert!(pending.set(Arc::new(geodata)).is_ok());
+        assert!(resolver.match_policy(&message).is_some());
+        assert!(resolver.match_policy(&dns_query("example.com")).is_none());
+    }
 
     /// Regression test for https://github.com/Watfaq/clash-rs/issues/976
     /// IPv6 literal addresses must be returned directly even when dns.ipv6 is
@@ -931,6 +1100,7 @@ mod tests {
             host: url::Host::Ipv4(Ipv4Addr::from([114, 114, 114, 114])),
             port: 53,
             net: DNSNetMode::Udp,
+            path: String::new(),
             iface: None,
             proxy: get_default_outbound(),
             ecs: None,
@@ -951,6 +1121,7 @@ mod tests {
             host: url::Host::Ipv4(Ipv4Addr::from([1, 1, 1, 1])),
             port: 53,
             net: DNSNetMode::Tcp,
+            path: String::new(),
             iface: None,
             proxy: get_default_outbound(),
             ecs: None,
@@ -971,6 +1142,7 @@ mod tests {
             host: url::Host::Domain("dns.google".to_string()),
             port: 853,
             net: DNSNetMode::DoT,
+            path: String::new(),
             iface: None,
             proxy: get_default_outbound(),
             ecs: None,
@@ -993,6 +1165,7 @@ mod tests {
             host: url::Host::Domain("cloudflare-dns.com".to_string()),
             port: 443,
             net: DNSNetMode::DoH,
+            path: "/dns-query".to_owned(),
             iface: None,
             proxy: get_default_outbound(),
             ecs: None,
@@ -1013,6 +1186,7 @@ mod tests {
             host: url::Host::Domain("en0".to_string()),
             port: 0,
             net: DNSNetMode::Dhcp,
+            path: String::new(),
             iface: None,
             proxy: get_default_outbound(),
             ecs: None,
@@ -1089,6 +1263,7 @@ mod tests {
             net: DNSNetMode::Udp,
             host: url::Host::Ipv4("8.8.8.8".parse().unwrap()),
             port: 53,
+            path: String::new(),
             interface: None,
             proxy: None,
         }]);
@@ -1097,6 +1272,7 @@ mod tests {
             net: DNSNetMode::Udp,
             host: url::Host::Ipv4("114.114.114.114".parse().unwrap()),
             port: 53,
+            path: String::new(),
             interface: None,
             proxy: None,
         }];
@@ -1105,6 +1281,7 @@ mod tests {
             net: DNSNetMode::Udp,
             host: url::Host::Ipv4("223.5.5.5".parse().unwrap()),
             port: 53,
+            path: String::new(),
             interface: None,
             proxy: None,
         }];
@@ -1112,6 +1289,7 @@ mod tests {
         let resolver = EnhancedResolver::new(
             config,
             cache_store,
+            None,
             None,
             Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             None,
@@ -1153,6 +1331,7 @@ mod tests {
             net: DNSNetMode::Udp,
             host: url::Host::Ipv4("114.114.114.114".parse().unwrap()),
             port: 53,
+            path: String::new(),
             interface: None,
             proxy: None,
         }];
@@ -1161,6 +1340,7 @@ mod tests {
             net: DNSNetMode::Udp,
             host: url::Host::Ipv4("223.5.5.5".parse().unwrap()),
             port: 53,
+            path: String::new(),
             interface: None,
             proxy: None,
         }];
@@ -1168,6 +1348,7 @@ mod tests {
         let resolver = EnhancedResolver::new(
             config,
             cache_store,
+            None,
             None,
             Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             None,
@@ -1223,6 +1404,7 @@ mod tests {
             net: DNSNetMode::Udp,
             host: url::Host::Ipv4("8.8.8.8".parse().unwrap()),
             port: 53,
+            path: String::new(),
             interface: None,
             proxy: None,
         };
@@ -1234,6 +1416,7 @@ mod tests {
             net: DNSNetMode::Udp,
             host: url::Host::Ipv4("114.114.114.114".parse().unwrap()),
             port: 53,
+            path: String::new(),
             interface: None,
             proxy: None,
         }];
@@ -1241,6 +1424,7 @@ mod tests {
             net: DNSNetMode::Udp,
             host: url::Host::Ipv4("223.5.5.5".parse().unwrap()),
             port: 53,
+            path: String::new(),
             interface: None,
             proxy: None,
         }];
@@ -1265,7 +1449,8 @@ mod tests {
         ]);
 
         let resolver =
-            EnhancedResolver::new(config, cache_store, None, outbounds, None).await;
+            EnhancedResolver::new(config, cache_store, None, None, outbounds, None)
+                .await;
 
         assert!(resolver.proxy_resolver.is_some());
         let domains = resolver.proxy_server_domains.as_ref().expect(
@@ -1292,7 +1477,8 @@ mod tests {
         let outbounds = make_outbound_registry(&[("cf-proxy", "one.one.one.one")]);
 
         let resolver =
-            EnhancedResolver::new(config, cache_store, None, outbounds, None).await;
+            EnhancedResolver::new(config, cache_store, None, None, outbounds, None)
+                .await;
 
         // Sanity: the trie was built
         assert!(resolver.proxy_server_domains.is_some());

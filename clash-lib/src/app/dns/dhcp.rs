@@ -99,6 +99,7 @@ impl DhcpClient {
                         net: DNSNetMode::Udp,
                         host: url::Host::Ipv4(s),
                         port: 53,
+                        path: String::new(),
                         interface: None,
                         proxy: None,
                     })

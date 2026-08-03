@@ -148,6 +148,8 @@ impl TryFrom<&OutboundVmess> for Handler {
                         })
                         .transpose()?
                 };
+                let alpn =
+                    super::utils::tls_alpn_for_network(s.network.as_deref(), alpn);
                 let sni = s.server_name.as_ref().map(|x| x.to_owned()).unwrap_or(
                     s.ws_opts
                         .as_ref()

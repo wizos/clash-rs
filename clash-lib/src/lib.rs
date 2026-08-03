@@ -592,12 +592,16 @@ async fn create_components(
     // registry when downloading the file.
     let country_mmdb_file = config.general.mmdb;
     let country_mmdb_download_url = config.general.mmdb_download_url;
+    let geosite_file = config.general.geosite;
+    let geosite_download_url = config.general.geosite_download_url;
 
     // Create a shared pending handle that the DNS resolver's GeoIPFilter holds.
     // It starts empty and is populated once the MMDB is loaded below.
     let pending_country_mmdb: Option<dns::PendingMmdb> = country_mmdb_file
         .as_ref()
         .map(|_| Arc::new(OnceLock::new()));
+    let pending_geodata: Option<dns::PendingGeoData> =
+        geosite_file.as_ref().map(|_| Arc::new(OnceLock::new()));
 
     // When `dns.respect-rules` is true, share a `RuleDispatch` between the
     // resolver and the (later-built) router + outbound manager. The DNS
@@ -610,10 +614,12 @@ async fn create_components(
         config.dns,
         Some(cache_store.clone()),
         pending_country_mmdb.clone(),
+        pending_geodata.clone(),
         outbound_registry.clone(),
         dns_rule_dispatch,
     )
     .await;
+    dns::set_active_resolver(dns_resolver.clone());
 
     debug!("initializing outbound manager");
     let outbound_manager = Arc::new(
@@ -681,18 +687,26 @@ async fn create_components(
     };
 
     debug!("initializing geosite");
-    let geodata = if let Some(geosite_file) = config.general.geosite {
-        Some(Arc::new(
+    let geodata = if let Some(geosite_file) = geosite_file {
+        let geodata = Arc::new(
             geodata::GeoData::new(
                 cwd.join(&geosite_file),
-                config
-                    .general
-                    .geosite_download_url
+                geosite_download_url
                     .unwrap_or(DEFAULT_GEOSITE_DOWNLOAD_URL.to_string()),
                 client.clone(),
             )
             .await?,
-        ) as GeoDataLookup)
+        ) as GeoDataLookup;
+        if let Some(pending) = &pending_geodata {
+            if pending.set(geodata.clone()).is_err() {
+                warn!(
+                    "geodata OnceLock was already set — this is unexpected and \
+                     indicates a double-initialization bug"
+                );
+            }
+            dns_resolver.flush_cache().await;
+        }
+        Some(geodata)
     } else {
         debug!("geosite not set, skipping");
         None

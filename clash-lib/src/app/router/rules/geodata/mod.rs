@@ -80,6 +80,10 @@ impl GeoSiteMatcher {
             matcher: matcher_group,
         })
     }
+
+    pub(crate) fn matches_domain(&self, domain: &str) -> bool {
+        self.matcher.apply(domain)
+    }
 }
 
 impl Display for GeoSiteMatcher {

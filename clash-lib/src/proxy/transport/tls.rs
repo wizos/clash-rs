@@ -1,6 +1,9 @@
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use hickory_proto::rr::{RData, RecordType, rdata::svcb::SvcParamValue};
+use hickory_proto::{
+    op::{Message, MessageType, OpCode, Query},
+    rr::{Name, RData, Record, RecordType, rdata::svcb::SvcParamValue},
+};
 use hickory_resolver::{
     TokioResolver,
     config::{CLOUDFLARE, ResolverConfig},
@@ -12,6 +15,7 @@ use tokio::sync::OnceCell;
 
 use super::Transport;
 use crate::{
+    app::dns::{ResolverKind, ThreadSafeDNSResolver, active_resolver},
     common::{
         errors::map_io_error,
         tls::{
@@ -281,7 +285,42 @@ fn build_connector(
     Ok(tokio_rustls::TlsConnector::from(Arc::new(tls_config)))
 }
 
-pub(crate) async fn resolve_ech_config_list(name: &str) -> io::Result<Vec<u8>> {
+fn extract_ech_config_list(answers: &[Record]) -> Option<Vec<u8>> {
+    answers
+        .iter()
+        .filter_map(|record| match &record.data {
+            RData::HTTPS(https) => Some(&https.svc_params),
+            _ => None,
+        })
+        .flatten()
+        .find_map(|(_, value)| match value {
+            SvcParamValue::EchConfigList(list) => Some(list.0.clone()),
+            _ => None,
+        })
+}
+
+async fn resolve_ech_config_list_with_proxy_resolver(
+    name: &str,
+    resolver: &ThreadSafeDNSResolver,
+) -> io::Result<Vec<u8>> {
+    let query_name = name.to_owned();
+    let name = Name::from_str_relaxed(name).map_err(map_io_error)?;
+    let mut message = Message::new(0, MessageType::Query, OpCode::Query);
+    message.add_query(Query::query(name, RecordType::HTTPS));
+    let response = resolver
+        .exchange_proxy_server(&message)
+        .await
+        .map_err(map_io_error)?;
+
+    extract_ech_config_list(&response.answers).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("HTTPS DNS record for {query_name} contains no ECH config"),
+        )
+    })
+}
+
+async fn resolve_ech_config_list_with_system_dns(name: &str) -> io::Result<Vec<u8>> {
     let builder = TokioResolver::builder_tokio().unwrap_or_else(|_| {
         TokioResolver::builder_with_config(
             ResolverConfig::udp_and_tcp(&CLOUDFLARE),
@@ -294,24 +333,21 @@ pub(crate) async fn resolve_ech_config_list(name: &str) -> io::Result<Vec<u8>> {
         .await
         .map_err(map_io_error)?;
 
-    lookup
-        .answers()
-        .iter()
-        .filter_map(|record| match &record.data {
-            RData::HTTPS(https) => Some(&https.svc_params),
-            _ => None,
-        })
-        .flatten()
-        .find_map(|(_, value)| match value {
-            SvcParamValue::EchConfigList(list) => Some(list.0.clone()),
-            _ => None,
-        })
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("HTTPS DNS record for {name} contains no ECH config"),
-            )
-        })
+    extract_ech_config_list(lookup.answers()).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("HTTPS DNS record for {name} contains no ECH config"),
+        )
+    })
+}
+
+pub(crate) async fn resolve_ech_config_list(name: &str) -> io::Result<Vec<u8>> {
+    if let Some(resolver) = active_resolver()
+        && matches!(resolver.kind(), ResolverKind::Clash)
+    {
+        return resolve_ech_config_list_with_proxy_resolver(name, &resolver).await;
+    }
+    resolve_ech_config_list_with_system_dns(name).await
 }
 
 pub(crate) async fn build_rustls_client_config_with_optional_ech(
@@ -394,12 +430,26 @@ impl Transport for Client {
 mod tests {
     use std::sync::Arc;
 
+    use hickory_proto::{
+        op::{Message, MessageType, OpCode},
+        rr::{
+            Name, RData, Record, RecordType,
+            rdata::{
+                HTTPS, SVCB,
+                svcb::{EchConfigList, SvcParamKey, SvcParamValue},
+            },
+        },
+    };
     use quinn::crypto::rustls::QuicClientConfig;
 
     use super::{
         Client, Connector, EchOptions, build_rustls_client_config_with_optional_ech,
+        resolve_ech_config_list_with_proxy_resolver,
     };
-    use crate::common::tls::DefaultTlsVerifier;
+    use crate::{
+        app::dns::{MockClashResolver, ThreadSafeDNSResolver},
+        common::tls::DefaultTlsVerifier,
+    };
 
     const ECH_CONFIG: &str = "AEn+DQBFKwAgACABWIHUGj4u+PIggYXcR5JF0gYk3dCRioBW8uJq9H4mKAAIAAEAAQABAANAEnB1YmxpYy50bHMtZWNoLmRldgAA";
 
@@ -469,6 +519,49 @@ mod tests {
             panic!("ECH without an explicit config must use DNS discovery");
         };
         assert_eq!(deferred.query_server_name, "ech.example");
+    }
+
+    #[tokio::test]
+    async fn resolves_ech_with_proxy_server_dns() {
+        let expected = vec![0, 4, 0xfe, 0x0d, 0, 0];
+        let answer = expected.clone();
+        let mut resolver = MockClashResolver::new();
+        resolver
+            .expect_exchange_proxy_server()
+            .withf(|message| {
+                message.queries.first().is_some_and(|query| {
+                    query.name().to_string() == "cloudflare-ech.com"
+                        && query.query_type() == RecordType::HTTPS
+                })
+            })
+            .times(1)
+            .return_once(move |_| {
+                let mut response =
+                    Message::new(0, MessageType::Response, OpCode::Query);
+                response.add_answer(Record::from_rdata(
+                    Name::from_ascii("cloudflare-ech.com.").unwrap(),
+                    120,
+                    RData::HTTPS(HTTPS(SVCB::new(
+                        1,
+                        Name::root(),
+                        vec![(
+                            SvcParamKey::EchConfigList,
+                            SvcParamValue::EchConfigList(EchConfigList(answer)),
+                        )],
+                    ))),
+                ));
+                Ok(response)
+            });
+        let resolver: ThreadSafeDNSResolver = Arc::new(resolver);
+
+        let actual = resolve_ech_config_list_with_proxy_resolver(
+            "cloudflare-ech.com",
+            &resolver,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(actual, expected);
     }
 
     #[tokio::test]

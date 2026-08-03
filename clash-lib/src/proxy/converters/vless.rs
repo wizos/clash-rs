@@ -264,6 +264,10 @@ impl TryFrom<&OutboundVless> for Handler {
                             })
                             .transpose()?
                     };
+                    let alpn = super::utils::tls_alpn_for_network(
+                        s.network.as_deref(),
+                        alpn,
+                    );
                     let client = TlsClient::new_mihomo(
                         s.skip_cert_verify.unwrap_or_default(),
                         s.server_name.as_ref().map(|x| x.to_owned()).unwrap_or(

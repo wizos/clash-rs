@@ -21,6 +21,17 @@ pub fn tls_ech_options(options: Option<&EchOptions>) -> Option<TlsEchOptions> {
         })
 }
 
+pub fn tls_alpn_for_network(
+    network: Option<&str>,
+    configured: Option<Vec<String>>,
+) -> Option<Vec<String>> {
+    if matches!(network, Some("ws")) {
+        Some(vec!["http/1.1".to_owned()])
+    } else {
+        configured
+    }
+}
+
 impl TryFrom<(&WsOpt, &CommonConfigOptions)> for WsClient {
     type Error = std::io::Error;
 
@@ -124,4 +135,24 @@ pub fn decode_base64_public_key(base64_public_key: &str) -> Result<[u8; 32], Err
 pub fn decode_short_id(hex_short_id: &str) -> Result<Vec<u8>, Error> {
     hex::decode(hex_short_id)
         .map_err(|e| Error::InvalidConfig(format!("reality short-id hex: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tls_alpn_for_network;
+
+    #[test]
+    fn websocket_requires_http_1_1_alpn() {
+        assert_eq!(
+            tls_alpn_for_network(
+                Some("ws"),
+                Some(vec![
+                    "h3".to_owned(),
+                    "h2".to_owned(),
+                    "http/1.1".to_owned(),
+                ]),
+            ),
+            Some(vec!["http/1.1".to_owned()]),
+        );
+    }
 }

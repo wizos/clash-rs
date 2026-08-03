@@ -22,6 +22,7 @@ pub struct NameServer {
     pub net: DNSNetMode,
     pub host: url::Host<String>,
     pub port: u16,
+    pub path: String,
     pub interface: Option<OutboundInterface>,
     pub proxy: Option<String>,
 }
@@ -65,7 +66,7 @@ pub struct Config {
     pub store_fake_ip: bool,
     pub store_smart_stats: bool,
     pub hosts: Option<trie::StringTrie<IpAddr>>,
-    pub nameserver_policy: HashMap<String, NameServer>,
+    pub nameserver_policy: HashMap<String, Vec<NameServer>>,
     pub edns_client_subnet: Option<EdnsClientSubnet>,
     pub fw_mark: Option<u32>,
     pub respect_rules: bool,
@@ -83,6 +84,7 @@ impl Config {
                     net: DNSNetMode::System,
                     host: url::Host::Domain("system".to_string()),
                     port: 0,
+                    path: String::new(),
                     interface: None,
                     proxy: None,
                 });
@@ -164,10 +166,27 @@ impl Config {
             }
 
             let net = net.parse()?;
+            let path = if net == DNSNetMode::DoH {
+                let has_explicit_path =
+                    server.split_once("://").is_some_and(|(_, rest)| {
+                        let suffix = rest
+                            .find(|c| c == '?' || c == '#')
+                            .unwrap_or(rest.len());
+                        rest[..suffix].contains('/')
+                    });
+                if has_explicit_path {
+                    url.path().to_owned()
+                } else {
+                    "/dns-query".to_owned()
+                }
+            } else {
+                String::new()
+            };
             nameservers.push(NameServer {
                 host: host.to_owned(),
                 port,
                 net,
+                path,
                 interface: iface
                     .map(|x| match x.as_str() {
                         "auto" => {
@@ -192,7 +211,7 @@ impl Config {
 
     pub fn parse_nameserver_policy(
         policy_map: &HashMap<String, serde_yaml::Value>,
-    ) -> Result<HashMap<String, NameServer>, Error> {
+    ) -> Result<HashMap<String, Vec<NameServer>>, Error> {
         let mut policy = HashMap::new();
 
         for (domain, value) in policy_map {
@@ -218,13 +237,38 @@ impl Config {
                 continue;
             }
 
-            let (_, valid) = trie::valid_and_split_domain(domain);
-            if !valid {
-                return Err(Error::InvalidConfig(format!(
-                    "DNS ResolverRule invalid domain: {domain}"
-                )));
+            let geosite = domain
+                .get(.."geosite:".len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("geosite:"));
+            let keys = if geosite {
+                domain["geosite:".len()..]
+                    .split(',')
+                    .map(|key| format!("geosite:{}", key.trim()))
+                    .collect::<Vec<_>>()
+            } else {
+                domain
+                    .split(',')
+                    .map(|key| key.trim().to_owned())
+                    .collect::<Vec<_>>()
+            };
+
+            for key in keys {
+                if let Some(country) = key.strip_prefix("geosite:") {
+                    if country.is_empty() {
+                        return Err(Error::InvalidConfig(format!(
+                            "DNS ResolverRule invalid geosite: {domain}"
+                        )));
+                    }
+                } else {
+                    let (_, valid) = trie::valid_and_split_domain(&key);
+                    if !valid {
+                        return Err(Error::InvalidConfig(format!(
+                            "DNS ResolverRule invalid domain: {key}"
+                        )));
+                    }
+                }
+                policy.insert(key, nameservers.clone());
             }
-            policy.insert(domain.into(), nameservers[0].clone());
         }
         Ok(policy)
     }
@@ -561,5 +605,51 @@ mod tests {
         let _sock: std::net::SocketAddr = format!("{}:{}", ns[0].host, ns[0].port)
             .parse()
             .expect("address should parse to SocketAddr");
+    }
+
+    #[test]
+    fn parse_nameserver_preserves_doh_path_and_defaults_when_missing() {
+        let servers = vec![
+            "https://dna.chuci.xyz/query".to_owned(),
+            "https://dns.example".to_owned(),
+            "https://dns.example/".to_owned(),
+        ];
+
+        let nameservers = Config::parse_nameserver(&servers).unwrap();
+
+        assert_eq!(nameservers[0].path, "/query");
+        assert_eq!(nameservers[1].path, "/dns-query");
+        assert_eq!(nameservers[2].path, "/");
+    }
+
+    #[test]
+    fn parse_nameserver_policy_preserves_all_servers() {
+        let policy = HashMap::from([(
+            "example.com".to_owned(),
+            serde_yaml::Value::Sequence(vec![
+                serde_yaml::Value::String("1.1.1.1".to_owned()),
+                serde_yaml::Value::String("8.8.8.8".to_owned()),
+            ]),
+        )]);
+
+        let parsed = Config::parse_nameserver_policy(&policy).unwrap();
+        let nameservers = parsed.get("example.com").unwrap();
+
+        assert_eq!(nameservers.len(), 2);
+        assert_eq!(nameservers[0].host.to_string(), "1.1.1.1");
+        assert_eq!(nameservers[1].host.to_string(), "8.8.8.8");
+    }
+
+    #[test]
+    fn parse_nameserver_policy_splits_geosite_keys() {
+        let policy = HashMap::from([(
+            "geosite:gfw,geolocation-!cn".to_owned(),
+            serde_yaml::Value::String("1.1.1.1".to_owned()),
+        )]);
+
+        let parsed = Config::parse_nameserver_policy(&policy).unwrap();
+
+        assert_eq!(parsed["geosite:gfw"].len(), 1);
+        assert_eq!(parsed["geosite:geolocation-!cn"].len(), 1);
     }
 }

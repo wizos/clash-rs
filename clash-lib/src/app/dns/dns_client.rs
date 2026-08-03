@@ -191,6 +191,7 @@ pub struct Opts {
     pub father: Option<Arc<dyn ClashResolver>>,
     pub host: url::Host<String>,
     pub port: u16,
+    pub path: String,
     pub net: DNSNetMode,
     pub iface: Option<OutboundInterface>,
     pub proxy: Arc<dyn OutboundHandler>,
@@ -229,6 +230,7 @@ pub(crate) enum DnsConfig {
     Https(
         net::SocketAddr,
         url::Host<String>,
+        String,
         Option<OutboundInterface>,
         Arc<dyn OutboundHandler>,
         FwMark,
@@ -262,12 +264,12 @@ impl Display for DnsConfig {
                 write!(f, "host: {host}")?;
                 write!(f, "via proxy: {}", proxy.name())
             }
-            DnsConfig::Https(addr, host, iface, proxy, _) => {
+            DnsConfig::Https(addr, host, path, iface, proxy, _) => {
                 write!(f, "HTTPS: {}:{} ", addr.ip(), addr.port())?;
                 if let Some(iface) = iface {
                     write!(f, "bind: {iface} ")?;
                 }
-                write!(f, "host: {host}")?;
+                write!(f, "host: {host} path: {path} ")?;
                 write!(f, "via proxy: {}", proxy.name())
             }
         }
@@ -472,6 +474,7 @@ impl DnsClient {
                 let cfg = DnsConfig::Https(
                     net::SocketAddr::new(ip, opts.port),
                     opts.host.clone(),
+                    opts.path.clone(),
                     opts.iface.clone(),
                     opts.proxy.clone(),
                     opts.fw_mark,
@@ -705,7 +708,7 @@ async fn dns_stream_builder(
             );
             Ok((x, tokio::spawn(y)))
         }
-        DnsConfig::Https(addr, host, iface, proxy, fw_mark) => {
+        DnsConfig::Https(addr, host, path, iface, proxy, fw_mark) => {
             let mut tls_config = ClientConfig::builder()
                 .with_root_certificates(GLOBAL_ROOT_STORE.clone())
                 .with_no_client_auth();
@@ -731,7 +734,7 @@ async fn dns_stream_builder(
                     rule_dispatch.clone(),
                 ),
             )
-            .build(*addr, host.to_string().into(), "/dns-query".into())
+            .build(*addr, host.to_string().into(), path.clone().into())
             .await
             .map_err(|x| Error::DNSError(x.to_string()))?;
 

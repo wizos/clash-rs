@@ -35,6 +35,8 @@ impl Client {
         max_early_data: usize,
         early_data_header_name: String,
     ) -> Self {
+        let (path, max_early_data, early_data_header_name) =
+            path_early_data(path, max_early_data, early_data_header_name);
         Self {
             server,
             port,
@@ -79,6 +81,34 @@ impl Client {
         }
         request.body(()).map_err(map_io_error)
     }
+}
+
+fn path_early_data(
+    path: String,
+    max_early_data: usize,
+    early_data_header_name: String,
+) -> (String, usize, String) {
+    let Some((base, query)) = path.split_once('?') else {
+        return (path, max_early_data, early_data_header_name);
+    };
+    let parameters =
+        url::form_urlencoded::parse(query.as_bytes()).collect::<Vec<_>>();
+    let Some(max_early_data) = parameters
+        .iter()
+        .find(|(name, _)| name == "ed")
+        .and_then(|(_, value)| value.parse().ok())
+    else {
+        return (path, max_early_data, early_data_header_name);
+    };
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(parameters.iter().filter(|(name, _)| name != "ed"))
+        .finish();
+    let path = if query.is_empty() {
+        base.to_owned()
+    } else {
+        format!("{base}?{query}")
+    };
+    (path, max_early_data, "Sec-WebSocket-Protocol".to_owned())
 }
 
 #[async_trait]
@@ -135,6 +165,18 @@ mod tests {
             request.uri().to_string(),
             "ws://104.17.133.14:80/%2F%3Fed%3D2048"
         );
+    }
+
+    #[test]
+    fn path_early_data_matches_mihomo_semantics() {
+        let client = client("104.17.133.14", "/ws?ed=2048&token=value");
+        let request = client.req().unwrap();
+
+        assert_eq!(client.path, "/ws?token=value");
+        assert_eq!(client.max_early_data, 2048);
+        assert_eq!(client.early_data_header_name, "Sec-WebSocket-Protocol");
+        assert_eq!(request.uri().path_and_query().unwrap(), "/ws?token=value");
+        assert_eq!(request.headers()["Sec-WebSocket-Protocol"], "xxoo");
     }
 
     #[test]
