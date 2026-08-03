@@ -92,6 +92,7 @@ pub struct DelayHistory {
 #[derive(Default)]
 struct ProxyState {
     alive: AtomicBool,
+    delay_by_url: HashMap<String, Option<Duration>>,
     delay_history: VecDeque<DelayHistory>,
 }
 
@@ -99,6 +100,7 @@ struct ProxyState {
 #[derive(Clone)]
 pub struct ProxyManager {
     proxy_state: Arc<RwLock<HashMap<String, ProxyState>>>,
+    failure_checks: Arc<tokio::sync::Mutex<HashMap<(String, String), Option<bool>>>>,
     healthcheck_semaphore: Arc<tokio::sync::Semaphore>,
     dns_resolver: ThreadSafeDNSResolver,
     /// Firewall Mark for url test
@@ -119,6 +121,7 @@ impl ProxyManager {
         Self {
             dns_resolver,
             proxy_state: Default::default(),
+            failure_checks: Default::default(),
             healthcheck_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 MAX_CONCURRENT_HEALTHCHECKS,
             )),
@@ -190,20 +193,93 @@ impl ProxyManager {
             .unwrap_or(true) // if not found, assume it's alive
     }
 
+    pub async fn alive_for(&self, name: &str, url: &str) -> bool {
+        self.proxy_state
+            .read()
+            .await
+            .get(name)
+            .and_then(|state| state.delay_by_url.get(url))
+            .map(Option::is_some)
+            .unwrap_or(true)
+    }
+
+    pub async fn checking_after_failure(&self, name: &str, url: &str) -> bool {
+        self.failure_checks
+            .lock()
+            .await
+            .get(&(name.to_owned(), url.to_owned()))
+            .is_some_and(Option::is_none)
+    }
+
+    pub async fn available_for(&self, name: &str, url: &str) -> bool {
+        self.alive_for(name, url).await
+            && !self.checking_after_failure(name, url).await
+    }
+
+    pub async fn check_after_failure(
+        &self,
+        outbound: AnyOutboundHandler,
+        url: &str,
+    ) {
+        use crate::config::internal::proxy::{
+            PROXY_COMPATIBLE, PROXY_DIRECT, PROXY_REJECT,
+        };
+
+        if matches!(
+            outbound.name(),
+            PROXY_DIRECT | PROXY_COMPATIBLE | PROXY_REJECT
+        ) {
+            return;
+        }
+        let key = (outbound.name().to_owned(), url.to_owned());
+        {
+            let mut checks = self.failure_checks.lock().await;
+            if checks.contains_key(&key) {
+                return;
+            }
+            checks.insert(key.clone(), None);
+        }
+
+        let manager = self.clone();
+        let url = url.to_owned();
+        tokio::spawn(async move {
+            let semaphore = manager.healthcheck_semaphore.clone();
+            if let Ok(_permit) = semaphore.acquire_owned().await {
+                let _ = manager.url_test(outbound, &url, None).await;
+            }
+            manager.failure_checks.lock().await.remove(&key);
+        });
+    }
+
     pub async fn report_alive(
         &self,
         name: &str,
         alive: bool,
         history: Option<DelayHistory>,
     ) {
-        let mut state = self.proxy_state.write().await;
-        let entry = state.entry(name.to_owned()).or_default();
-        entry.alive.store(alive, Ordering::Relaxed);
-        if let Some(ins) = history {
-            entry.delay_history.push_back(ins);
-            if entry.delay_history.len() > 10 {
-                entry.delay_history.pop_front();
+        let history_url = history.as_ref().map(|entry| entry.url.clone());
+        {
+            let mut state = self.proxy_state.write().await;
+            let entry = state.entry(name.to_owned()).or_default();
+            entry.alive.store(alive, Ordering::Relaxed);
+            if let Some(ins) = history {
+                entry
+                    .delay_by_url
+                    .insert(ins.url.clone(), alive.then_some(ins.delay));
+                entry.delay_history.push_back(ins);
+                if entry.delay_history.len() > 10 {
+                    entry.delay_history.pop_front();
+                }
             }
+        }
+        if let Some(url) = history_url
+            && let Some(result) = self
+                .failure_checks
+                .lock()
+                .await
+                .get_mut(&(name.to_owned(), url))
+        {
+            *result = Some(alive);
         }
     }
 
@@ -225,6 +301,16 @@ impl ProxyManager {
             .await
             .last()
             .map(|x| x.delay.to_owned())
+    }
+
+    pub async fn last_delay_for(&self, name: &str, url: &str) -> Option<Duration> {
+        self.proxy_state
+            .read()
+            .await
+            .get(name)
+            .and_then(|state| state.delay_by_url.get(url))
+            .copied()
+            .flatten()
     }
 
     pub async fn get_packet_loss(&self, name: &str) -> Option<f64> {
@@ -897,17 +983,6 @@ impl ProxyManager {
             .as_ref()
             .map(|(actual, overall)| self.selected_delay(*actual, *overall));
 
-        crate::app::events::emit(
-            "delay",
-            serde_json::json!({
-                "url": url,
-                "name": name.clone(),
-                "value": selected_delay
-                    .map(|delay| delay.as_millis().min(i32::MAX as u128) as i32)
-                    .unwrap_or(-1),
-            }),
-        );
-
         self.report_alive(
             &name,
             result.is_ok(),
@@ -918,6 +993,17 @@ impl ProxyManager {
             }),
         )
         .await;
+
+        crate::app::events::emit(
+            "delay",
+            serde_json::json!({
+                "url": url,
+                "name": name.clone(),
+                "value": selected_delay
+                    .map(|delay| delay.as_millis().min(i32::MAX as u128) as i32)
+                    .unwrap_or(-1),
+            }),
+        );
 
         result
     }
@@ -1056,7 +1142,10 @@ mod tests {
             remote_content_manager,
         },
         config::internal::proxy::PROXY_DIRECT,
-        proxy::{direct, mocks::MockDummyOutboundHandler},
+        proxy::{
+            direct, mocks::MockDummyOutboundHandler,
+            utils::test_utils::noop::NoopResolver,
+        },
         tests::initialize,
     };
     use futures::TryFutureExt;
@@ -1078,6 +1167,43 @@ mod tests {
         assert_eq!(
             manager.healthcheck_semaphore.available_permits(),
             super::MAX_CONCURRENT_HEALTHCHECKS,
+        );
+    }
+
+    #[tokio::test]
+    async fn tracks_availability_per_test_url() {
+        let manager =
+            remote_content_manager::ProxyManager::new(Arc::new(NoopResolver), None);
+        manager
+            .report_alive(
+                "node",
+                false,
+                Some(remote_content_manager::DelayHistory {
+                    time: chrono::Utc::now(),
+                    delay: Duration::ZERO,
+                    url: "https://failed.example".to_owned(),
+                }),
+            )
+            .await;
+        manager
+            .report_alive(
+                "node",
+                true,
+                Some(remote_content_manager::DelayHistory {
+                    time: chrono::Utc::now(),
+                    delay: Duration::from_millis(10),
+                    url: "https://alive.example".to_owned(),
+                }),
+            )
+            .await;
+
+        assert!(!manager.alive_for("node", "https://failed.example").await);
+        assert!(manager.alive_for("node", "https://alive.example").await);
+        assert_eq!(
+            manager
+                .last_delay_for("node", "https://alive.example")
+                .await,
+            Some(Duration::from_millis(10)),
         );
     }
 

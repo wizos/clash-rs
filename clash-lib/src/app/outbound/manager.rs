@@ -40,8 +40,9 @@ use crate::{
         },
     },
     config::internal::proxy::{
-        OutboundGroupProtocol, OutboundGroupSelection, OutboundProxyProtocol,
-        OutboundProxyProviderDef, PROXY_DIRECT, PROXY_GLOBAL, PROXY_REJECT,
+        DEFAULT_LATENCY_TEST_URL, OutboundGroupProtocol, OutboundGroupSelection,
+        OutboundProxyProtocol, OutboundProxyProviderDef, PROXY_COMPATIBLE,
+        PROXY_DIRECT, PROXY_GLOBAL, PROXY_REJECT,
     },
     proxy::{
         AnyOutboundHandler, anytls,
@@ -74,8 +75,6 @@ pub struct OutboundManager {
     proxy_manager: ProxyManager,
     selector_control: HashMap<String, ThreadSafeSelectorControl>,
 }
-
-static DEFAULT_LATENCY_TEST_URL: &str = "http://www.gstatic.com/generate_204";
 
 pub type ThreadSafeOutboundManager = Arc<OutboundManager>;
 
@@ -720,6 +719,9 @@ impl OutboundManager {
                 .cmp(&proxy_names.iter().position(|x| &x == b))
         });
         for name in keys {
+            if name == PROXY_COMPATIBLE {
+                continue;
+            }
             g.push(handlers.get(name).unwrap().clone());
         }
         let hc = HealthCheck::new(
@@ -793,6 +795,7 @@ impl OutboundManager {
             selection: &OutboundGroupSelection,
             interval: u64,
             lazy: bool,
+            health_check_url: &str,
             handlers: &HashMap<String, AnyOutboundHandler>,
             proxy_manager: &ProxyManager,
             provider_registry: &mut HashMap<String, ArcProxyProvider>,
@@ -807,6 +810,7 @@ impl OutboundManager {
                     proxies,
                     interval,
                     lazy,
+                    health_check_url,
                     handlers,
                     proxy_manager.clone(),
                     provider_registry,
@@ -847,11 +851,12 @@ impl OutboundManager {
             proxies: &[String],
             interval: u64,
             lazy: bool,
+            health_check_url: &str,
             handlers: &HashMap<String, AnyOutboundHandler>,
             proxy_manager: ProxyManager,
             provider_registry: &mut HashMap<String, ArcProxyProvider>,
         ) -> Result<ArcProxyProvider, Error> {
-            if name == PROXY_DIRECT || name == PROXY_REJECT {
+            if matches!(name, PROXY_DIRECT | PROXY_COMPATIBLE | PROXY_REJECT) {
                 return Err(Error::InvalidConfig(format!(
                     "proxy group name `{name}` is reserved"
                 )));
@@ -870,7 +875,7 @@ impl OutboundManager {
 
             let hc = HealthCheck::new(
                 proxies.clone(),
-                DEFAULT_LATENCY_TEST_URL.to_owned(),
+                health_check_url.to_owned(),
                 interval,
                 lazy,
                 proxy_manager,
@@ -898,6 +903,7 @@ impl OutboundManager {
                         &proto.selection,
                         0,
                         true,
+                        proto.url.as_deref().unwrap_or(DEFAULT_LATENCY_TEST_URL),
                         handlers,
                         proxy_manager,
                         provider_registry,
@@ -933,6 +939,7 @@ impl OutboundManager {
                         &proto.selection,
                         proto.interval,
                         proto.lazy.unwrap_or_default(),
+                        &proto.url,
                         handlers,
                         proxy_manager,
                         provider_registry,
@@ -960,7 +967,9 @@ impl OutboundManager {
                         proxy_manager.clone(),
                     );
 
-                    handlers.insert(proto.name.clone(), Arc::new(url_test));
+                    let url_test = Arc::new(url_test);
+                    handlers.insert(proto.name.clone(), url_test.clone());
+                    selector_control.insert(proto.name.clone(), url_test);
                 }
                 OutboundGroupProtocol::Fallback(proto) => {
                     let providers = build_group_providers(
@@ -970,6 +979,7 @@ impl OutboundManager {
                         &proto.selection,
                         proto.interval,
                         proto.lazy.unwrap_or_default(),
+                        &proto.url,
                         handlers,
                         proxy_manager,
                         provider_registry,
@@ -982,22 +992,21 @@ impl OutboundManager {
                         continue;
                     }
 
-                    handlers.insert(
-                        proto.name.clone(),
-                        Arc::new(fallback::Handler::new(
-                            fallback::HandlerOptions {
-                                name: proto.name.clone(),
-                                common_opts: crate::proxy::HandlerCommonOptions {
-                                    icon: proto.icon.clone(),
-                                    url: Some(proto.url.clone()),
-                                    connector: None,
-                                },
-                                ..Default::default()
+                    let fallback = Arc::new(fallback::Handler::new(
+                        fallback::HandlerOptions {
+                            name: proto.name.clone(),
+                            common_opts: crate::proxy::HandlerCommonOptions {
+                                icon: proto.icon.clone(),
+                                url: Some(proto.url.clone()),
+                                connector: None,
                             },
-                            providers,
-                            proxy_manager.clone(),
-                        )),
-                    );
+                            ..Default::default()
+                        },
+                        providers,
+                        proxy_manager.clone(),
+                    ));
+                    handlers.insert(proto.name.clone(), fallback.clone());
+                    selector_control.insert(proto.name.clone(), fallback);
                 }
                 OutboundGroupProtocol::LoadBalance(proto) => {
                     let providers = build_group_providers(
@@ -1007,6 +1016,7 @@ impl OutboundManager {
                         &proto.selection,
                         proto.interval,
                         proto.lazy.unwrap_or_default(),
+                        &proto.url,
                         handlers,
                         proxy_manager,
                         provider_registry,
@@ -1044,6 +1054,7 @@ impl OutboundManager {
                         &proto.selection,
                         0,
                         true,
+                        proto.url.as_deref().unwrap_or(DEFAULT_LATENCY_TEST_URL),
                         handlers,
                         proxy_manager,
                         provider_registry,
@@ -1085,6 +1096,7 @@ impl OutboundManager {
                         &proto.selection,
                         0,
                         proto.lazy.unwrap_or_default(),
+                        proto.url.as_deref().unwrap_or(DEFAULT_LATENCY_TEST_URL),
                         handlers,
                         proxy_manager,
                         provider_registry,

@@ -10,8 +10,14 @@ use std::{
 use uuid::Uuid;
 
 pub const PROXY_DIRECT: &str = "DIRECT";
+pub const PROXY_COMPATIBLE: &str = "COMPATIBLE";
 pub const PROXY_REJECT: &str = "REJECT";
 pub const PROXY_GLOBAL: &str = "GLOBAL";
+pub const DEFAULT_LATENCY_TEST_URL: &str = "http://www.gstatic.com/generate_204";
+
+fn default_latency_test_url() -> String {
+    DEFAULT_LATENCY_TEST_URL.to_owned()
+}
 
 #[allow(clippy::large_enum_variant)]
 pub enum OutboundProxy {
@@ -1258,6 +1264,7 @@ pub struct OutboundGroupUrlTest {
     #[serde(rename = "use")]
     pub use_provider: Option<Vec<String>>,
 
+    #[serde(default = "default_latency_test_url")]
     pub url: String,
     #[serde(deserialize_with = "utils::deserialize_u64")]
     pub interval: u64,
@@ -1275,6 +1282,7 @@ pub struct OutboundGroupFallback {
     #[serde(rename = "use")]
     pub use_provider: Option<Vec<String>>,
 
+    #[serde(default = "default_latency_test_url")]
     pub url: String,
     #[serde(deserialize_with = "utils::deserialize_u64")]
     pub interval: u64,
@@ -1292,6 +1300,7 @@ pub struct OutboundGroupLoadBalance {
     #[serde(rename = "use")]
     pub use_provider: Option<Vec<String>>,
 
+    #[serde(default = "default_latency_test_url")]
     pub url: String,
     #[serde(deserialize_with = "utils::deserialize_u64")]
     pub interval: u64,
@@ -1967,6 +1976,35 @@ mod anytls_tests {
         assert_eq!(config.idle_session_check_interval, Some(30));
         assert_eq!(config.idle_session_timeout, Some(300));
         assert_eq!(config.min_idle_session, Some(2));
+    }
+}
+
+#[cfg(test)]
+mod proxy_group_defaults_tests {
+    use super::{
+        DEFAULT_LATENCY_TEST_URL, OutboundGroupProtocol,
+        OutboundGroupProtocol::{Fallback, LoadBalance, UrlTest},
+    };
+
+    #[test]
+    fn defaults_mihomo_health_check_url_when_omitted() {
+        let groups = [
+            "name: auto\ntype: url-test\nproxies: [DIRECT]\ninterval: 300",
+            "name: fallback\ntype: fallback\nproxies: [DIRECT]\ninterval: 300",
+            "name: balance\ntype: load-balance\nproxies: [DIRECT]\ninterval: 300",
+        ];
+
+        for yaml in groups {
+            let group: OutboundGroupProtocol =
+                serde_yaml::from_str(yaml).expect("group without url should parse");
+            let url = match group {
+                UrlTest(group) => group.url,
+                Fallback(group) => group.url,
+                LoadBalance(group) => group.url,
+                _ => unreachable!(),
+            };
+            assert_eq!(url, DEFAULT_LATENCY_TEST_URL);
+        }
     }
 }
 

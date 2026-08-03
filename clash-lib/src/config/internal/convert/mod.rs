@@ -11,7 +11,7 @@ use crate::{
     config::{
         def,
         internal::{
-            proxy::{OutboundProxy, PROXY_DIRECT, PROXY_REJECT},
+            proxy::{OutboundProxy, PROXY_COMPATIBLE, PROXY_DIRECT, PROXY_REJECT},
             rule::RuleType,
         },
         proxy::{OutboundDirect, OutboundProxyProtocol, OutboundReject},
@@ -126,6 +126,14 @@ pub(super) fn convert(mut c: def::Config) -> Result<config::Config, crate::Error
                     )),
                 ),
                 (
+                    String::from(PROXY_COMPATIBLE),
+                    OutboundProxy::ProxyServer(OutboundProxyProtocol::Direct(
+                        OutboundDirect {
+                            name: PROXY_COMPATIBLE.to_string(),
+                        },
+                    )),
+                ),
+                (
                     String::from(PROXY_REJECT),
                     OutboundProxy::ProxyServer(OutboundProxyProtocol::Reject(
                         OutboundReject {
@@ -192,5 +200,23 @@ impl TryFrom<HashMap<String, Value>> for OutboundGroupProtocol {
             .to_owned();
         OutboundGroupProtocol::deserialize(MapDeserializer::new(mapping.into_iter()))
             .map_err(map_serde_error(name))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn converted_config_includes_compatible_outbound() {
+        let config = convert(def::Config::default()).unwrap();
+
+        assert!(config.proxies.contains_key(PROXY_COMPATIBLE));
+        assert!(
+            !config
+                .proxy_names
+                .iter()
+                .any(|name| name == PROXY_COMPATIBLE)
+        );
     }
 }
