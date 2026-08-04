@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::os::fd::{BorrowedFd, IntoRawFd};
 
 use futures::{FutureExt, SinkExt, StreamExt, future::BoxFuture};
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use url::Url;
@@ -40,6 +41,7 @@ pub struct TunRunner {
     resolver: ThreadSafeDNSResolver,
     cancellation_token: CancellationToken,
     task_handle: StdMutex<Option<tokio::task::JoinHandle<Result<(), Error>>>>,
+    ready_tx: StdMutex<Option<oneshot::Sender<Result<(), String>>>>,
 }
 
 impl TunRunner {
@@ -69,7 +71,21 @@ impl TunRunner {
             resolver,
             cancellation_token: cancellation_token.unwrap_or_default(),
             task_handle: StdMutex::new(None),
+            ready_tx: StdMutex::new(None),
         })
+    }
+
+    pub async fn start_and_wait(&self) -> Result<(), Error> {
+        if !self.cfg.enable {
+            return Ok(());
+        }
+        let (ready_tx, ready_rx) = oneshot::channel();
+        *self.ready_tx.lock().unwrap() = Some(ready_tx);
+        self.run_async();
+        ready_rx
+            .await
+            .map_err(|_| Error::Operation("tun startup task stopped".to_string()))?
+            .map_err(Error::Operation)
     }
 
     async fn new_internal(
@@ -335,28 +351,46 @@ impl Runner for TunRunner {
         let resolver = self.resolver.clone();
         let dns_hijack = self.cfg.dns_hijack;
         let cancellation_token = self.cancellation_token.clone();
+        let ready_tx = self.ready_tx.lock().unwrap().take();
 
         let handle = tokio::spawn(async move {
             let (tun, stack, mut tcp_listener, udp_socket) =
-                TunRunner::new_internal(&cfg)
-                    .await
-                    .inspect_err(|e| match e {
-                        Error::Io(e) => {
-                            if e.kind() == std::io::ErrorKind::PermissionDenied {
-                                error!(
-                                    "tun initialization failed: permission denied. \
-                                     Please make sure the program has the \
-                                     necessary permissions to create and manage \
-                                     TUN interfaces."
-                                );
-                            } else {
-                                error!("tun initialization I/O error: {}", e);
+                match TunRunner::new_internal(&cfg).await {
+                    Ok(value) => {
+                        if let Some(ready_tx) = ready_tx {
+                            let _ = ready_tx.send(Ok(()));
+                        }
+                        value
+                    }
+                    Err(error) => {
+                        match &error {
+                            Error::Io(error) => {
+                                if error.kind()
+                                    == std::io::ErrorKind::PermissionDenied
+                                {
+                                    error!(
+                                        "tun initialization failed: permission denied. \
+                                         Please make sure the program has the \
+                                         necessary permissions to create and manage \
+                                         TUN interfaces."
+                                    );
+                                } else {
+                                    error!(
+                                        "tun initialization I/O error: {}",
+                                        error
+                                    );
+                                }
+                            }
+                            _ => {
+                                error!("tun initialization error: {}", error);
                             }
                         }
-                        _ => {
-                            error!("tun initialization error: {}", e);
+                        if let Some(ready_tx) = ready_tx {
+                            let _ = ready_tx.send(Err(error.to_string()));
                         }
-                    })?;
+                        return Err(error);
+                    }
+                };
 
             let framed = tun_rs::async_framed::DeviceFramed::new(
                 tun,

@@ -36,6 +36,11 @@ use std::{
     path::PathBuf,
     sync::{Arc, OnceLock},
 };
+#[cfg(feature = "tun")]
+use std::{
+    sync::{LazyLock, Mutex as StdMutex, mpsc as std_mpsc},
+    time::{Duration, Instant},
+};
 use thiserror::Error;
 use tokio::sync::{Mutex, broadcast, mpsc};
 use tracing::{debug, error, info, warn};
@@ -80,6 +85,99 @@ pub enum Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 type ArcRunner = Arc<dyn Runner>;
+
+#[cfg(feature = "tun")]
+struct RuntimeTunCommand {
+    config: config::internal::config::TunConfig,
+    result: std_mpsc::SyncSender<Result<()>>,
+}
+
+#[cfg(feature = "tun")]
+static RUNTIME_TUN_CONTROL: LazyLock<
+    StdMutex<Option<mpsc::UnboundedSender<RuntimeTunCommand>>>,
+> = LazyLock::new(|| StdMutex::new(None));
+#[cfg(feature = "tun")]
+const RUNTIME_TUN_START_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[cfg(feature = "tun")]
+fn external_tun_config(
+    fd: i32,
+    addresses: &str,
+    dns: &str,
+) -> Result<config::internal::config::TunConfig> {
+    if fd <= 0 {
+        return Err(Error::InvalidConfig(format!("invalid tun fd: {fd}")));
+    }
+
+    let mut gateway = None;
+    let mut gateway_v6 = None;
+    for address in addresses
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        match address.parse::<ipnet::IpNet>()? {
+            ipnet::IpNet::V4(value) if gateway.is_none() => gateway = Some(value),
+            ipnet::IpNet::V6(value) if gateway_v6.is_none() => {
+                gateway_v6 = Some(value)
+            }
+            _ => {}
+        }
+    }
+
+    Ok(config::internal::config::TunConfig {
+        enable: true,
+        device_id: format!("fd://{fd}"),
+        gateway: gateway.ok_or_else(|| {
+            Error::InvalidConfig("tun requires an IPv4 address".to_string())
+        })?,
+        gateway_v6,
+        dns_hijack: !dns.trim().is_empty(),
+        ..Default::default()
+    })
+}
+
+#[cfg(feature = "tun")]
+fn replace_runtime_tun(config: config::internal::config::TunConfig) -> Result<()> {
+    let sender = RUNTIME_TUN_CONTROL
+        .lock()
+        .map_err(|_| {
+            Error::Operation("runtime TUN control is poisoned".to_string())
+        })?
+        .clone()
+        .ok_or_else(|| {
+            Error::Operation("runtime TUN control is unavailable".to_string())
+        })?;
+    let (result_tx, result_rx) = std_mpsc::sync_channel(1);
+    sender
+        .send(RuntimeTunCommand {
+            config,
+            result: result_tx,
+        })
+        .map_err(|_| Error::Operation("runtime TUN control stopped".to_string()))?;
+    result_rx
+        .recv_timeout(RUNTIME_TUN_START_TIMEOUT + Duration::from_secs(2))
+        .map_err(|error| {
+            Error::Operation(format!("runtime TUN response failed: {error}"))
+        })?
+}
+
+#[cfg(feature = "tun")]
+pub fn attach_external_tun(fd: i32, addresses: &str, dns: &str) -> Result<()> {
+    replace_runtime_tun(external_tun_config(fd, addresses, dns)?)
+}
+
+#[cfg(feature = "tun")]
+pub fn detach_external_tun() -> Result<()> {
+    replace_runtime_tun(config::internal::config::TunConfig::default())
+}
+
+enum RuntimeEvent {
+    Shutdown,
+    Reload(Option<(u64, Config)>),
+    #[cfg(feature = "tun")]
+    Tun(Option<RuntimeTunCommand>),
+}
 
 pub struct Options {
     pub config: Config,
@@ -343,25 +441,46 @@ pub async fn start(
 
     let cwd_clone = cwd.clone();
 
+    #[cfg(feature = "tun")]
+    let (runtime_tun_tx, mut runtime_tun_rx) = mpsc::unbounded_channel();
+    #[cfg(feature = "tun")]
+    {
+        *RUNTIME_TUN_CONTROL.lock().unwrap() = Some(runtime_tun_tx.clone());
+    }
+
     let reload_token = shutdown_token.child_token();
     let reload_handle = tokio::spawn(async move {
         let mut components = components;
         // Listen for config reload signal and reload config
         loop {
-            let next = tokio::select! {
-                _ = reload_token.cancelled() => {
+            #[cfg(feature = "tun")]
+            let event = tokio::select! {
+                _ = reload_token.cancelled() => RuntimeEvent::Shutdown,
+                next = reload_rx.recv() => RuntimeEvent::Reload(next),
+                command = runtime_tun_rx.recv() => RuntimeEvent::Tun(command),
+            };
+            #[cfg(not(feature = "tun"))]
+            let event = tokio::select! {
+                _ = reload_token.cancelled() => RuntimeEvent::Shutdown,
+                next = reload_rx.recv() => RuntimeEvent::Reload(next),
+            };
+            let (reload_attempt, config) = match event {
+                RuntimeEvent::Shutdown | RuntimeEvent::Reload(None) => {
                     api_listener.shutdown();
                     components.stop_all().await;
                     api_listener.join().await.ok();
                     break;
                 }
-                next = reload_rx.recv() => next,
-            };
-            let Some((reload_attempt, config)) = next else {
-                api_listener.shutdown();
-                components.stop_all().await;
-                api_listener.join().await.ok();
-                break;
+                RuntimeEvent::Reload(Some(value)) => value,
+                #[cfg(feature = "tun")]
+                RuntimeEvent::Tun(Some(command)) => {
+                    let result =
+                        components.replace_tun(command.config, &global_state).await;
+                    let _ = command.result.send(result);
+                    continue;
+                }
+                #[cfg(feature = "tun")]
+                RuntimeEvent::Tun(None) => continue,
             };
             info!("reloading config");
             {
@@ -468,6 +587,16 @@ pub async fn start(
     reload_handle.await.map_err(|error| {
         Error::Operation(format!("reload task join failed: {error}"))
     })??;
+    #[cfg(feature = "tun")]
+    {
+        let mut control = RUNTIME_TUN_CONTROL.lock().unwrap();
+        if control
+            .as_ref()
+            .is_some_and(|current| current.same_channel(&runtime_tun_tx))
+        {
+            *control = None;
+        }
+    }
     Ok(())
 }
 
@@ -488,6 +617,56 @@ struct RuntimeComponents {
 }
 
 impl RuntimeComponents {
+    #[cfg(feature = "tun")]
+    async fn replace_tun(
+        &mut self,
+        config: config::internal::config::TunConfig,
+        global_state: &Arc<Mutex<GlobalState>>,
+    ) -> Result<()> {
+        let enabled = config.enable;
+        let started = Instant::now();
+        let runner = Arc::new(tun::TunRunner::new(
+            config,
+            self.dispatcher.clone(),
+            self.dns_resolver.clone(),
+            None,
+        )?);
+        let replacement: ArcRunner = runner.clone();
+        let previous = std::mem::replace(&mut self.tun_runner, replacement.clone());
+        global_state.lock().await.tunnel_runner = replacement;
+
+        previous.shutdown();
+        if let Err(error) = previous.join().await {
+            warn!("previous TUN runner stopped with error: {error}");
+        }
+
+        let result = match tokio::time::timeout(
+            RUNTIME_TUN_START_TIMEOUT,
+            runner.start_and_wait(),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                runner.shutdown();
+                Err(Error::Operation("TUN startup timed out".to_string()))
+            }
+        };
+        match &result {
+            Ok(()) => info!(
+                "runtime TUN {} in {}ms",
+                if enabled { "attached" } else { "detached" },
+                started.elapsed().as_millis(),
+            ),
+            Err(error) => error!(
+                "runtime TUN {} failed after {}ms: {error}",
+                if enabled { "attach" } else { "detach" },
+                started.elapsed().as_millis(),
+            ),
+        }
+        result
+    }
+
     fn start_all(&self) {
         #[cfg(feature = "tun")]
         self.tun_runner.run_async();
@@ -867,5 +1046,27 @@ mod tests {
         });
 
         handle.join().unwrap();
+    }
+
+    #[cfg(feature = "tun")]
+    #[test]
+    fn builds_external_tun_from_flclash_android_arguments() {
+        let config = crate::external_tun_config(
+            42,
+            "172.19.0.1/30,fdfe:dcba:9876::1/126",
+            "172.19.0.2,fdfe:dcba:9876::2",
+        )
+        .unwrap();
+
+        assert!(config.enable);
+        assert_eq!(config.device_id, "fd://42");
+        assert_eq!(config.gateway.to_string(), "172.19.0.1/30");
+        assert_eq!(
+            config.gateway_v6.map(|value| value.to_string()).as_deref(),
+            Some("fdfe:dcba:9876::1/126"),
+        );
+        assert!(config.dns_hijack);
+        assert!(!config.route_all);
+        assert!(crate::external_tun_config(0, "172.19.0.1/30", "").is_err());
     }
 }

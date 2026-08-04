@@ -91,6 +91,48 @@ pub extern "C" fn clash_clear_android_process_resolver() {
     clash_lib::process_resolver::clear_android_resolver();
 }
 
+/// Attach an application-owned TUN descriptor to the running clash instance.
+///
+/// Unlike a config reload, this replaces only the TUN runner and keeps DNS,
+/// providers, outbounds, routing state, and the controller alive.
+///
+/// # Safety
+/// `addresses` and `dns` must point to valid NUL-terminated UTF-8 strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn clash_attach_tun(
+    fd: c_int,
+    addresses: *const c_char,
+    dns: *const c_char,
+) -> c_int {
+    if addresses.is_null() || dns.is_null() {
+        return 0;
+    }
+    let Ok(addresses) = unsafe { CStr::from_ptr(addresses) }.to_str() else {
+        return 0;
+    };
+    let Ok(dns) = unsafe { CStr::from_ptr(dns) }.to_str() else {
+        return 0;
+    };
+    match clash_lib::attach_external_tun(fd, addresses, dns) {
+        Ok(()) => 1,
+        Err(error) => {
+            eprintln!("failed to attach external TUN: {error}");
+            0
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn clash_detach_tun() -> c_int {
+    match clash_lib::detach_external_tun() {
+        Ok(()) => 1,
+        Err(error) => {
+            eprintln!("failed to detach external TUN: {error}");
+            0
+        }
+    }
+}
+
 /// # Safety
 /// This function is unsafe because it dereferences raw pointers.
 #[unsafe(no_mangle)]
