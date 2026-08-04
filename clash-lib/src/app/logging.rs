@@ -10,8 +10,11 @@ use opentelemetry_semantic_conventions::{
     attribute::{DEPLOYMENT_ENVIRONMENT_NAME, SERVICE_VERSION},
 };
 use serde::Serialize;
-use std::{io::IsTerminal, sync::Once};
-use tokio::sync::broadcast::Sender;
+use std::{
+    io::IsTerminal,
+    sync::{LazyLock, Once},
+};
+use tokio::sync::broadcast::{self, Receiver, Sender};
 use tracing::level_filters::LevelFilter;
 use tracing_log::LogTracer;
 #[cfg(feature = "telemetry")]
@@ -41,6 +44,13 @@ pub struct LogEvent {
     pub level: LogLevel,
     #[serde(rename = "payload")]
     pub msg: String,
+}
+
+static LOG_EVENTS: LazyLock<Sender<LogEvent>> =
+    LazyLock::new(|| broadcast::channel(512).0);
+
+pub fn subscribe() -> Receiver<LogEvent> {
+    LOG_EVENTS.subscribe()
 }
 
 pub struct EventCollector(Vec<Sender<LogEvent>>);
@@ -73,6 +83,8 @@ where
             },
             msg: strs.join(" "),
         };
+        let _ = LOG_EVENTS.send(event.clone());
+        crate::app::events::emit_app("log", &event);
         for tx in &self.0 {
             _ = tx.send(event.clone());
         }
@@ -199,18 +211,6 @@ fn setup_logging_inner(
 
     let subscriber = tracing_subscriber::registry();
 
-    // Collect and expose data about the Tokio runtime (tasks, threads, resources,
-    // etc.) — gated on tokio_unstable because console_subscriber panics at
-    // runtime if Tokio was compiled without --cfg tokio_unstable. When tests
-    // are run with RUSTFLAGS="--cfg docker_test", that env-var overrides
-    // .cargo/config.toml, so tokio_unstable is absent and the gate correctly
-    // excludes this code.
-    #[cfg(all(feature = "telemetry", tokio_unstable))]
-    let subscriber = subscriber.with(console_subscriber::spawn());
-    #[cfg(all(feature = "telemetry", tokio_unstable))]
-    let filter = filter
-        .add_directive("tokio=trace".parse().unwrap())
-        .add_directive("runtime=trace".parse().unwrap());
     let exclude = filter_fn(|metadata| {
         !metadata.target().contains("tokio")
             && !metadata.target().contains("runtime")

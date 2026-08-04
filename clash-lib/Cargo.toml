@@ -237,7 +237,6 @@ quinn-proto = { version = "0.11", default-features = false }
 blake2 = "0.10.6"
 digest = "0.11.3"
 
-console-subscriber = { git = "https://github.com/tokio-rs/console.git" }
 criterion = { version = "0.8", features = ["html_reports", "async_tokio"], optional = true }
 memory-stats = "1.0.0"
 

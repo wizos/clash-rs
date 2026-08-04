@@ -31,6 +31,7 @@ use crate::{
     runner::Runner,
 };
 
+use std::sync::{Mutex as StdMutex, mpsc as std_mpsc};
 use std::{
     io,
     path::PathBuf,
@@ -38,7 +39,7 @@ use std::{
 };
 #[cfg(feature = "tun")]
 use std::{
-    sync::{LazyLock, Mutex as StdMutex, mpsc as std_mpsc},
+    sync::LazyLock,
     time::{Duration, Instant},
 };
 use thiserror::Error;
@@ -96,6 +97,17 @@ struct RuntimeTunCommand {
 static RUNTIME_TUN_CONTROL: LazyLock<
     StdMutex<Option<mpsc::UnboundedSender<RuntimeTunCommand>>>,
 > = LazyLock::new(|| StdMutex::new(None));
+
+struct RuntimeControllerCommand {
+    method: String,
+    path: String,
+    body: Option<String>,
+    result: std_mpsc::SyncSender<Result<app::api::ControllerResponse>>,
+}
+
+static RUNTIME_CONTROLLER: std::sync::LazyLock<
+    StdMutex<Option<mpsc::UnboundedSender<RuntimeControllerCommand>>>,
+> = std::sync::LazyLock::new(|| StdMutex::new(None));
 #[cfg(feature = "tun")]
 const RUNTIME_TUN_START_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -172,9 +184,39 @@ pub fn detach_external_tun() -> Result<()> {
     replace_runtime_tun(config::internal::config::TunConfig::default())
 }
 
+pub fn controller_request(
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+    timeout: std::time::Duration,
+) -> Result<app::api::ControllerResponse> {
+    let sender = RUNTIME_CONTROLLER
+        .lock()
+        .map_err(|_| Error::Operation("runtime controller is poisoned".to_owned()))?
+        .clone()
+        .ok_or_else(|| {
+            Error::Operation("runtime controller is unavailable".to_owned())
+        })?;
+    let (result_tx, result_rx) = std_mpsc::sync_channel(1);
+    sender
+        .send(RuntimeControllerCommand {
+            method: method.to_owned(),
+            path: path.to_owned(),
+            body: body.map(str::to_owned),
+            result: result_tx,
+        })
+        .map_err(|_| Error::Operation("runtime controller stopped".to_owned()))?;
+    result_rx
+        .recv_timeout(timeout + std::time::Duration::from_secs(1))
+        .map_err(|error| {
+            Error::Operation(format!("runtime controller response failed: {error}"))
+        })?
+}
+
 enum RuntimeEvent {
     Shutdown,
     Reload(Option<(u64, Config)>),
+    Controller(Option<RuntimeControllerCommand>),
     #[cfg(feature = "tun")]
     Tun(Option<RuntimeTunCommand>),
 }
@@ -314,9 +356,13 @@ pub fn start_scaffold_instance(
     let config: InternalConfig = opts.config.try_parse()?;
     let cwd = opts.cwd.unwrap_or_else(|| ".".to_string());
     let rt_kind = opts.rt.unwrap_or(TokioRuntime::MultiThread);
+    let log_file = opts.log_file.filter(|path| !path.is_empty());
 
     let token = tokio_util::sync::CancellationToken::new();
     let token_clone = token.clone();
+    let (ready_tx, ready_rx) =
+        std_mpsc::sync_channel::<std::result::Result<(), String>>(1);
+    let startup_tx = ready_tx.clone();
 
     let handle = std::thread::spawn(move || {
         let rt = match rt_kind {
@@ -330,15 +376,41 @@ pub fn start_scaffold_instance(
         .expect("Failed to build runtime");
 
         let (log_tx, _) = tokio::sync::broadcast::channel(100);
+        let log_collector = app::logging::EventCollector::new(vec![log_tx.clone()]);
+        app::logging::setup_logging(
+            config.general.log_level,
+            log_collector,
+            &cwd,
+            log_file,
+        );
 
-        if let Err(e) =
-            rt.block_on(start(config, cwd, config_path, log_tx, token_clone))
-        {
+        let result = rt.block_on(start_runtime(
+            config,
+            cwd,
+            config_path,
+            log_tx,
+            token_clone,
+            Some(startup_tx),
+        ));
+        if let Err(e) = result {
+            let _ = ready_tx.try_send(Err(e.to_string()));
             eprintln!("Clash instance error: {}", e);
         }
     });
 
-    Ok((handle, token))
+    match ready_rx.recv() {
+        Ok(Ok(())) => Ok((handle, token)),
+        Ok(Err(error)) => {
+            let _ = handle.join();
+            Err(Error::Operation(error))
+        }
+        Err(error) => {
+            let _ = handle.join();
+            Err(Error::Operation(format!(
+                "clash runtime stopped before startup completed: {error}"
+            )))
+        }
+    }
 }
 
 static SHUTDOWN_TOKEN: std::sync::Mutex<Vec<tokio_util::sync::CancellationToken>> =
@@ -380,6 +452,17 @@ pub async fn start(
     log_tx: broadcast::Sender<LogEvent>,
     shutdown_token: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
+    start_runtime(config, cwd, config_path, log_tx, shutdown_token, None).await
+}
+
+async fn start_runtime(
+    config: InternalConfig,
+    cwd: String,
+    config_path: Option<String>,
+    log_tx: broadcast::Sender<LogEvent>,
+    shutdown_token: tokio_util::sync::CancellationToken,
+    startup_tx: Option<std_mpsc::SyncSender<std::result::Result<(), String>>>,
+) -> Result<()> {
     setup_default_crypto_provider();
 
     let cwd = PathBuf::from(cwd);
@@ -407,7 +490,7 @@ pub async fn start(
         config_path,
     }));
 
-    let mut api_listener: ArcRunner = Arc::new(app::api::ApiRunner::new(
+    let mut api_listener = Arc::new(app::api::ApiRunner::new(
         controller_cfg.clone(),
         log_tx.clone(),
         components.inbound_manager.clone(),
@@ -439,6 +522,10 @@ pub async fn start(
 
     components.start_all();
 
+    let (runtime_controller_tx, mut runtime_controller_rx) =
+        mpsc::unbounded_channel();
+    *RUNTIME_CONTROLLER.lock().unwrap() = Some(runtime_controller_tx.clone());
+
     let cwd_clone = cwd.clone();
 
     #[cfg(feature = "tun")]
@@ -457,12 +544,14 @@ pub async fn start(
             let event = tokio::select! {
                 _ = reload_token.cancelled() => RuntimeEvent::Shutdown,
                 next = reload_rx.recv() => RuntimeEvent::Reload(next),
+                command = runtime_controller_rx.recv() => RuntimeEvent::Controller(command),
                 command = runtime_tun_rx.recv() => RuntimeEvent::Tun(command),
             };
             #[cfg(not(feature = "tun"))]
             let event = tokio::select! {
                 _ = reload_token.cancelled() => RuntimeEvent::Shutdown,
                 next = reload_rx.recv() => RuntimeEvent::Reload(next),
+                command = runtime_controller_rx.recv() => RuntimeEvent::Controller(command),
             };
             let (reload_attempt, config) = match event {
                 RuntimeEvent::Shutdown | RuntimeEvent::Reload(None) => {
@@ -472,6 +561,17 @@ pub async fn start(
                     break;
                 }
                 RuntimeEvent::Reload(Some(value)) => value,
+                RuntimeEvent::Controller(Some(command)) => {
+                    let controller = api_listener.clone();
+                    tokio::spawn(async move {
+                        let result = controller
+                            .request(&command.method, &command.path, command.body)
+                            .await;
+                        let _ = command.result.send(result);
+                    });
+                    continue;
+                }
+                RuntimeEvent::Controller(None) => continue,
                 #[cfg(feature = "tun")]
                 RuntimeEvent::Tun(Some(command)) => {
                     let result =
@@ -534,7 +634,7 @@ pub async fn start(
             // maybe adding APIs to replace components
             // and only recreate the listeners when necessary (e.g. when the listen
             // address or port is changed)
-            let new_api_listener: ArcRunner = Arc::new(app::api::ApiRunner::new(
+            let new_api_listener = Arc::new(app::api::ApiRunner::new(
                 controller_cfg,
                 log_tx.clone(),
                 new_components.inbound_manager.clone(),
@@ -579,6 +679,10 @@ pub async fn start(
         Ok::<(), Error>(())
     });
 
+    if let Some(startup_tx) = startup_tx {
+        let _ = startup_tx.send(Ok(()));
+    }
+
     tokio::select! {
         result = tokio::signal::ctrl_c() => { result.map_err(Error::Io)?; }
         _ = shutdown_token.cancelled() => {}
@@ -593,6 +697,15 @@ pub async fn start(
         if control
             .as_ref()
             .is_some_and(|current| current.same_channel(&runtime_tun_tx))
+        {
+            *control = None;
+        }
+    }
+    {
+        let mut control = RUNTIME_CONTROLLER.lock().unwrap();
+        if control
+            .as_ref()
+            .is_some_and(|current| current.same_channel(&runtime_controller_tx))
         {
             *control = None;
         }

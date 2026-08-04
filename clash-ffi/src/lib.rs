@@ -6,12 +6,23 @@ use std::{
     path::PathBuf,
     sync::{LazyLock, Mutex},
     thread::JoinHandle,
+    time::Duration,
 };
 use tokio_util::sync::CancellationToken;
 
-static RUNNING_INSTANCE: LazyLock<
-    Mutex<Option<(JoinHandle<()>, CancellationToken)>>,
-> = LazyLock::new(|| Mutex::new(None));
+struct RunningInstance {
+    runtime_handle: JoinHandle<()>,
+    event_handle: JoinHandle<()>,
+    token: CancellationToken,
+    event_token: CancellationToken,
+}
+
+type EventCallback = unsafe extern "C" fn(*const c_char);
+
+static RUNNING_INSTANCE: LazyLock<Mutex<Option<RunningInstance>>> =
+    LazyLock::new(|| Mutex::new(None));
+static EVENT_CALLBACK: LazyLock<Mutex<Option<EventCallback>>> =
+    LazyLock::new(|| Mutex::new(None));
 static PANIC_REPORT_PATH: LazyLock<Mutex<Option<PathBuf>>> =
     LazyLock::new(|| Mutex::new(None));
 static PANIC_REPORTER: std::sync::Once = std::sync::Once::new();
@@ -58,12 +69,50 @@ pub unsafe extern "C" fn clash_initialize_android_context(
 }
 
 fn stop_running_instance() -> bool {
-    let Some((handle, token)) = RUNNING_INSTANCE.lock().unwrap().take() else {
+    let Some(instance) = RUNNING_INSTANCE.lock().unwrap().take() else {
         return false;
     };
-    token.cancel();
-    let _ = handle.join();
+    instance.token.cancel();
+    instance.event_token.cancel();
+    let _ = instance.runtime_handle.join();
+    let _ = instance.event_handle.join();
     true
+}
+
+fn start_event_forwarder(token: CancellationToken) -> JoinHandle<()> {
+    let mut receiver = clash_lib::app::events::subscribe_app();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build event forwarding runtime");
+        runtime.block_on(async move {
+            loop {
+                let event = tokio::select! {
+                    _ = token.cancelled() => break,
+                    event = receiver.recv() => event,
+                };
+                let event = match event {
+                    Ok(event) => event,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
+                let Some(callback) = *EVENT_CALLBACK.lock().unwrap() else {
+                    continue;
+                };
+                if let Ok(event) = CString::new(event) {
+                    unsafe { callback(event.as_ptr()) };
+                }
+            }
+        });
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn clash_set_event_callback(callback: Option<EventCallback>) {
+    *EVENT_CALLBACK.lock().unwrap() = callback;
 }
 
 /// Register FlClash's Android `VpnService` flow-to-package callback.
@@ -133,6 +182,46 @@ pub extern "C" fn clash_detach_tun() -> c_int {
     }
 }
 
+/// Execute a controller request in the running core without opening a local
+/// TCP connection. The returned JSON contains `status`, `body`, and `error`.
+///
+/// # Safety
+/// `method` and `path` must be valid NUL-terminated UTF-8 strings. `body` may
+/// be null when the request has no payload.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn clash_controller_request(
+    method: *const c_char,
+    path: *const c_char,
+    body: *const c_char,
+    timeout_ms: u64,
+) -> *mut c_char {
+    let method = unsafe { CStr::from_ptr(method) }.to_string_lossy();
+    let path = unsafe { CStr::from_ptr(path) }.to_string_lossy();
+    let body = if body.is_null() {
+        None
+    } else {
+        Some(unsafe { CStr::from_ptr(body) }.to_string_lossy())
+    };
+    let result = match clash_lib::controller_request(
+        &method,
+        &path,
+        body.as_deref(),
+        Duration::from_millis(timeout_ms),
+    ) {
+        Ok(response) => serde_json::json!({
+            "status": response.status,
+            "body": response.body,
+            "error": "",
+        }),
+        Err(error) => serde_json::json!({
+            "status": 0,
+            "body": "",
+            "error": error.to_string(),
+        }),
+    };
+    CString::new(result.to_string()).unwrap().into_raw()
+}
+
 /// # Safety
 /// This function is unsafe because it dereferences raw pointers.
 #[unsafe(no_mangle)]
@@ -166,12 +255,23 @@ pub unsafe extern "C" fn clash_start(
         };
 
         stop_running_instance();
+        let event_token = CancellationToken::new();
+        let event_handle = start_event_forwarder(event_token.clone());
         match start_scaffold_instance(options) {
-            Ok(instance) => {
-                *RUNNING_INSTANCE.lock().unwrap() = Some(instance);
+            Ok((runtime_handle, token)) => {
+                *RUNNING_INSTANCE.lock().unwrap() = Some(RunningInstance {
+                    runtime_handle,
+                    event_handle,
+                    token,
+                    event_token,
+                });
                 CString::new("").unwrap().into_raw()
             }
-            Err(e) => CString::new(format!("Error: {e}")).unwrap().into_raw(),
+            Err(e) => {
+                event_token.cancel();
+                let _ = event_handle.join();
+                CString::new(format!("Error: {e}")).unwrap().into_raw()
+            }
         }
     }
 }
@@ -235,7 +335,10 @@ pub unsafe extern "C" fn clash_free_string(s: *mut c_char) {
 
 #[cfg(test)]
 mod tests {
-    use super::{clash_free_string, clash_shutdown, clash_start, clash_validate};
+    use super::{
+        clash_controller_request, clash_free_string, clash_shutdown, clash_start,
+        clash_validate,
+    };
     use std::ffi::{CStr, CString};
 
     #[test]
@@ -246,7 +349,6 @@ mod tests {
         let config = CString::new(
             r#"
 mixed-port: 0
-external-controller: 127.0.0.1:0
 dns:
   enable: false
 rules:
@@ -265,6 +367,24 @@ rules:
         assert!(message.is_empty(), "{message}");
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
         unsafe { clash_free_string(result) };
+
+        let method = CString::new("GET").unwrap();
+        let path = CString::new("/configs").unwrap();
+        let response_ptr = unsafe {
+            clash_controller_request(
+                method.as_ptr(),
+                path.as_ptr(),
+                std::ptr::null(),
+                2_000,
+            )
+        };
+        let response: serde_json::Value = serde_json::from_str(
+            unsafe { CStr::from_ptr(response_ptr) }.to_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(response["status"], 200);
+        assert!(response["error"].as_str().unwrap().is_empty());
+        unsafe { clash_free_string(response_ptr) };
 
         let restarted = std::time::Instant::now();
         let replacement =

@@ -13,7 +13,7 @@ mod runner;
 mod tcp;
 mod websocket;
 
-pub use runner::ApiRunner;
+pub use runner::{ApiRunner, ControllerResponse};
 
 pub struct AppState {
     pub log_source_tx: Sender<LogEvent>,

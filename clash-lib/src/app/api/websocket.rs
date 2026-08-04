@@ -162,13 +162,13 @@ pub async fn memory(
 
 pub async fn log(
     ws: WebSocketUpgrade,
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
     ws.on_failed_upgrade(move |e| {
         warn!("ws upgrade error: {}", e);
     })
     .on_upgrade(move |mut socket| async move {
-        let mut rx = state.log_source_tx.subscribe();
+        let mut rx = crate::app::logging::subscribe();
         while let Ok(evt) = rx.recv().await {
             let res = match serde_json::to_string(&evt) {
                 Ok(s) => s,

@@ -1,16 +1,18 @@
 use std::{
     path::PathBuf,
-    sync::{Arc, Mutex as StdMutex},
+    sync::{Arc, Mutex as StdMutex, OnceLock},
 };
 
 use axum::{
-    Router, middleware,
+    Router,
+    body::{Body, to_bytes},
+    middleware,
     response::Redirect,
     routing::{get, post},
 };
-use http::{Method, header};
+use http::{Method, Request, header};
 use tokio::sync::{Mutex, broadcast::Sender};
-use tower::ServiceBuilder;
+use tower::{ServiceBuilder, ServiceExt};
 use tower_http::{
     cors::{AllowOrigin, Any, CorsLayer},
     services::ServeDir,
@@ -51,6 +53,13 @@ pub struct ApiRunner {
     dns_listen_addr: DNSListenAddr,
     dns_enabled: bool,
     task_handle: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+    local_router: OnceLock<Router>,
+}
+
+#[derive(Debug)]
+pub struct ControllerResponse {
+    pub status: u16,
+    pub body: String,
 }
 
 impl ApiRunner {
@@ -87,24 +96,110 @@ impl ApiRunner {
             dns_listen_addr,
             dns_enabled,
             task_handle: StdMutex::new(None),
+            local_router: OnceLock::new(),
         }
+    }
+
+    fn build_api_router(&self) -> Router {
+        let app_state = Arc::new(AppState {
+            log_source_tx: self.log_source.clone(),
+            statistics_manager: self.statistics_manager.clone(),
+        });
+
+        Router::new()
+            .route("/", get(handlers::hello::handle))
+            .route("/logs", get(handlers::log::handle))
+            .route("/traffic", get(handlers::traffic::handle))
+            .route("/user-stats", get(handlers::user_stats::handle))
+            .route("/version", get(handlers::version::handle))
+            .route("/memory", get(handlers::memory::handle))
+            .route("/restart", post(handlers::restart::handle))
+            .nest("/ws", websocket::routes(app_state.clone()))
+            .nest(
+                "/configs",
+                handlers::config::routes(
+                    self.inbound_manager.clone(),
+                    self.dispatcher.clone(),
+                    self.global_state.clone(),
+                    self.dns_resolver.clone(),
+                    self.dns_listen_addr.clone(),
+                    self.dns_enabled,
+                    self.outbound_manager.clone(),
+                ),
+            )
+            .nest("/rules", handlers::rule::routes(self.router.clone()))
+            .nest(
+                "/group",
+                handlers::group::routes(self.outbound_manager.clone()),
+            )
+            .nest(
+                "/proxies",
+                handlers::proxy::routes(
+                    self.outbound_manager.clone(),
+                    self.cache_store.clone(),
+                ),
+            )
+            .nest(
+                "/providers/proxies",
+                handlers::provider::routes(self.outbound_manager.clone()),
+            )
+            .nest(
+                "/providers/rules",
+                handlers::provider::rule_routes(self.router.clone()),
+            )
+            .nest(
+                "/connections",
+                handlers::connection::routes(self.statistics_manager.clone()),
+            )
+            .nest(
+                "/flows",
+                handlers::flows::routes(self.statistics_manager.clone()),
+            )
+            .nest("/dns", handlers::dns::routes(self.dns_resolver.clone()))
+            .layer(middleware::from_fn(
+                middlewares::fix_json_content_type::fix_content_type,
+            ))
+            .with_state(app_state)
+    }
+
+    fn api_router(&self) -> Router {
+        self.local_router
+            .get_or_init(|| self.build_api_router())
+            .clone()
+    }
+
+    pub async fn request(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<String>,
+    ) -> crate::Result<ControllerResponse> {
+        let request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.unwrap_or_default()))
+            .map_err(|error| crate::Error::Operation(error.to_string()))?;
+        let response = self
+            .api_router()
+            .oneshot(request)
+            .await
+            .map_err(|error| crate::Error::Operation(error.to_string()))?;
+        let status = response.status().as_u16();
+        let body = to_bytes(response.into_body(), 64 * 1024 * 1024)
+            .await
+            .map_err(|error| crate::Error::Operation(error.to_string()))?;
+        let body = String::from_utf8(body.to_vec())
+            .map_err(|error| crate::Error::Operation(error.to_string()))?;
+        Ok(ControllerResponse { status, body })
     }
 }
 
 impl Runner for ApiRunner {
     fn run_async(&self) {
-        let inbound_manager = self.inbound_manager.clone();
-        let dispatcher = self.dispatcher.clone();
-        let global_state = self.global_state.clone();
-        let dns_resolver = self.dns_resolver.clone();
-        let outbound_manager = self.outbound_manager.clone();
-        let statistics_manager = self.statistics_manager.clone();
-        let cache_store = self.cache_store.clone();
         let controller_cfg = self.controller_cfg.clone();
-        let router = self.router.clone();
         let cwd = self.cwd.clone();
-        let dns_listen_addr = self.dns_listen_addr.clone();
-        let dns_enabled = self.dns_enabled;
+        let router = self.api_router();
 
         let ipc_addr = controller_cfg.external_controller_ipc;
         let tcp_addr = controller_cfg.external_controller;
@@ -143,55 +238,10 @@ impl Runner for ApiRunner {
             .allow_private_network(true)
             .allow_origin(origins);
 
-        let app_state = Arc::new(AppState {
-            log_source_tx: self.log_source.clone(),
-            statistics_manager: statistics_manager.clone(),
-        });
         let cancellation_token = self.cancellation_token.clone();
         let handle = tokio::spawn(async move {
-            let mut router = Router::new()
-                .route("/", get(handlers::hello::handle))
-                .route("/logs", get(handlers::log::handle))
-                .route("/traffic", get(handlers::traffic::handle))
-                .route("/user-stats", get(handlers::user_stats::handle))
-                .route("/version", get(handlers::version::handle))
-                .route("/memory", get(handlers::memory::handle))
-                .route("/restart", post(handlers::restart::handle))
-                .nest("/ws", websocket::routes(app_state.clone()))
-                .nest(
-                    "/configs",
-                    handlers::config::routes(
-                        inbound_manager,
-                        dispatcher,
-                        global_state,
-                        dns_resolver.clone(),
-                        dns_listen_addr,
-                        dns_enabled,
-                        outbound_manager.clone(),
-                    ),
-                )
-                .nest("/rules", handlers::rule::routes(router.clone()))
-                .nest("/group", handlers::group::routes(outbound_manager.clone()))
-                .nest(
-                    "/proxies",
-                    handlers::proxy::routes(outbound_manager.clone(), cache_store),
-                )
-                .nest(
-                    "/providers/proxies",
-                    handlers::provider::routes(outbound_manager),
-                )
-                .nest("/providers/rules", handlers::provider::rule_routes(router))
-                .nest(
-                    "/connections",
-                    handlers::connection::routes(statistics_manager.clone()),
-                )
-                .nest("/flows", handlers::flows::routes(statistics_manager))
-                .nest("/dns", handlers::dns::routes(dns_resolver))
-                .layer(middleware::from_fn(
-                    middlewares::fix_json_content_type::fix_content_type,
-                ))
+            let mut router = router
                 .route_layer(cors)
-                .with_state(app_state)
                 .layer(ServiceBuilder::new().layer(TraceLayer::new_for_http()));
 
             if let Some(external_ui) = controller_cfg.external_ui {
@@ -215,7 +265,6 @@ impl Runner for ApiRunner {
             // Create display strings before moving values
             let tcp_addr_display = tcp_addr.as_ref().map(|addr| addr.to_string());
             let ipc_addr_display = ipc_addr.clone();
-
             // Handle TCP listening
             let tcp_fut = tcp_addr.map(|bind_addr| {
                 let bind_addr = if bind_addr.starts_with(':') {
