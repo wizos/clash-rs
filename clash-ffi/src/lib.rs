@@ -1,7 +1,9 @@
 use clash_lib::{Config, Options, TokioRuntime, start_scaffold_instance};
 use std::{
+    backtrace::Backtrace,
     ffi::{CStr, CString},
     os::raw::{c_char, c_int, c_void},
+    path::PathBuf,
     sync::{LazyLock, Mutex},
     thread::JoinHandle,
 };
@@ -10,6 +12,33 @@ use tokio_util::sync::CancellationToken;
 static RUNNING_INSTANCE: LazyLock<
     Mutex<Option<(JoinHandle<()>, CancellationToken)>>,
 > = LazyLock::new(|| Mutex::new(None));
+static PANIC_REPORT_PATH: LazyLock<Mutex<Option<PathBuf>>> =
+    LazyLock::new(|| Mutex::new(None));
+static PANIC_REPORTER: std::sync::Once = std::sync::Once::new();
+
+fn install_panic_reporter(cwd: &str) {
+    *PANIC_REPORT_PATH.lock().unwrap() =
+        Some(PathBuf::from(cwd).join("clash-rs-panic.log"));
+    PANIC_REPORTER.call_once(|| {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let thread = std::thread::current();
+            let location = info
+                .location()
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_owned());
+            let report = format!(
+                "thread={}; location={location}; panic={info}; backtrace={}",
+                thread.name().unwrap_or("unnamed"),
+                Backtrace::force_capture(),
+            );
+            if let Some(path) = PANIC_REPORT_PATH.lock().unwrap().as_ref() {
+                let _ = std::fs::write(path, report);
+            }
+            default_hook(info);
+        }));
+    });
+}
 
 /// Register the process-wide Android VM and application context used by
 /// platform-aware dependencies such as the system DNS resolver.
@@ -78,6 +107,7 @@ pub unsafe extern "C" fn clash_start(
             .to_string();
         let log_str = CStr::from_ptr(log).to_str().unwrap_or_default().to_string();
         let cwd_str = CStr::from_ptr(cwd).to_str().unwrap_or_default().to_string();
+        install_panic_reporter(&cwd_str);
 
         let rt = if multithread != 0 {
             Some(TokioRuntime::MultiThread)

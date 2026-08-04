@@ -26,6 +26,7 @@ pub trait ProxyProvider: Provider {
     async fn touch(&self);
     /// this is a blocking call, you may want to spawn a new task to run this
     async fn healthcheck(&self);
+    fn register_healthcheck(&self, _url: &str, _interval: u64) {}
 }
 
 struct ProxyFilter {

@@ -1266,7 +1266,7 @@ pub struct OutboundGroupUrlTest {
 
     #[serde(default = "default_latency_test_url")]
     pub url: String,
-    #[serde(deserialize_with = "utils::deserialize_u64")]
+    #[serde(default, deserialize_with = "utils::deserialize_u64")]
     pub interval: u64,
     pub lazy: Option<bool>,
     pub tolerance: Option<u16>,
@@ -1284,7 +1284,7 @@ pub struct OutboundGroupFallback {
 
     #[serde(default = "default_latency_test_url")]
     pub url: String,
-    #[serde(deserialize_with = "utils::deserialize_u64")]
+    #[serde(default, deserialize_with = "utils::deserialize_u64")]
     pub interval: u64,
     pub lazy: Option<bool>,
     pub icon: Option<String>,
@@ -1302,7 +1302,7 @@ pub struct OutboundGroupLoadBalance {
 
     #[serde(default = "default_latency_test_url")]
     pub url: String,
-    #[serde(deserialize_with = "utils::deserialize_u64")]
+    #[serde(default, deserialize_with = "utils::deserialize_u64")]
     pub interval: u64,
     pub lazy: Option<bool>,
     pub strategy: Option<LoadBalanceStrategy>,
@@ -1396,6 +1396,7 @@ pub struct OutboundHttpProvider {
     pub proxy: Option<String>,
     pub interval: u64,
     pub path: String,
+    #[serde(default)]
     pub health_check: HealthCheck,
     #[serde(rename = "override", default)]
     pub override_options: OutboundProxyProviderOverride,
@@ -1408,6 +1409,7 @@ pub struct OutboundFileProvider {
     pub name: String,
     pub path: String,
     pub interval: Option<u64>,
+    #[serde(default)]
     pub health_check: HealthCheck,
     #[serde(rename = "override", default)]
     pub override_options: OutboundProxyProviderOverride,
@@ -1505,11 +1507,35 @@ impl OutboundProxyProviderOverride {
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
+#[serde(default)]
 pub struct HealthCheck {
     pub enable: bool,
     pub url: String,
     pub interval: u64,
     pub lazy: Option<bool>,
+}
+
+impl HealthCheck {
+    pub fn effective_interval(&self) -> u64 {
+        if !self.enable || self.url.is_empty() {
+            0
+        } else if self.interval == 0 {
+            300
+        } else {
+            self.interval
+        }
+    }
+}
+
+impl Default for HealthCheck {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            url: String::new(),
+            interval: 0,
+            lazy: Some(true),
+        }
+    }
 }
 
 impl TryFrom<HashMap<String, Value>> for OutboundProxyProviderDef {
@@ -1554,6 +1580,29 @@ mod proxy_provider_compatibility_tests {
             panic!("expected HTTP provider");
         };
         assert_eq!(provider.proxy.as_deref(), Some("Proxy"));
+        assert_eq!(provider.health_check.effective_interval(), 300);
+    }
+
+    #[test]
+    fn defaults_enabled_mihomo_healthcheck_to_300_seconds_and_lazy() {
+        let yaml = r#"
+            type: http
+            url: https://example.com/provider.yaml
+            interval: 3600
+            path: ./provider.yaml
+            health-check:
+              enable: true
+              url: https://example.com/generate_204
+        "#;
+
+        let Http(provider) =
+            serde_yaml::from_str::<OutboundProxyProviderDef>(yaml).unwrap()
+        else {
+            panic!("expected HTTP provider");
+        };
+        assert_eq!(provider.health_check.effective_interval(), 300);
+        assert_eq!(provider.health_check.lazy, Some(true));
+        assert_eq!(super::HealthCheck::default().effective_interval(), 0);
     }
 }
 
@@ -1987,23 +2036,24 @@ mod proxy_group_defaults_tests {
     };
 
     #[test]
-    fn defaults_mihomo_health_check_url_when_omitted() {
+    fn defaults_mihomo_health_check_fields_when_omitted() {
         let groups = [
-            "name: auto\ntype: url-test\nproxies: [DIRECT]\ninterval: 300",
-            "name: fallback\ntype: fallback\nproxies: [DIRECT]\ninterval: 300",
-            "name: balance\ntype: load-balance\nproxies: [DIRECT]\ninterval: 300",
+            "name: auto\ntype: url-test\nproxies: [DIRECT]",
+            "name: fallback\ntype: fallback\nproxies: [DIRECT]",
+            "name: balance\ntype: load-balance\nproxies: [DIRECT]",
         ];
 
         for yaml in groups {
-            let group: OutboundGroupProtocol =
-                serde_yaml::from_str(yaml).expect("group without url should parse");
-            let url = match group {
-                UrlTest(group) => group.url,
-                Fallback(group) => group.url,
-                LoadBalance(group) => group.url,
+            let group: OutboundGroupProtocol = serde_yaml::from_str(yaml)
+                .expect("group with defaults should parse");
+            let (url, interval) = match group {
+                UrlTest(group) => (group.url, group.interval),
+                Fallback(group) => (group.url, group.interval),
+                LoadBalance(group) => (group.url, group.interval),
                 _ => unreachable!(),
             };
             assert_eq!(url, DEFAULT_LATENCY_TEST_URL);
+            assert_eq!(interval, 0);
         }
     }
 }

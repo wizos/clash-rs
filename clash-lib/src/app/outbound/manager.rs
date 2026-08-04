@@ -65,6 +65,14 @@ use uuid::Uuid;
 
 static RESERVED_PROVIDER_NAME: &str = "default";
 
+fn group_healthcheck_interval(auto_healthcheck_group: bool, interval: u64) -> u64 {
+    if auto_healthcheck_group && interval == 0 {
+        300
+    } else {
+        interval
+    }
+}
+
 pub struct OutboundManager {
     /// Shared registry used by both OutboundManager lookups and the DNS /
     /// HTTP bootstrap clients.  Populated at the end of `new()` and is the
@@ -654,6 +662,13 @@ mod tests {
     };
     use tokio::sync::RwLock;
 
+    #[test]
+    fn defaults_direct_group_healthcheck_to_300_seconds() {
+        assert_eq!(group_healthcheck_interval(true, 0), 300);
+        assert_eq!(group_healthcheck_interval(false, 0), 0);
+        assert_eq!(group_healthcheck_interval(true, 120), 120);
+    }
+
     #[tokio::test]
     async fn provider_proxies_are_available_by_name_and_in_api_list() {
         let mut provider_proxy = MockDummyOutboundHandler::new();
@@ -796,6 +811,7 @@ impl OutboundManager {
             interval: u64,
             lazy: bool,
             health_check_url: &str,
+            auto_healthcheck_group: bool,
             handlers: &HashMap<String, AnyOutboundHandler>,
             proxy_manager: &ProxyManager,
             provider_registry: &mut HashMap<String, ArcProxyProvider>,
@@ -808,7 +824,7 @@ impl OutboundManager {
                 let pd = make_provider_from_proxies(
                     name,
                     proxies,
-                    interval,
+                    group_healthcheck_interval(auto_healthcheck_group, interval),
                     lazy,
                     health_check_url,
                     handlers,
@@ -829,6 +845,9 @@ impl OutboundManager {
                             ))
                         })?
                         .clone();
+                    if auto_healthcheck_group {
+                        provider.register_healthcheck(health_check_url, interval);
+                    }
                     providers.push(provider);
                 }
             }
@@ -904,6 +923,7 @@ impl OutboundManager {
                         0,
                         true,
                         proto.url.as_deref().unwrap_or(DEFAULT_LATENCY_TEST_URL),
+                        false,
                         handlers,
                         proxy_manager,
                         provider_registry,
@@ -938,8 +958,9 @@ impl OutboundManager {
                         &proto.use_provider,
                         &proto.selection,
                         proto.interval,
-                        proto.lazy.unwrap_or_default(),
+                        proto.lazy.unwrap_or(true),
                         &proto.url,
+                        true,
                         handlers,
                         proxy_manager,
                         provider_registry,
@@ -978,8 +999,9 @@ impl OutboundManager {
                         &proto.use_provider,
                         &proto.selection,
                         proto.interval,
-                        proto.lazy.unwrap_or_default(),
+                        proto.lazy.unwrap_or(true),
                         &proto.url,
+                        true,
                         handlers,
                         proxy_manager,
                         provider_registry,
@@ -1015,8 +1037,9 @@ impl OutboundManager {
                         &proto.use_provider,
                         &proto.selection,
                         proto.interval,
-                        proto.lazy.unwrap_or_default(),
+                        proto.lazy.unwrap_or(true),
                         &proto.url,
+                        true,
                         handlers,
                         proxy_manager,
                         provider_registry,
@@ -1055,6 +1078,7 @@ impl OutboundManager {
                         0,
                         true,
                         proto.url.as_deref().unwrap_or(DEFAULT_LATENCY_TEST_URL),
+                        false,
                         handlers,
                         proxy_manager,
                         provider_registry,
@@ -1097,6 +1121,7 @@ impl OutboundManager {
                         0,
                         proto.lazy.unwrap_or_default(),
                         proto.url.as_deref().unwrap_or(DEFAULT_LATENCY_TEST_URL),
+                        false,
                         handlers,
                         proxy_manager,
                         provider_registry,
@@ -1208,11 +1233,17 @@ impl OutboundManager {
                     }
                 };
 
+            let healthcheck_interval = health_check.effective_interval();
+            let healthcheck_url = if health_check.enable {
+                health_check.url
+            } else {
+                String::new()
+            };
             let hc = HealthCheck::new(
                 vec![],
-                health_check.url,
-                health_check.interval,
-                health_check.lazy.unwrap_or_default(),
+                healthcheck_url,
+                healthcheck_interval,
+                health_check.lazy.unwrap_or(true),
                 proxy_manager.clone(),
             );
 

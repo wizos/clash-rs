@@ -417,7 +417,14 @@ impl EnhancedResolver {
         m.metadata.recursion_desired = true;
 
         let result = self.exchange(&m).await?;
-        let ip_list = EnhancedResolver::ip_list_of_message(&result);
+        let ip_list = EnhancedResolver::ip_list_of_message(&result)
+            .into_iter()
+            .filter(|ip| match record_type {
+                rr::RecordType::A => ip.is_ipv4(),
+                rr::RecordType::AAAA => ip.is_ipv6(),
+                _ => true,
+            })
+            .collect::<Vec<_>>();
         if ip_list.is_empty() {
             return Err(anyhow!("no record for hostname: {}", host));
         }
@@ -676,11 +683,9 @@ impl ClashResolver for EnhancedResolver {
         if enhanced
             && let Some(hosts) = &self.hosts
             && let Some(v) = hosts.search(host)
+            && let Some(net::IpAddr::V4(v4)) = v.get_data()
         {
-            return Ok(v.get_data().map(|v| match v {
-                net::IpAddr::V4(v4) => *v4,
-                _ => unreachable!("invalid IP family"),
-            }));
+            return Ok(Some(*v4));
         }
 
         if let Ok(ip) = host.parse::<net::Ipv4Addr>() {
@@ -694,16 +699,24 @@ impl ClashResolver for EnhancedResolver {
                 debug!("fake dns lookup: {} -> {:?}", host, ip);
                 match ip {
                     net::IpAddr::V4(v4) => return Ok(Some(v4)),
-                    _ => unreachable!("invalid IP family"),
+                    net::IpAddr::V6(_) => {
+                        return Err(anyhow!(
+                            "fake DNS returned an IPv6 address for IPv4 lookup: {host}"
+                        ));
+                    }
                 }
             }
         }
 
         match self.lookup_ip(host, rr::RecordType::A).await {
-            Ok(result) => match result.choose(&mut rand::rng()).unwrap() {
-                net::IpAddr::V4(v4) => Ok(Some(*v4)),
-                _ => unreachable!("invalid IP family"),
-            },
+            Ok(result) => result
+                .choose(&mut rand::rng())
+                .and_then(|ip| match ip {
+                    net::IpAddr::V4(v4) => Some(*v4),
+                    net::IpAddr::V6(_) => None,
+                })
+                .map(Some)
+                .ok_or_else(|| anyhow!("no A record for hostname: {host}")),
             Err(e) => Err(e),
         }
     }
@@ -725,18 +738,20 @@ impl ClashResolver for EnhancedResolver {
         if enhanced
             && let Some(hosts) = &self.hosts
             && let Some(v) = hosts.search(host)
+            && let Some(net::IpAddr::V6(v6)) = v.get_data()
         {
-            return Ok(v.get_data().map(|v| match v {
-                net::IpAddr::V6(v6) => *v6,
-                _ => unreachable!("invalid IP family"),
-            }));
+            return Ok(Some(*v6));
         }
 
         match self.lookup_ip(host, rr::RecordType::AAAA).await {
-            Ok(result) => match result.choose(&mut rand::rng()).unwrap() {
-                net::IpAddr::V6(v6) => Ok(Some(*v6)),
-                _ => unreachable!("invalid IP family"),
-            },
+            Ok(result) => result
+                .choose(&mut rand::rng())
+                .and_then(|ip| match ip {
+                    net::IpAddr::V6(v6) => Some(*v6),
+                    net::IpAddr::V4(_) => None,
+                })
+                .map(Some)
+                .ok_or_else(|| anyhow!("no AAAA record for hostname: {host}")),
 
             Err(e) => Err(e),
         }
@@ -853,6 +868,7 @@ mod tests {
             ThreadSafeDNSClient,
             config::{Config, NameServer},
             dns_client::{DNSNetMode, DnsClient, Opts},
+            helper::build_dns_response_message,
             resolver::enhanced::EnhancedResolver,
             runtime::DnsRuntimeProvider,
         },
@@ -879,6 +895,30 @@ mod tests {
             message: &op::Message,
         ) -> anyhow::Result<op::Message> {
             Ok(message.clone())
+        }
+    }
+
+    #[derive(Debug)]
+    struct WrongFamilyDnsClient;
+
+    #[async_trait::async_trait]
+    impl DnsClientTrait for WrongFamilyDnsClient {
+        fn id(&self) -> String {
+            "wrong-family".to_owned()
+        }
+
+        async fn exchange(
+            &self,
+            message: &op::Message,
+        ) -> anyhow::Result<op::Message> {
+            let mut response = build_dns_response_message(message, true, false);
+            let name = message.queries[0].name().clone();
+            response.add_answer(rr::Record::from_rdata(
+                name,
+                60,
+                rr::RData::AAAA(rr::rdata::AAAA("::1".parse().unwrap())),
+            ));
+            Ok(response)
         }
     }
 
@@ -995,6 +1035,16 @@ mod tests {
             Some(std::net::IpAddr::V4("127.0.0.1".parse().unwrap())),
             "IPv4 literal should be returned as-is"
         );
+    }
+
+    #[tokio::test]
+    async fn wrong_ip_family_response_returns_error_instead_of_panicking() {
+        let mut resolver = EnhancedResolver::new_default().await;
+        resolver.main = vec![Arc::new(WrongFamilyDnsClient)];
+
+        let result = resolver.resolve_v4("example.com", false).await;
+
+        assert!(result.is_err());
     }
 
     /// resolve_v6 must return an IPv6 literal directly even when ipv6 is

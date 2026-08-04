@@ -388,6 +388,16 @@ impl ProxyProvider for ProxySetProvider {
     async fn healthcheck(&self) {
         self.hc.check().await;
     }
+
+    fn register_healthcheck(&self, url: &str, interval: u64) {
+        self.hc.register(url, interval);
+        if self.hc.auto() {
+            let hc = self.hc.clone();
+            tokio::spawn(async move {
+                hc.kick_off().await;
+            });
+        }
+    }
 }
 
 #[cfg(test)]
