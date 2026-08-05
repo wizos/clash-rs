@@ -1,4 +1,6 @@
-use clash_lib::{Config, Options, TokioRuntime, start_scaffold_instance};
+use clash_lib::{
+    Config, Options, ScaffoldInstance, TokioRuntime, start_scaffold_instance,
+};
 use std::{
     backtrace::Backtrace,
     ffi::{CStr, CString},
@@ -11,9 +13,8 @@ use std::{
 use tokio_util::sync::CancellationToken;
 
 struct RunningInstance {
-    runtime_handle: JoinHandle<()>,
+    core: ScaffoldInstance,
     event_handle: JoinHandle<()>,
-    token: CancellationToken,
     event_token: CancellationToken,
 }
 
@@ -64,7 +65,7 @@ pub unsafe extern "C" fn clash_initialize_android_context(
     context: *mut c_void,
 ) {
     unsafe {
-        ndk_context::initialize_android_context(java_vm, context);
+        clash_lib::initialize_android_context(java_vm, context);
     }
 }
 
@@ -72,9 +73,8 @@ fn stop_running_instance() -> bool {
     let Some(instance) = RUNNING_INSTANCE.lock().unwrap().take() else {
         return false;
     };
-    instance.token.cancel();
     instance.event_token.cancel();
-    let _ = instance.runtime_handle.join();
+    let _ = instance.core.shutdown();
     let _ = instance.event_handle.join();
     true
 }
@@ -258,11 +258,10 @@ pub unsafe extern "C" fn clash_start(
         let event_token = CancellationToken::new();
         let event_handle = start_event_forwarder(event_token.clone());
         match start_scaffold_instance(options) {
-            Ok((runtime_handle, token)) => {
+            Ok(core) => {
                 *RUNNING_INSTANCE.lock().unwrap() = Some(RunningInstance {
-                    runtime_handle,
+                    core,
                     event_handle,
-                    token,
                     event_token,
                 });
                 CString::new("").unwrap().into_raw()

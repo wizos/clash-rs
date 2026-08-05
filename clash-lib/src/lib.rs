@@ -56,6 +56,22 @@ mod proxy;
 mod runner;
 mod session;
 
+/// Registers the process-wide Android VM and application context used by
+/// platform-aware dependencies such as the system DNS resolver.
+///
+/// # Safety
+/// Both pointers must remain valid for the lifetime of the process, and this
+/// function must be called exactly once before starting the core.
+#[cfg(target_os = "android")]
+pub unsafe fn initialize_android_context(
+    java_vm: *mut std::ffi::c_void,
+    context: *mut std::ffi::c_void,
+) {
+    unsafe {
+        ndk_context::initialize_android_context(java_vm, context);
+    }
+}
+
 use crate::common::{geodata, mmdb::MmdbLookup};
 pub use config::{
     DNSListen as ClashDNSListen, RuntimeConfig as ClashRuntimeConfig,
@@ -237,6 +253,40 @@ pub enum TokioRuntime {
     SingleThread,
 }
 
+/// Owns one background Clash runtime and its shutdown boundary.
+///
+/// Callers may use [`Self::runtime_handle`] to run adapter tasks on the same
+/// Tokio runtime. Shutdown must happen from outside that runtime thread.
+pub struct ScaffoldInstance {
+    runtime_thread: std::thread::JoinHandle<()>,
+    runtime_handle: tokio::runtime::Handle,
+    shutdown_token: tokio_util::sync::CancellationToken,
+}
+
+impl ScaffoldInstance {
+    pub fn runtime_handle(&self) -> tokio::runtime::Handle {
+        self.runtime_handle.clone()
+    }
+
+    pub fn cancel(&self) {
+        self.shutdown_token.cancel();
+    }
+
+    pub fn shutdown(self) -> Result<()> {
+        self.shutdown_token.cancel();
+        if self.runtime_thread.thread().id() == std::thread::current().id() {
+            return Err(Error::Operation(
+                "cannot join the Clash runtime from its own thread".to_owned(),
+            ));
+        }
+        self.runtime_thread.join().map_err(|_| {
+            Error::Operation(
+                "Clash runtime thread panicked during shutdown".to_owned(),
+            )
+        })
+    }
+}
+
 #[allow(clippy::large_enum_variant)]
 pub enum Config {
     Def(ClashConfigDef),
@@ -337,15 +387,10 @@ pub fn start_scaffold(opts: Options) -> Result<()> {
 }
 
 /// Start a Clash instance in a background thread with independent lifecycle.
-/// Returns the thread handle and a CancellationToken to shut it down.
+/// Returns an owned runtime instance with explicit task and shutdown access.
 /// Unlike `start_scaffold`, this does NOT register in the global
 /// SHUTDOWN_TOKEN.
-pub fn start_scaffold_instance(
-    opts: Options,
-) -> Result<(
-    std::thread::JoinHandle<()>,
-    tokio_util::sync::CancellationToken,
-)> {
+pub fn start_scaffold_instance(opts: Options) -> Result<ScaffoldInstance> {
     let config_path = opts.config_path.or_else(|| {
         if let Config::File(ref p) = opts.config {
             Some(p.clone())
@@ -362,18 +407,26 @@ pub fn start_scaffold_instance(
     let token_clone = token.clone();
     let (ready_tx, ready_rx) =
         std_mpsc::sync_channel::<std::result::Result<(), String>>(1);
+    let (runtime_tx, runtime_rx) = std_mpsc::sync_channel(1);
     let startup_tx = ready_tx.clone();
 
     let handle = std::thread::spawn(move || {
-        let rt = match rt_kind {
+        let mut runtime_builder = match rt_kind {
             TokioRuntime::MultiThread => tokio::runtime::Builder::new_multi_thread(),
             TokioRuntime::SingleThread => {
                 tokio::runtime::Builder::new_current_thread()
             }
+        };
+        let rt = match runtime_builder.enable_all().build() {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                let _ = runtime_tx.send(Err(error.to_string()));
+                return;
+            }
+        };
+        if runtime_tx.send(Ok(rt.handle().clone())).is_err() {
+            return;
         }
-        .enable_all()
-        .build()
-        .expect("Failed to build runtime");
 
         let (log_tx, _) = tokio::sync::broadcast::channel(100);
         let log_collector = app::logging::EventCollector::new(vec![log_tx.clone()]);
@@ -398,8 +451,28 @@ pub fn start_scaffold_instance(
         }
     });
 
+    let runtime_handle = match runtime_rx.recv() {
+        Ok(Ok(runtime_handle)) => runtime_handle,
+        Ok(Err(error)) => {
+            let _ = handle.join();
+            return Err(Error::Operation(format!(
+                "failed to build Clash runtime: {error}"
+            )));
+        }
+        Err(error) => {
+            let _ = handle.join();
+            return Err(Error::Operation(format!(
+                "Clash runtime stopped before initialization: {error}"
+            )));
+        }
+    };
+
     match ready_rx.recv() {
-        Ok(Ok(())) => Ok((handle, token)),
+        Ok(Ok(())) => Ok(ScaffoldInstance {
+            runtime_thread: handle,
+            runtime_handle,
+            shutdown_token: token,
+        }),
         Ok(Err(error)) => {
             let _ = handle.join();
             Err(Error::Operation(error))

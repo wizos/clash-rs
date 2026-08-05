@@ -92,8 +92,7 @@ fn wait_port_closed(port: u16) -> Result<(), clash_lib::Error> {
 #[allow(dead_code)]
 pub struct ClashInstance {
     ports: Vec<u16>,
-    handle: Option<std::thread::JoinHandle<()>>,
-    token: tokio_util::sync::CancellationToken,
+    instance: Option<clash_lib::ScaffoldInstance>,
 }
 
 impl ClashInstance {
@@ -102,7 +101,7 @@ impl ClashInstance {
         options: clash_lib::Options,
         ports: Vec<u16>,
     ) -> Result<Self, clash_lib::Error> {
-        let (handle, token) = clash_lib::start_scaffold_instance(options)?;
+        let instance = clash_lib::start_scaffold_instance(options)?;
 
         // Wait for the main port (API) to be ready
         if let Some(&main_port) = ports.first() {
@@ -111,16 +110,16 @@ impl ClashInstance {
 
         Ok(Self {
             ports,
-            handle: Some(handle),
-            token,
+            instance: Some(instance),
         })
     }
 }
 
 impl Drop for ClashInstance {
     fn drop(&mut self) {
-        // Cancel only this instance — does not affect sibling instances.
-        self.token.cancel();
+        if let Some(instance) = self.instance.as_ref() {
+            instance.cancel();
+        }
 
         // Wait for all ports to be released.
         for &port in &self.ports {
@@ -132,9 +131,8 @@ impl Drop for ClashInstance {
             }
         }
 
-        // Join the thread to ensure it has fully exited.
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+        if let Some(instance) = self.instance.take() {
+            let _ = instance.shutdown();
         }
     }
 }

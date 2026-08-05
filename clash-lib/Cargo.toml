@@ -194,7 +194,6 @@ serde_ignored = "0.1"
 serde_json = "1"
 erased-serde = "0.4"
 
-
 # Macro Magic
 educe = "0.6"
 
@@ -283,6 +282,10 @@ anyhow = "1"
 
 [target.'cfg(any(target_os="linux", target_os="macos", target_os="windows"))'.dependencies]
 sock2proc = { git = "https://github.com/Watfaq/sock2proc.git", rev = "9f9e630" }
+
+[target.'cfg(target_os = "android")'.dependencies]
+ndk-context = "0.1"
+
 [target.'cfg(unix)'.dependencies]
 hyperlocal = { version = "0.9", features = ["client"] }
 
