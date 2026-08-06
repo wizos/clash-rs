@@ -30,7 +30,7 @@ pub mod healthcheck;
 pub mod providers;
 
 pub const MIN_HEALTHCHECK_CONCURRENCY: usize = 1;
-pub const DEFAULT_HEALTHCHECK_CONCURRENCY: usize = 4;
+pub const DEFAULT_HEALTHCHECK_CONCURRENCY: usize = 40;
 pub const MAX_HEALTHCHECK_CONCURRENCY: usize = 40;
 
 struct ProxyCheckOutcome {
@@ -45,26 +45,17 @@ async fn check_proxy(
     outbound: AnyOutboundHandler,
     url: String,
     timeout: Option<Duration>,
-    queue_timeout: Duration,
 ) -> ProxyCheckOutcome {
     let queue_started = std::time::Instant::now();
-    let permit =
-        tokio::time::timeout(queue_timeout, semaphore.acquire_owned()).await;
+    let permit = semaphore.acquire_owned().await;
     let queue_elapsed = queue_started.elapsed();
     let _permit = match permit {
-        Ok(Ok(permit)) => permit,
-        Ok(Err(error)) => {
+        Ok(permit) => permit,
+        Err(error) => {
             return ProxyCheckOutcome {
                 result: Err(new_io_error(format!(
                     "healthcheck semaphore closed: {error}"
                 ))),
-                queue_elapsed,
-                test_elapsed: Duration::ZERO,
-            };
-        }
-        Err(_) => {
-            return ProxyCheckOutcome {
-                result: Err(new_io_error("healthcheck queue timeout")),
                 queue_elapsed,
                 test_elapsed: Duration::ZERO,
             };
@@ -246,7 +237,6 @@ impl ProxyManager {
     ) -> Vec<std::io::Result<(Duration, Duration)>> {
         let started_at = std::time::Instant::now();
         let concurrency = self.healthcheck_concurrency.load(Ordering::Acquire);
-        let queue_timeout = timeout.unwrap_or(Duration::from_secs(5));
         let manager = self.clone();
         let semaphore = self.healthcheck_semaphore.clone();
         let checks = outbounds
@@ -259,7 +249,6 @@ impl ProxyManager {
                     outbound,
                     url.to_owned(),
                     timeout,
-                    queue_timeout,
                 )
             })
             .collect::<Vec<_>>();
@@ -1322,6 +1311,52 @@ mod tests {
         assert_eq!(manager.healthcheck_semaphore.available_permits(), 1);
         assert!(manager.set_healthcheck_concurrency(0).await.is_err());
         assert!(manager.set_healthcheck_concurrency(41).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn healthcheck_timeout_starts_after_a_slot_is_available() {
+        let manager = remote_content_manager::ProxyManager::new(
+            Arc::new(MockClashResolver::new()),
+            None,
+        );
+        manager.set_healthcheck_concurrency(1).await.unwrap();
+        let held_permit = manager
+            .healthcheck_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+
+        let mut outbound = MockDummyOutboundHandler::new();
+        outbound
+            .expect_name()
+            .return_const("queued-node".to_owned());
+        outbound
+            .expect_connect_stream()
+            .returning(|_, _| Err(std::io::Error::other("network test started")));
+        let manager_clone = manager.clone();
+        let task = tokio::spawn(async move {
+            manager_clone
+                .check(
+                    &[Arc::new(outbound)],
+                    "https://example.com/generate_204",
+                    Some(Duration::from_millis(5)),
+                )
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!task.is_finished());
+        drop(held_permit);
+
+        let results = task.await.unwrap();
+        assert!(
+            results[0]
+                .as_ref()
+                .unwrap_err()
+                .to_string()
+                .contains("network test started")
+        );
     }
 
     #[tokio::test]

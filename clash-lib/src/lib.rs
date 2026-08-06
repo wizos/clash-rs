@@ -865,8 +865,15 @@ impl RuntimeComponents {
         let previous = std::mem::replace(&mut self.tun_runner, replacement.clone());
         global_state.lock().await.tunnel_runner = replacement;
 
+        let stop_started = Instant::now();
         stop_runtime_tun_runner(&previous, RUNTIME_TUN_STOP_TIMEOUT).await;
+        let stop_elapsed = stop_started.elapsed();
+        warn!(
+            "replace_tun: stop_runtime_tun_runner took {}ms",
+            stop_elapsed.as_millis(),
+        );
 
+        let start_started = Instant::now();
         let result = match tokio::time::timeout(
             RUNTIME_TUN_START_TIMEOUT,
             runner.start_and_wait(),
@@ -879,6 +886,12 @@ impl RuntimeComponents {
                 Err(Error::Operation("TUN startup timed out".to_string()))
             }
         };
+        let start_elapsed = start_started.elapsed();
+        warn!(
+            "replace_tun: start_and_wait took {}ms",
+            start_elapsed.as_millis(),
+        );
+
         match &result {
             Ok(()) => info!(
                 "runtime TUN {} in {}ms",
@@ -892,8 +905,19 @@ impl RuntimeComponents {
             ),
         }
         if enabled && result.is_ok() {
+            let hc_started = Instant::now();
             self.outbound_manager.start_healthchecks();
+            warn!(
+                "replace_tun: start_healthchecks took {}ms",
+                hc_started.elapsed().as_millis(),
+            );
         }
+        warn!(
+            "replace_tun: total took {}ms (stop={}ms, start={}ms)",
+            started.elapsed().as_millis(),
+            stop_elapsed.as_millis(),
+            start_elapsed.as_millis(),
+        );
         result
     }
 

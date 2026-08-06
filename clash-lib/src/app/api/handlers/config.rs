@@ -12,8 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::Mutex;
 
-#[cfg(target_os = "android")]
-use crate::runner::Runner;
+
 use crate::{
     GlobalState,
     app::{
@@ -79,13 +78,6 @@ pub fn routes(
 }
 
 async fn start_listeners(State(state): State<ConfigState>) -> impl IntoResponse {
-    #[cfg(target_os = "android")]
-    {
-        state.inbound_manager.run_async();
-        return StatusCode::NO_CONTENT.into_response();
-    }
-
-    #[cfg(not(target_os = "android"))]
     match state.inbound_manager.restart().await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => (
