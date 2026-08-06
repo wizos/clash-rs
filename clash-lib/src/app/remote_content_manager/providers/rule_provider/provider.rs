@@ -146,7 +146,8 @@ pub struct RuleProviderImpl {
     format: RuleSetFormat,
     inline_rules: Option<Vec<String>>,
 
-    mmdb: Option<MmdbLookup>,
+    country_mmdb: Option<MmdbLookup>,
+    asn_mmdb: Option<MmdbLookup>,
     geodata: Option<GeoDataLookup>,
 }
 
@@ -159,7 +160,8 @@ impl RuleProviderImpl {
         // InlineRuleProvider doesn't have an interval and vehicle
         interval: Option<Duration>,
         vehicle: Option<ThreadSafeProviderVehicle>,
-        mmdb: Option<MmdbLookup>,
+        country_mmdb: Option<MmdbLookup>,
+        asn_mmdb: Option<MmdbLookup>,
         geodata: Option<GeoDataLookup>,
         inline_rules: Option<Vec<String>>,
     ) -> Self {
@@ -193,7 +195,8 @@ impl RuleProviderImpl {
         let current_behavior = behavior;
         let current_format = format;
         let inline_rules_clone = inline_rules.clone();
-        let mmdb_clone = mmdb.clone();
+        let country_mmdb_clone = country_mmdb.clone();
+        let asn_mmdb_clone = asn_mmdb.clone();
         let geodata_clone = geodata.clone();
         let parser: RuleParser =
             Box::new(move |input: &[u8]| -> anyhow::Result<RuleContent> {
@@ -217,7 +220,8 @@ impl RuleProviderImpl {
                         make_rules(
                             current_behavior,
                             payload,
-                            mmdb_clone.clone(),
+                            country_mmdb_clone.clone(),
+                            asn_mmdb_clone.clone(),
                             geodata_clone.clone(),
                         )
                         .map_err(anyhow::Error::new)
@@ -249,7 +253,8 @@ impl RuleProviderImpl {
                         make_rules(
                             current_behavior,
                             payload,
-                            mmdb_clone.clone(),
+                            country_mmdb_clone.clone(),
+                            asn_mmdb_clone.clone(),
                             geodata_clone.clone(),
                         )
                         .map_err(anyhow::Error::new)
@@ -291,7 +296,8 @@ impl RuleProviderImpl {
             format,
             inline_rules,
 
-            mmdb,
+            country_mmdb,
+            asn_mmdb,
             geodata,
         }
     }
@@ -404,7 +410,8 @@ impl Provider for RuleProviderImpl {
             let rules = make_rules(
                 self.behavior,
                 self.inline_rules.clone().unwrap_or_default(),
-                self.mmdb.clone(),
+                self.country_mmdb.clone(),
+                self.asn_mmdb.clone(),
                 self.geodata.clone(),
             );
 
@@ -489,7 +496,8 @@ impl Provider for RuleProviderImpl {
 fn make_rules(
     behavior: RuleSetBehavior,
     rules: Vec<String>, // Input is Vec<String> for Yaml/Text
-    mmdb: Option<MmdbLookup>,
+    country_mmdb: Option<MmdbLookup>,
+    asn_mmdb: Option<MmdbLookup>,
     geodata: Option<GeoDataLookup>,
 ) -> Result<RuleContent, Error> {
     match behavior {
@@ -501,7 +509,7 @@ fn make_rules(
             Ok(RuleContent::Ipcidr(Box::new(make_ip_cidr_rules(rules)?)))
         }
         RuleSetBehavior::Classical => Ok(RuleContent::Classical(
-            make_classical_rules(rules, mmdb, geodata)?,
+            make_classical_rules(rules, country_mmdb, asn_mmdb, geodata)?,
         )),
     }
 }
@@ -524,10 +532,12 @@ fn make_ip_cidr_rules(rules: Vec<String>) -> Result<CidrTrie, Error> {
 
 fn make_classical_rules(
     rules: Vec<String>,
-    mmdb: Option<MmdbLookup>,
+    country_mmdb: Option<MmdbLookup>,
+    asn_mmdb: Option<MmdbLookup>,
     geodata: Option<GeoDataLookup>,
 ) -> Result<Vec<Box<dyn RuleMatcher>>, Error> {
     let mut rv = vec![];
+    let mut missing_asn_mmdb = false;
     for rule in rules {
         let parts = rule.split(',').map(str::trim).collect::<Vec<&str>>();
 
@@ -541,16 +551,26 @@ fn make_classical_rules(
             }
             _ => Err(Error::InvalidConfig(format!("invalid rule line: {rule}"))),
         }?;
+        missing_asn_mmdb |= asn_mmdb.is_none()
+            && matches!(
+                &rule_type,
+                RuleType::IpAsn { .. } | RuleType::SrcIpAsn { .. }
+            );
 
         let rule_matcher = map_rule_type(
             rule_type,
-            mmdb.clone(),
-            None,
+            country_mmdb.clone(),
+            asn_mmdb.clone(),
             geodata.clone(),
             None,
             None,
         );
         rv.push(rule_matcher);
+    }
+    if missing_asn_mmdb {
+        warn!(
+            "classical rule provider contains IP-ASN rules but ASN MMDB is unavailable"
+        );
     }
     Ok(rv)
 }
@@ -583,6 +603,7 @@ mod tests {
             None,
             None,
             Some(Arc::new(mock_mmdb)),
+            None,
             Some(Arc::new(mock_geodata)),
             Some(vec!["DOMAIN-SUFFIX, google.com".to_owned()]),
         );
@@ -594,6 +615,35 @@ mod tests {
             ..Default::default()
         };
         assert!(provider.search(&sess));
+    }
+
+    #[tokio::test]
+    async fn classical_provider_uses_asn_mmdb() {
+        let mut mock_asn_mmdb = MockMmdbLookupTrait::new();
+        mock_asn_mmdb.expect_lookup_asn().returning(|_| {
+            Ok(crate::common::mmdb::MmdbLookupAsn {
+                asn_number: 64512,
+                asn_name: "TEST-ASN".to_owned(),
+            })
+        });
+
+        let provider = RuleProviderImpl::new(
+            "asn-test".to_owned(),
+            RuleSetBehavior::Classical,
+            RuleSetFormat::Text,
+            None,
+            None,
+            None,
+            Some(Arc::new(mock_asn_mmdb)),
+            None,
+            Some(vec!["IP-ASN,64512".to_owned()]),
+        );
+
+        assert_ok!(provider.initialize().await);
+        assert!(provider.search(&Session {
+            destination: "203.0.113.1:443".parse().unwrap(),
+            ..Default::default()
+        }));
     }
 
     #[tokio::test]
@@ -629,6 +679,7 @@ mod tests {
             Some(Duration::from_secs(5)),
             Some(Arc::new(mock_vehicle)),
             Some(Arc::new(mock_mmdb)),
+            None,
             Some(Arc::new(mock_geodata)),
             Some(vec!["+.google.com".to_owned()]),
         );
@@ -675,6 +726,7 @@ mod tests {
             None, // no polling interval — rely purely on file watching
             Some(vehicle),
             Some(Arc::new(mock_mmdb)),
+            None,
             Some(Arc::new(mock_geodata)),
             None,
         ));

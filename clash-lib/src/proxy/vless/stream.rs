@@ -6,7 +6,7 @@ use std::{
 
 use bytes::{BufMut, BytesMut};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tracing::{debug, error};
+use tracing::debug;
 
 use crate::{proxy::AnyStream, session::SocksAddr};
 
@@ -104,7 +104,7 @@ impl VlessStream {
         tokio::io::AsyncWriteExt::write_all(&mut self.inner, &buf)
             .await
             .map_err(|e| {
-                error!("Failed to send VLESS handshake: {}", e);
+                debug!("Failed to send VLESS handshake: {}", e);
                 e
             })?;
 
@@ -127,12 +127,12 @@ impl VlessStream {
         tokio::io::AsyncReadExt::read_exact(&mut self.inner, &mut response)
             .await
             .map_err(|e| {
-                error!("Failed to read VLESS response: {}", e);
+                debug!("Failed to read VLESS response: {}", e);
                 e
             })?;
 
         if response[0] != VLESS_VERSION {
-            error!("Invalid VLESS response version: {}", response[0]);
+            debug!("Invalid VLESS response version: {}", response[0]);
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("invalid VLESS response version: {}", response[0]),
@@ -149,7 +149,7 @@ impl VlessStream {
             )
             .await
             .map_err(|e| {
-                error!("Failed to read VLESS additional info: {}", e);
+                debug!("Failed to read VLESS additional info: {}", e);
                 e
             })?;
             debug!(

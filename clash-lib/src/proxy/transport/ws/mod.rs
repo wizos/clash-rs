@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use http::{Request, StatusCode, Uri};
+use http::{HeaderName, HeaderValue, Request, StatusCode, Uri};
 use std::{collections::HashMap, io, net::Ipv6Addr};
 use tokio_tungstenite::{
     client_async_with_config,
@@ -67,19 +67,28 @@ impl Client {
             .map_err(map_io_error)?;
         let mut request = Request::builder()
             .method("GET")
+            .header("Host", authority.as_str())
             .header("Connection", "Upgrade")
             .header("Upgrade", "websocket")
             .header("Sec-WebSocket-Version", "13")
             .header("Sec-WebSocket-Key", generate_key())
-            .uri(uri);
+            .uri(uri)
+            .body(())
+            .map_err(map_io_error)?;
         for (k, v) in self.headers.iter() {
-            request = request.header(k.as_str(), v.as_str());
+            request.headers_mut().insert(
+                HeaderName::from_bytes(k.as_bytes()).map_err(map_io_error)?,
+                HeaderValue::from_str(v).map_err(map_io_error)?,
+            );
         }
         if self.max_early_data > 0 {
-            // we will replace this field later
-            request = request.header(self.early_data_header_name.as_str(), "xxoo");
+            request.headers_mut().insert(
+                HeaderName::from_bytes(self.early_data_header_name.as_bytes())
+                    .map_err(map_io_error)?,
+                HeaderValue::from_static("xxoo"),
+            );
         }
-        request.body(()).map_err(map_io_error)
+        Ok(request)
     }
 }
 
@@ -182,5 +191,18 @@ mod tests {
     #[test]
     fn invalid_authority_returns_error() {
         assert!(client("invalid host", "/").req().is_err());
+    }
+
+    #[test]
+    fn request_has_one_effective_host_header() {
+        let mut client = client("example.com", "/");
+        client
+            .headers
+            .insert("Host".to_owned(), "cdn.example.com".to_owned());
+
+        let request = client.req().unwrap();
+
+        assert_eq!(request.headers().get_all("Host").iter().count(), 1);
+        assert_eq!(request.headers()["Host"], "cdn.example.com");
     }
 }

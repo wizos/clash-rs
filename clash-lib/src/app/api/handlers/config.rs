@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::Mutex;
 
+#[cfg(target_os = "android")]
+use crate::runner::Runner;
 use crate::{
     GlobalState,
     app::{
@@ -77,6 +79,13 @@ pub fn routes(
 }
 
 async fn start_listeners(State(state): State<ConfigState>) -> impl IntoResponse {
+    #[cfg(target_os = "android")]
+    {
+        state.inbound_manager.run_async();
+        return StatusCode::NO_CONTENT.into_response();
+    }
+
+    #[cfg(not(target_os = "android"))]
     match state.inbound_manager.restart().await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => (
@@ -310,6 +319,7 @@ struct PatchConfigRequest {
     tcp_concurrent: Option<bool>,
     interface_name: Option<String>,
     unified_delay: Option<bool>,
+    healthcheck_concurrency: Option<usize>,
     find_process_mode: Option<def::FindProcessMode>,
     suspended: Option<bool>,
 }
@@ -388,6 +398,14 @@ async fn patch_configs(
     }
     if let Some(unified_delay) = payload.unified_delay {
         state.outbound_manager.set_unified_delay(unified_delay);
+    }
+    if let Some(concurrency) = payload.healthcheck_concurrency
+        && let Err(error) = state
+            .outbound_manager
+            .set_healthcheck_concurrency(concurrency)
+            .await
+    {
+        return (StatusCode::BAD_REQUEST, error).into_response();
     }
     if let Some(find_process_mode) = payload.find_process_mode {
         crate::process_resolver::set_find_process_mode(find_process_mode);

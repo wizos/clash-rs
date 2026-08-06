@@ -1,4 +1,4 @@
-use tracing::warn;
+use tracing::debug;
 
 use super::RuleMatcher;
 use crate::{common::mmdb::MmdbLookup, session::Session};
@@ -33,7 +33,7 @@ impl RuleMatcher for IpAsn {
                     asn_result.asn_number.to_string() == self.asn
                 })
             } else {
-                warn!(
+                debug!(
                     "IP-ASN lookup failed: ASN MMDB not available. Maybe \
                      config.asn-mmdb is not set?"
                 );

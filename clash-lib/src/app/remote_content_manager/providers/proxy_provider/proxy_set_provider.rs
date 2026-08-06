@@ -81,7 +81,7 @@ impl ProxySetProvider {
     ) -> anyhow::Result<Self> {
         let hc = Arc::new(hc);
 
-        if hc.auto() {
+        if hc.auto() && !cfg!(target_os = "android") {
             let hc = hc.clone();
             debug!("kicking off healthcheck for: {}", &name);
             tokio::spawn(async move {
@@ -107,9 +107,11 @@ impl ProxySetProvider {
                         inner.proxies.clone_from(&input);
                     }
                     hc.update(input).await;
-                    tokio::spawn(async move {
-                        hc.check().await;
-                    });
+                    if !cfg!(target_os = "android") {
+                        tokio::spawn(async move {
+                            hc.check().await;
+                        });
+                    }
                 })
             },
         );
@@ -389,9 +391,18 @@ impl ProxyProvider for ProxySetProvider {
         self.hc.check().await;
     }
 
+    fn start_healthcheck(&self) {
+        if self.hc.auto() {
+            let hc = self.hc.clone();
+            tokio::spawn(async move {
+                hc.kick_off().await;
+            });
+        }
+    }
+
     fn register_healthcheck(&self, url: &str, interval: u64) {
         self.hc.register(url, interval);
-        if self.hc.auto() {
+        if self.hc.auto() && !cfg!(target_os = "android") {
             let hc = self.hc.clone();
             tokio::spawn(async move {
                 hc.kick_off().await;

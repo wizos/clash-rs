@@ -139,7 +139,7 @@ impl OutboundHandler for Handler {
         resolver: ThreadSafeDNSResolver,
     ) -> std::io::Result<BoxedChainedStream> {
         self.do_connect_stream(sess, resolver).await.map_err(|e| {
-            tracing::error!("{:?}", e);
+            tracing::debug!("TUIC stream connection failed: {:?}", e);
             std::io::Error::other(e.to_string())
         })
     }
@@ -150,7 +150,7 @@ impl OutboundHandler for Handler {
         resolver: ThreadSafeDNSResolver,
     ) -> std::io::Result<BoxedChainedDatagram> {
         self.do_connect_datagram(sess, resolver).await.map_err(|e| {
-            tracing::error!("{:?}", e);
+            tracing::debug!("TUIC datagram connection failed: {:?}", e);
             std::io::Error::other(e.to_string())
         })
     }

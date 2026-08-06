@@ -91,8 +91,8 @@ pub fn clear_android_resolver() {
 }
 
 pub fn protect_socket(fd: c_int) {
-    let resolver = *resolver().read().expect("process resolver lock poisoned");
-    if let Some(resolver) = resolver
+    let resolver = resolver().read().expect("process resolver lock poisoned");
+    if let Some(resolver) = resolver.as_ref()
         && let Some(protect) = resolver.protect
     {
         unsafe { protect(resolver.context as *mut c_void, fd) };
@@ -120,8 +120,10 @@ pub fn resolve_session(sess: &mut Session) {
         Ok(target) => target,
         Err(_) => return,
     };
-    let resolver = *resolver().read().expect("process resolver lock poisoned");
-    let Some(resolver) = resolver else {
+    // Keep the read guard until the JNI callback and returned string are done.
+    // clear_android_resolver() may release the callback's Java global ref.
+    let resolver = resolver().read().expect("process resolver lock poisoned");
+    let Some(resolver) = resolver.as_ref() else {
         return;
     };
     let protocol = match sess.network {
@@ -291,6 +293,21 @@ fn parse_proc_address(value: &str, ipv6: bool) -> Option<(IpAddr, u16)> {
 mod tests {
     use super::*;
 
+    unsafe extern "C" fn assert_locked_resolve(
+        _context: *mut c_void,
+        _protocol: c_int,
+        _source: *const c_char,
+        _target: *const c_char,
+        _uid: c_int,
+    ) -> *mut c_char {
+        assert!(resolver().try_write().is_err());
+        std::ptr::null_mut()
+    }
+
+    unsafe extern "C" fn assert_locked_protect(_context: *mut c_void, _fd: c_int) {
+        assert!(resolver().try_write().is_err());
+    }
+
     #[test]
     fn resolver_is_a_noop_without_callback() {
         clear_android_resolver();
@@ -298,6 +315,27 @@ mod tests {
         resolve_session(&mut session);
         assert!(session.process.is_empty());
         assert_eq!(session.uid, 0);
+    }
+
+    #[test]
+    fn keeps_android_callback_alive_while_it_is_invoked() {
+        unsafe {
+            set_android_resolver(
+                std::ptr::null_mut(),
+                36,
+                Some(assert_locked_resolve),
+                None,
+                Some(assert_locked_protect),
+            );
+        }
+        protect_socket(1);
+        let mut session = Session {
+            source: "172.19.0.1:45678".parse().unwrap(),
+            destination: SocksAddr::Ip("1.1.1.1:443".parse().unwrap()),
+            ..Default::default()
+        };
+        resolve_session(&mut session);
+        clear_android_resolver();
     }
 
     #[test]

@@ -8,9 +8,13 @@ use std::{
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures::{Future, ready};
 use http::{HeaderValue, Request, StatusCode};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_tungstenite::{
-    client_async_with_config, tungstenite::protocol::WebSocketConfig,
+    WebSocketStream,
+    tungstenite::{
+        handshake::{client::generate_request, derive_accept_key},
+        protocol::{Role, WebSocketConfig},
+    },
 };
 
 use crate::{
@@ -87,23 +91,133 @@ impl WebsocketEarlyDataConn {
         >,
     > {
         async fn run(
-            stream: AnyStream,
+            mut stream: AnyStream,
             req: Request<()>,
             config: Option<WebSocketConfig>,
         ) -> std::io::Result<AnyStream> {
-            let (stream, resp) = client_async_with_config(req, stream, config)
-                .await
-                .map_err(map_io_error)?;
-            if resp.status() != StatusCode::SWITCHING_PROTOCOLS {
-                return Err(new_io_error(
-                    "msg: websocket early data handshake failed",
-                ));
-            }
-            let rv = Box::new(WebsocketConn::from_websocket(stream));
+            let (request, key) = generate_request(req).map_err(map_io_error)?;
+            stream.write_all(&request).await?;
+            stream.flush().await?;
+
+            let mut response = Vec::with_capacity(1024);
+            let header_end = loop {
+                if let Some(position) =
+                    response.windows(4).position(|v| v == b"\r\n\r\n")
+                {
+                    break position + 4;
+                }
+                if response.len() >= MAX_HANDSHAKE_RESPONSE_SIZE {
+                    return Err(new_io_error(
+                        "websocket handshake response is too large",
+                    ));
+                }
+                let mut buffer = [0_u8; 1024];
+                let remaining = MAX_HANDSHAKE_RESPONSE_SIZE - response.len();
+                let read_len = cmp::min(buffer.len(), remaining);
+                let size = stream.read(&mut buffer[..read_len]).await?;
+                if size == 0 {
+                    return Err(new_io_error(
+                        "websocket server closed during handshake",
+                    ));
+                }
+                response.extend_from_slice(&buffer[..size]);
+            };
+
+            validate_response(&response[..header_end], &key)?;
+            let tail = response.split_off(header_end);
+            let websocket = WebSocketStream::from_partially_read(
+                stream,
+                tail,
+                Role::Client,
+                config,
+            )
+            .await;
+            let rv = Box::new(WebsocketConn::from_websocket(websocket));
             Ok(rv)
         }
 
         Box::pin(run(stream, req, config))
+    }
+}
+
+const MAX_HANDSHAKE_RESPONSE_SIZE: usize = 64 * 1024;
+
+fn validate_response(response: &[u8], key: &str) -> std::io::Result<()> {
+    let mut headers = [httparse::EMPTY_HEADER; 64];
+    let mut parsed = httparse::Response::new(&mut headers);
+    if !parsed.parse(response).map_err(map_io_error)?.is_complete() {
+        return Err(new_io_error("incomplete websocket handshake response"));
+    }
+    if parsed.code != Some(StatusCode::SWITCHING_PROTOCOLS.as_u16()) {
+        return Err(new_io_error(format!(
+            "websocket handshake returned status {}",
+            parsed.code.unwrap_or_default(),
+        )));
+    }
+
+    let header = |name: &str| {
+        parsed
+            .headers
+            .iter()
+            .find(|header| header.name.eq_ignore_ascii_case(name))
+            .and_then(|header| std::str::from_utf8(header.value).ok())
+    };
+    let upgrade_valid = header("Upgrade")
+        .is_some_and(|value| value.eq_ignore_ascii_case("websocket"));
+    let connection_valid = header("Connection").is_some_and(|value| {
+        value
+            .split(',')
+            .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+    });
+    let accept_valid = header("Sec-WebSocket-Accept")
+        .is_some_and(|value| value.trim() == derive_accept_key(key.as_bytes()));
+    if !upgrade_valid || !connection_valid || !accept_valid {
+        return Err(new_io_error("invalid websocket handshake response"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http::Request;
+
+    #[tokio::test]
+    async fn accepts_early_data_response_without_subprotocol_echo() {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let server_task = tokio::spawn(async move {
+            let mut request = vec![0_u8; 2048];
+            let size = server.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..size]);
+            assert!(request.contains("Sec-WebSocket-Protocol: ZGF0YQ"));
+            server
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\n\
+Upgrade: websocket\r\n\
+Connection: Upgrade\r\n\
+Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+        let request = Request::builder()
+            .method("GET")
+            .uri("ws://example.com/")
+            .header("Host", "example.com")
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Version", "13")
+            .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .header("Sec-WebSocket-Protocol", "ZGF0YQ")
+            .body(())
+            .unwrap();
+
+        let result =
+            WebsocketEarlyDataConn::proxy_stream(Box::new(client), request, None)
+                .await;
+
+        assert!(result.is_ok());
+        server_task.await.unwrap();
     }
 }
 

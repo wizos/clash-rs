@@ -10,7 +10,7 @@ use crate::{
 };
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use futures::{FutureExt, StreamExt, stream::FuturesOrdered};
+use futures::{FutureExt, StreamExt, stream};
 use http_body_util::Empty;
 use hyper::Request;
 use hyper_util::rt::TokioIo;
@@ -19,17 +19,71 @@ use std::{
     collections::{HashMap, VecDeque},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
 use tokio::sync::RwLock;
-use tracing::{debug, instrument, trace, warn};
+use tracing::{debug, info, instrument, trace, warn};
 
 pub mod healthcheck;
 pub mod providers;
 
-const MAX_CONCURRENT_HEALTHCHECKS: usize = 50;
+pub const MIN_HEALTHCHECK_CONCURRENCY: usize = 1;
+pub const DEFAULT_HEALTHCHECK_CONCURRENCY: usize = 4;
+pub const MAX_HEALTHCHECK_CONCURRENCY: usize = 40;
+
+struct ProxyCheckOutcome {
+    result: std::io::Result<(Duration, Duration)>,
+    queue_elapsed: Duration,
+    test_elapsed: Duration,
+}
+
+async fn check_proxy(
+    manager: ProxyManager,
+    semaphore: Arc<tokio::sync::Semaphore>,
+    outbound: AnyOutboundHandler,
+    url: String,
+    timeout: Option<Duration>,
+    queue_timeout: Duration,
+) -> ProxyCheckOutcome {
+    let queue_started = std::time::Instant::now();
+    let permit =
+        tokio::time::timeout(queue_timeout, semaphore.acquire_owned()).await;
+    let queue_elapsed = queue_started.elapsed();
+    let _permit = match permit {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(error)) => {
+            return ProxyCheckOutcome {
+                result: Err(new_io_error(format!(
+                    "healthcheck semaphore closed: {error}"
+                ))),
+                queue_elapsed,
+                test_elapsed: Duration::ZERO,
+            };
+        }
+        Err(_) => {
+            return ProxyCheckOutcome {
+                result: Err(new_io_error("healthcheck queue timeout")),
+                queue_elapsed,
+                test_elapsed: Duration::ZERO,
+            };
+        }
+    };
+    let proxy_name = outbound.name().to_owned();
+    let test_started = std::time::Instant::now();
+    let result = manager
+        .url_test(outbound, url.as_str(), timeout)
+        .await
+        .inspect_err(|error| {
+            debug!("healthcheck {proxy_name} -> {url} failed: {error}")
+        });
+    ProxyCheckOutcome {
+        result,
+        queue_elapsed,
+        test_elapsed: test_started.elapsed(),
+    }
+}
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct TrafficStats {
@@ -102,6 +156,8 @@ pub struct ProxyManager {
     proxy_state: Arc<RwLock<HashMap<String, ProxyState>>>,
     failure_checks: Arc<tokio::sync::Mutex<HashMap<(String, String), Option<bool>>>>,
     healthcheck_semaphore: Arc<tokio::sync::Semaphore>,
+    healthcheck_concurrency: Arc<AtomicUsize>,
+    healthcheck_resize_lock: Arc<tokio::sync::Mutex<()>>,
     dns_resolver: ThreadSafeDNSResolver,
     /// Firewall Mark for url test
     fw_mark: Option<u32>,
@@ -123,8 +179,12 @@ impl ProxyManager {
             proxy_state: Default::default(),
             failure_checks: Default::default(),
             healthcheck_semaphore: Arc::new(tokio::sync::Semaphore::new(
-                MAX_CONCURRENT_HEALTHCHECKS,
+                DEFAULT_HEALTHCHECK_CONCURRENCY,
             )),
+            healthcheck_concurrency: Arc::new(AtomicUsize::new(
+                DEFAULT_HEALTHCHECK_CONCURRENCY,
+            )),
+            healthcheck_resize_lock: Default::default(),
             fw_mark,
             unified_delay: Arc::new(AtomicBool::new(false)),
         }
@@ -132,6 +192,40 @@ impl ProxyManager {
 
     pub fn set_unified_delay(&self, enabled: bool) {
         self.unified_delay.store(enabled, Ordering::Relaxed);
+    }
+
+    pub async fn set_healthcheck_concurrency(
+        &self,
+        concurrency: usize,
+    ) -> Result<(), String> {
+        if !(MIN_HEALTHCHECK_CONCURRENCY..=MAX_HEALTHCHECK_CONCURRENCY)
+            .contains(&concurrency)
+        {
+            return Err(format!(
+                "healthcheck concurrency must be between {MIN_HEALTHCHECK_CONCURRENCY} and \
+                 {MAX_HEALTHCHECK_CONCURRENCY}"
+            ));
+        }
+        let _guard = self.healthcheck_resize_lock.lock().await;
+        let current = self.healthcheck_concurrency.load(Ordering::Acquire);
+        if concurrency == current {
+            return Ok(());
+        }
+        if concurrency > current {
+            self.healthcheck_semaphore
+                .add_permits(concurrency - current);
+        } else if concurrency < current {
+            self.healthcheck_semaphore
+                .clone()
+                .acquire_many_owned((current - concurrency) as u32)
+                .await
+                .map_err(|error| format!("healthcheck semaphore closed: {error}"))?
+                .forget();
+        }
+        self.healthcheck_concurrency
+            .store(concurrency, Ordering::Release);
+        info!("healthcheck concurrency updated: {current} -> {concurrency}");
+        Ok(())
     }
 
     pub fn selected_delay(&self, actual: Duration, overall: Duration) -> Duration {
@@ -146,42 +240,87 @@ impl ProxyManager {
     #[instrument(skip(self))]
     pub async fn check(
         &self,
-        outbounds: &Vec<AnyOutboundHandler>,
+        outbounds: &[AnyOutboundHandler],
         url: &str,
         timeout: Option<Duration>,
     ) -> Vec<std::io::Result<(Duration, Duration)>> {
+        let started_at = std::time::Instant::now();
+        let concurrency = self.healthcheck_concurrency.load(Ordering::Acquire);
+        let queue_timeout = timeout.unwrap_or(Duration::from_secs(5));
+        let manager = self.clone();
         let semaphore = self.healthcheck_semaphore.clone();
-        let mut futs = vec![];
-        for outbound in outbounds {
-            let outbound = outbound.clone();
-            let url = url.to_owned();
-            let manager = self.clone();
-            let semaphore = semaphore.clone();
-            futs.push(tokio::spawn(async move {
-                let _permit = semaphore.acquire_owned().await.map_err(|err| {
-                    new_io_error(format!("healthcheck semaphore closed: {err}"))
-                })?;
-                let proxy_name = outbound.name().to_owned();
-                manager
-                    .url_test(outbound, url.as_str(), timeout)
-                    .await
-                    .inspect_err(|e| {
-                        warn!("healthcheck {} -> {} failed: {}", proxy_name, url, e)
-                    })
-            }));
+        let checks = outbounds
+            .iter()
+            .cloned()
+            .map(|outbound| {
+                check_proxy(
+                    manager.clone(),
+                    semaphore.clone(),
+                    outbound,
+                    url.to_owned(),
+                    timeout,
+                    queue_timeout,
+                )
+            })
+            .collect::<Vec<_>>();
+        let outcomes: Vec<_> =
+            stream::iter(checks).buffered(concurrency).collect().await;
+        let failed = outcomes
+            .iter()
+            .filter(|outcome| outcome.result.is_err())
+            .count();
+        let failure_samples = outcomes
+            .iter()
+            .filter_map(|outcome| outcome.result.as_ref().err())
+            .take(3)
+            .map(|error| error.to_string().chars().take(160).collect::<String>())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let summary = format!(
+            "healthcheck completed: url={url} total={} succeeded={} failed={} elapsed_ms={}{}",
+            outcomes.len(),
+            outcomes.len() - failed,
+            failed,
+            started_at.elapsed().as_millis(),
+            if failure_samples.is_empty() {
+                String::new()
+            } else {
+                format!(" samples=[{failure_samples}]")
+            },
+        );
+        let queue_total_ms: u128 = outcomes
+            .iter()
+            .map(|outcome| outcome.queue_elapsed.as_millis())
+            .sum();
+        let queue_max_ms = outcomes
+            .iter()
+            .map(|outcome| outcome.queue_elapsed.as_millis())
+            .max()
+            .unwrap_or_default();
+        let test_total_ms: u128 = outcomes
+            .iter()
+            .map(|outcome| outcome.test_elapsed.as_millis())
+            .sum();
+        let test_max_ms = outcomes
+            .iter()
+            .map(|outcome| outcome.test_elapsed.as_millis())
+            .max()
+            .unwrap_or_default();
+        let count = outcomes.len().max(1) as u128;
+        let metrics = format!(
+            " concurrency={concurrency} queue_avg_ms={} queue_max_ms={queue_max_ms} \
+             test_avg_ms={} test_max_ms={test_max_ms}",
+            queue_total_ms / count,
+            test_total_ms / count,
+        );
+        if failed == outcomes.len() && !outcomes.is_empty() {
+            warn!("{summary}{metrics}");
+        } else if failed > 0 {
+            info!("{summary}{metrics}");
+        } else {
+            debug!("{summary}{metrics}");
         }
-
-        let futs: FuturesOrdered<_> = futs.into_iter().collect();
-        let r: Vec<_> = futs.collect().await;
-
-        let mut results = vec![];
-        for res in r {
-            match res {
-                Ok(r) => results.push(r),
-                Err(e) => results.push(Err(new_io_error(e.to_string()))),
-            }
-        }
-        results
+        outcomes.into_iter().map(|outcome| outcome.result).collect()
     }
 
     pub async fn alive(&self, name: &str) -> bool {
@@ -963,11 +1102,11 @@ impl ProxyManager {
                         delay
                     }
                     Ok((Err(error), _)) => {
-                        warn!(e = ?error, "unified delay request failed");
+                        debug!(e = ?error, "unified delay request failed");
                         started_at.elapsed()
                     }
                     Err(_) => {
-                        warn!("unified delay request timed out");
+                        debug!("unified delay request timed out");
                         started_at.elapsed()
                     }
                 }
@@ -1166,8 +1305,23 @@ mod tests {
         ));
         assert_eq!(
             manager.healthcheck_semaphore.available_permits(),
-            super::MAX_CONCURRENT_HEALTHCHECKS,
+            remote_content_manager::DEFAULT_HEALTHCHECK_CONCURRENCY,
         );
+    }
+
+    #[tokio::test]
+    async fn healthcheck_concurrency_is_bounded_and_resizable() {
+        let manager = remote_content_manager::ProxyManager::new(
+            Arc::new(MockClashResolver::new()),
+            None,
+        );
+
+        manager.set_healthcheck_concurrency(40).await.unwrap();
+        assert_eq!(manager.healthcheck_semaphore.available_permits(), 40);
+        manager.set_healthcheck_concurrency(1).await.unwrap();
+        assert_eq!(manager.healthcheck_semaphore.available_permits(), 1);
+        assert!(manager.set_healthcheck_concurrency(0).await.is_err());
+        assert!(manager.set_healthcheck_concurrency(41).await.is_err());
     }
 
     #[tokio::test]

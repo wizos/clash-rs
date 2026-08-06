@@ -64,6 +64,7 @@ impl Router {
             &mut rule_provider_registry,
             dns_resolver.clone(),
             country_mmdb.clone(),
+            asn_mmdb.clone(),
             geodata.clone(),
             cwd,
         )
@@ -225,7 +226,8 @@ impl Router {
         rule_providers: HashMap<String, RuleProviderDef>,
         rule_provider_registry: &mut HashMap<String, ThreadSafeRuleProvider>,
         resolver: ThreadSafeDNSResolver,
-        mmdb: Option<MmdbLookup>,
+        country_mmdb: Option<MmdbLookup>,
+        asn_mmdb: Option<MmdbLookup>,
         geodata: Option<GeoDataLookup>,
         cwd: String,
     ) -> Result<(), Error> {
@@ -251,7 +253,8 @@ impl Router {
                         format,
                         Some(Duration::from_secs(http.interval)),
                         Some(Arc::new(vehicle)),
-                        mmdb.clone(),
+                        country_mmdb.clone(),
+                        asn_mmdb.clone(),
                         geodata.clone(),
                         http.inline_rules,
                     );
@@ -278,7 +281,8 @@ impl Router {
                         format,
                         interval,
                         Some(Arc::new(vehicle)),
-                        mmdb.clone(),
+                        country_mmdb.clone(),
+                        asn_mmdb.clone(),
                         geodata.clone(),
                         file.inline_rules,
                     );
@@ -293,7 +297,8 @@ impl Router {
                                              * inline rules */
                         None,
                         None,
-                        mmdb.clone(),
+                        country_mmdb.clone(),
+                        asn_mmdb.clone(),
                         geodata.clone(),
                         Some(inline.inline_rules),
                     );

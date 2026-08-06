@@ -308,6 +308,21 @@ impl OutboundManager {
         self.proxy_manager.set_unified_delay(enabled);
     }
 
+    pub async fn set_healthcheck_concurrency(
+        &self,
+        concurrency: usize,
+    ) -> Result<(), String> {
+        self.proxy_manager
+            .set_healthcheck_concurrency(concurrency)
+            .await
+    }
+
+    pub fn start_healthchecks(&self) {
+        for provider in self.proxy_providers.values() {
+            provider.start_healthcheck();
+        }
+    }
+
     pub fn selected_delay(
         &self,
         actual: std::time::Duration,

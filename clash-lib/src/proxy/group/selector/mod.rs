@@ -320,8 +320,14 @@ mod tests {
         let selector_control =
             Arc::new(handler.clone()) as ThreadSafeSelectorControl;
 
-        assert_eq!(selector_control.current().await, "<none>".to_owned());
-        assert!(handler.selected_proxy(false).await.is_none());
+        assert_eq!(
+            selector_control.current().await,
+            crate::config::internal::proxy::PROXY_COMPATIBLE,
+        );
+        assert_eq!(
+            handler.selected_proxy(false).await.unwrap().name(),
+            crate::config::internal::proxy::PROXY_COMPATIBLE,
+        );
         assert!(selector_control.select("provider1").await.is_err());
     }
 }

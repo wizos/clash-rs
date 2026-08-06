@@ -12,6 +12,13 @@ use crate::{
 pub struct DelayRequest {
     pub url: String,
     pub timeout: u16,
+    pub expand: Option<bool>,
+}
+
+impl DelayRequest {
+    pub fn expand_group(&self) -> bool {
+        self.expand.unwrap_or(true)
+    }
 }
 
 /// Run `url_test` over a group proxy and all its members, and if the group has
@@ -74,4 +81,26 @@ pub fn is_request_websocket(header: &HeaderMap) -> bool {
             .get(header::UPGRADE)
             .and_then(|x| x.to_str().ok().map(|x| x.to_ascii_lowercase()))
             == Some("websocket".to_ascii_lowercase())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DelayRequest;
+
+    #[test]
+    fn group_delay_expands_unless_explicitly_disabled() {
+        let request = DelayRequest {
+            url: String::new(),
+            timeout: 5_000,
+            expand: None,
+        };
+        assert!(request.expand_group());
+        assert!(
+            !DelayRequest {
+                expand: Some(false),
+                ..request
+            }
+            .expand_group()
+        );
+    }
 }

@@ -24,7 +24,7 @@ use http_body_util::{
 use hyper_util::rt::TokioIo;
 use rand::Rng;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tracing::error;
+use tracing::{debug, error};
 use url::Url;
 
 use super::{
@@ -1340,7 +1340,11 @@ impl Client {
             .map_err(io::Error::other)?;
         tokio::spawn(async move {
             let error_value = driver.wait_idle().await;
-            error!("xhttp HTTP/3 connection closed: {error_value}");
+            if error_value.is_h3_no_error() {
+                debug!("xhttp HTTP/3 connection closed: {error_value}");
+            } else {
+                error!("xhttp HTTP/3 connection failed: {error_value}");
+            }
             drop(endpoint);
         });
         Ok(sender)

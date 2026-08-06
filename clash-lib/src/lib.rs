@@ -126,6 +126,8 @@ static RUNTIME_CONTROLLER: std::sync::LazyLock<
 > = std::sync::LazyLock::new(|| StdMutex::new(None));
 #[cfg(feature = "tun")]
 const RUNTIME_TUN_START_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(feature = "tun")]
+const RUNTIME_TUN_STOP_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[cfg(feature = "tun")]
 fn external_tun_config(
@@ -188,6 +190,19 @@ fn replace_runtime_tun(config: config::internal::config::TunConfig) -> Result<()
         .map_err(|error| {
             Error::Operation(format!("runtime TUN response failed: {error}"))
         })?
+}
+
+#[cfg(feature = "tun")]
+async fn stop_runtime_tun_runner(runner: &ArcRunner, timeout: Duration) {
+    runner.shutdown();
+    match tokio::time::timeout(timeout, runner.join()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => warn!("previous TUN runner stopped with error: {error}"),
+        Err(_) => warn!(
+            "previous TUN runner did not stop within {}ms; continuing replacement",
+            timeout.as_millis(),
+        ),
+    }
 }
 
 #[cfg(feature = "tun")]
@@ -391,6 +406,21 @@ pub fn start_scaffold(opts: Options) -> Result<()> {
 /// Unlike `start_scaffold`, this does NOT register in the global
 /// SHUTDOWN_TOKEN.
 pub fn start_scaffold_instance(opts: Options) -> Result<ScaffoldInstance> {
+    start_scaffold_instance_with_inbounds(opts, true)
+}
+
+/// Start an embedded Clash instance without opening configured inbound
+/// listeners. The host can start them later through the controller API.
+pub fn start_scaffold_instance_deferred_inbounds(
+    opts: Options,
+) -> Result<ScaffoldInstance> {
+    start_scaffold_instance_with_inbounds(opts, false)
+}
+
+fn start_scaffold_instance_with_inbounds(
+    opts: Options,
+    start_inbounds: bool,
+) -> Result<ScaffoldInstance> {
     let config_path = opts.config_path.or_else(|| {
         if let Config::File(ref p) = opts.config {
             Some(p.clone())
@@ -444,6 +474,7 @@ pub fn start_scaffold_instance(opts: Options) -> Result<ScaffoldInstance> {
             log_tx,
             token_clone,
             Some(startup_tx),
+            start_inbounds,
         ));
         if let Err(e) = result {
             let _ = ready_tx.try_send(Err(e.to_string()));
@@ -525,7 +556,7 @@ pub async fn start(
     log_tx: broadcast::Sender<LogEvent>,
     shutdown_token: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
-    start_runtime(config, cwd, config_path, log_tx, shutdown_token, None).await
+    start_runtime(config, cwd, config_path, log_tx, shutdown_token, None, true).await
 }
 
 async fn start_runtime(
@@ -535,6 +566,7 @@ async fn start_runtime(
     log_tx: broadcast::Sender<LogEvent>,
     shutdown_token: tokio_util::sync::CancellationToken,
     startup_tx: Option<std_mpsc::SyncSender<std::result::Result<(), String>>>,
+    start_inbounds: bool,
 ) -> Result<()> {
     setup_default_crypto_provider();
 
@@ -593,7 +625,7 @@ async fn start_runtime(
         g.dns_listener = components.dns_listener.clone();
     }
 
-    components.start_all();
+    components.start_all(start_inbounds).await?;
 
     let (runtime_controller_tx, mut runtime_controller_rx) =
         mpsc::unbounded_channel();
@@ -609,7 +641,10 @@ async fn start_runtime(
     }
 
     let reload_token = shutdown_token.child_token();
-    let reload_handle = tokio::spawn(async move {
+    let runtime_handle = tokio::runtime::Handle::current();
+    // Keep control-plane commands responsive even when data-plane tasks occupy
+    // the runtime workers (notably Android's initial health checks).
+    let reload_task = async move {
         let mut components = components;
         // Listen for config reload signal and reload config
         loop {
@@ -617,8 +652,8 @@ async fn start_runtime(
             let event = tokio::select! {
                 _ = reload_token.cancelled() => RuntimeEvent::Shutdown,
                 next = reload_rx.recv() => RuntimeEvent::Reload(next),
-                command = runtime_controller_rx.recv() => RuntimeEvent::Controller(command),
                 command = runtime_tun_rx.recv() => RuntimeEvent::Tun(command),
+                command = runtime_controller_rx.recv() => RuntimeEvent::Controller(command),
             };
             #[cfg(not(feature = "tun"))]
             let event = tokio::select! {
@@ -700,7 +735,14 @@ async fn start_runtime(
                 let mut state = global_state.lock().await;
                 state.reload_phase = "starting-new-components".to_owned();
             }
-            new_components.start_all();
+            if let Err(error) = new_components.start_all(true).await {
+                error!("failed to start replacement components: {error}");
+                let mut state = global_state.lock().await;
+                state.reload_completed = reload_attempt;
+                state.reload_error = Some(error.to_string());
+                state.reload_phase = "failed".to_owned();
+                continue;
+            }
 
             // TODO: every reload is causing the API server to restart, we should
             // make the API server reloadable instead of restarting it.
@@ -750,7 +792,9 @@ async fn start_runtime(
             g.reload_phase = "idle".to_owned();
         }
         Ok::<(), Error>(())
-    });
+    };
+    let reload_handle =
+        tokio::task::spawn_blocking(move || runtime_handle.block_on(reload_task));
 
     if let Some(startup_tx) = startup_tx {
         let _ = startup_tx.send(Ok(()));
@@ -821,10 +865,7 @@ impl RuntimeComponents {
         let previous = std::mem::replace(&mut self.tun_runner, replacement.clone());
         global_state.lock().await.tunnel_runner = replacement;
 
-        previous.shutdown();
-        if let Err(error) = previous.join().await {
-            warn!("previous TUN runner stopped with error: {error}");
-        }
+        stop_runtime_tun_runner(&previous, RUNTIME_TUN_STOP_TIMEOUT).await;
 
         let result = match tokio::time::timeout(
             RUNTIME_TUN_START_TIMEOUT,
@@ -850,14 +891,20 @@ impl RuntimeComponents {
                 started.elapsed().as_millis(),
             ),
         }
+        if enabled && result.is_ok() {
+            self.outbound_manager.start_healthchecks();
+        }
         result
     }
 
-    fn start_all(&self) {
+    async fn start_all(&self, start_inbounds: bool) -> Result<()> {
         #[cfg(feature = "tun")]
         self.tun_runner.run_async();
         self.dns_listener.run_async();
-        self.inbound_manager.run_async();
+        if start_inbounds {
+            self.inbound_manager.restart().await?;
+        }
+        Ok(())
     }
 
     async fn stop_all(&self) {
@@ -1254,5 +1301,31 @@ mod tests {
         assert!(config.dns_hijack);
         assert!(!config.route_all);
         assert!(crate::external_tun_config(0, "172.19.0.1/30", "").is_err());
+    }
+
+    #[cfg(feature = "tun")]
+    #[tokio::test]
+    async fn stuck_tun_runner_does_not_block_replacement() {
+        use crate::{ArcRunner, Error, Runner, stop_runtime_tun_runner};
+        use futures::{FutureExt, future::BoxFuture};
+        use std::{future, sync::Arc, time::Instant};
+
+        struct StuckRunner;
+
+        impl Runner for StuckRunner {
+            fn run_async(&self) {}
+
+            fn shutdown(&self) {}
+
+            fn join(&self) -> BoxFuture<'_, Result<(), Error>> {
+                future::pending().boxed()
+            }
+        }
+
+        let runner: ArcRunner = Arc::new(StuckRunner);
+        let started = Instant::now();
+        stop_runtime_tun_runner(&runner, Duration::from_millis(10)).await;
+
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }

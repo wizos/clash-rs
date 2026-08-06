@@ -35,7 +35,7 @@ impl PlainProvider {
             tracing::warn!("{name}: proxies is empty, creating empty proxy group");
         }
 
-        if hc.auto() {
+        if hc.auto() && !cfg!(target_os = "android") {
             debug!("kicking off healthcheck: {}", name);
             let hc = hc.clone();
             tokio::spawn(async move {
@@ -95,5 +95,14 @@ impl ProxyProvider for PlainProvider {
 
     async fn healthcheck(&self) {
         self.hc.check().await;
+    }
+
+    fn start_healthcheck(&self) {
+        if self.hc.auto() {
+            let hc = self.hc.clone();
+            tokio::spawn(async move {
+                hc.kick_off().await;
+            });
+        }
     }
 }

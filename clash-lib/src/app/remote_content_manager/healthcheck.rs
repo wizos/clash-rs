@@ -28,6 +28,7 @@ pub struct HealthCheck {
     lazy: bool,
     proxy_manager: ProxyManager,
     inner: Arc<tokio::sync::RwLock<HealCheckInner>>,
+    check_state: Arc<tokio::sync::Mutex<Option<Instant>>>,
     cancel_token: CancellationToken,
 }
 
@@ -56,6 +57,7 @@ impl HealthCheck {
                 proxies,
                 task_handle: None,
             })),
+            check_state: Arc::new(tokio::sync::Mutex::new(None)),
             cancel_token: CancellationToken::new(),
         }
     }
@@ -76,8 +78,13 @@ impl HealthCheck {
         let proxy_manager = self.proxy_manager.clone();
         let url = self.url.clone();
         let extra_urls = self.extra_urls.clone();
+        let check_state = self.check_state.clone();
         let cancel_token = self.cancel_token.clone();
         let task_handle = tokio::spawn(async move {
+            // Let Android finish the TUN/listener control path before the
+            // initial batch of automatic checks competes for the runtime.
+            #[cfg(target_os = "android")]
+            tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
             let mut ticker =
                 tokio::time::interval(tokio::time::Duration::from_secs(interval));
             loop {
@@ -90,11 +97,12 @@ impl HealthCheck {
                         if should_check(lazy, now.duration_since(last_touch), interval) {
                             let proxies = inner.read().await.proxies.clone();
                             let extra_urls = extra_urls.read().clone();
-                            check_urls(
+                            run_check(
                                 &proxy_manager,
                                 &proxies,
                                 &url,
                                 &extra_urls,
+                                &check_state,
                             )
                             .await;
                         } else {
@@ -118,7 +126,14 @@ impl HealthCheck {
     pub async fn check(&self) {
         let proxies = self.inner.read().await.proxies.clone();
         let extra_urls = self.extra_urls.read().clone();
-        check_urls(&self.proxy_manager, &proxies, &self.url, &extra_urls).await;
+        run_check(
+            &self.proxy_manager,
+            &proxies,
+            &self.url,
+            &extra_urls,
+            &self.check_state,
+        )
+        .await;
     }
 
     pub async fn update(&self, proxies: Vec<AnyOutboundHandler>) {
@@ -152,7 +167,7 @@ fn should_check(lazy: bool, idle: Duration, interval: u64) -> bool {
 
 async fn check_urls(
     proxy_manager: &ProxyManager,
-    proxies: &Vec<AnyOutboundHandler>,
+    proxies: &[AnyOutboundHandler],
     url: &str,
     extra_urls: &[String],
 ) {
@@ -162,6 +177,26 @@ async fn check_urls(
     for url in extra_urls {
         proxy_manager.check(proxies, url, None).await;
     }
+}
+
+async fn run_check(
+    proxy_manager: &ProxyManager,
+    proxies: &[AnyOutboundHandler],
+    url: &str,
+    extra_urls: &[String],
+    check_state: &tokio::sync::Mutex<Option<Instant>>,
+) {
+    let requested_at = Instant::now();
+    let mut last_completed = check_state.lock().await;
+    if last_completed.is_some_and(|completed| {
+        completed >= requested_at
+            || requested_at.duration_since(completed) < Duration::from_secs(1)
+    }) {
+        debug!("coalesced duplicate healthcheck");
+        return;
+    }
+    check_urls(proxy_manager, proxies, url, extra_urls).await;
+    *last_completed = Some(Instant::now());
 }
 
 #[cfg(test)]
@@ -194,5 +229,17 @@ mod tests {
             healthcheck.extra_urls.read().as_slice(),
             &["https://example.com/generate_204".to_owned()],
         );
+    }
+
+    #[tokio::test]
+    async fn duplicate_healthchecks_share_recent_completion() {
+        let manager = ProxyManager::new(Arc::new(MockClashResolver::new()), None);
+        let state = tokio::sync::Mutex::new(None);
+
+        run_check(&manager, &[], "https://example.com", &[], &state).await;
+        let first_completion = *state.lock().await;
+        run_check(&manager, &[], "https://example.com", &[], &state).await;
+
+        assert_eq!(*state.lock().await, first_completion);
     }
 }

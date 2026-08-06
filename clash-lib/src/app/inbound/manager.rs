@@ -100,13 +100,16 @@ impl Runner for InboundManager {
         let cancellation_token = self.cancellation_token.clone();
 
         tokio::spawn(async move {
-            Self::start_all_listeners(
+            if let Err(error) = Self::start_all_listeners(
                 dispatcher,
                 authenticator,
                 inbound_handlers,
                 cancellation_token,
             )
-            .await;
+            .await
+            {
+                error!("failed to start inbound listeners: {error}");
+            }
         });
     }
 
@@ -267,6 +270,7 @@ impl InboundManager {
                         );
                         if let Some(h) = entry.handle {
                             h.abort();
+                            let _ = h.await;
                         }
                     }
 
@@ -322,8 +326,14 @@ impl InboundManager {
                         .map(|runners| {
                             tokio::spawn(async move {
                                 tokio::select! {
-                                    _ = futures::future::join_all(runners) => {
-                                        warn!("Provider inbound {} exited", listener_name);
+                                    result = futures::future::try_join_all(runners) => {
+                                        match result {
+                                            Ok(_) => warn!("Provider inbound {} exited", listener_name),
+                                            Err(error) => error!(
+                                                "Provider inbound {} failed: {error}",
+                                                listener_name,
+                                            ),
+                                        }
                                     }
                                     _ = ct.cancelled() => {
                                         info!("Provider inbound {} closed", listener_name);
@@ -372,7 +382,7 @@ impl InboundManager {
         authenticator: ThreadSafeAuthenticator,
         inbound_handlers: Arc<RwLock<HashMap<InboundOpts, StaticHandleEntry>>>,
         cancellation_token: tokio_util::sync::CancellationToken,
-    ) {
+    ) -> Result<(), crate::Error> {
         for (opts, entry) in inbound_handlers.write().await.iter_mut() {
             let cancellation_token = cancellation_token.clone();
             let name = opts.common_opts().name.clone();
@@ -406,38 +416,82 @@ impl InboundManager {
                 authenticator.clone(),
                 users_rx,
             )
-            .map(|r| {
-                tokio::spawn(async move {
-                    tokio::select! {
-                        _ = futures::future::join_all(r) => {
-                            warn!("Inbound handler {} has exited", name);
-                        },
+                .map(|runners| {
+                    tokio::spawn(async move {
+                        tokio::select! {
+                            result = futures::future::try_join_all(runners) => {
+                                match result {
+                                    Ok(_) => warn!("Inbound handler {} has exited", name),
+                                    Err(error) => error!("Inbound handler {} failed: {error}", name),
+                                }
+                            },
                         _ = cancellation_token.cancelled() => {
                             info!("Inbound handler {} is closed", name);
                         },
                     }
-                })
-            });
+                    })
+                });
         }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let failed = {
+            let mut handlers = inbound_handlers.write().await;
+            handlers.iter_mut().find_map(|(opts, entry)| {
+                if opts.common_opts().port != 0
+                    && entry.handle.as_ref().is_some_and(JoinHandle::is_finished)
+                {
+                    Some((
+                        opts.common_opts().name.clone(),
+                        entry.handle.take().expect("finished listener has a handle"),
+                    ))
+                } else {
+                    None
+                }
+            })
+        };
+        if let Some((name, handle)) = failed {
+            let _ = handle.await;
+            return Err(crate::Error::Operation(format!(
+                "inbound listener {name} exited during startup"
+            )));
+        }
+        Ok(())
     }
 
     async fn stop_all_listeners(&self) {
-        for (opt, entry) in self.inbound_handlers.write().await.iter_mut() {
-            if let Some(handler) = entry.handle.take() {
-                warn!("Shutting down inbound handler: {}", opt.common_opts().name);
-                handler.abort();
-            }
+        let static_handles = {
+            let mut handlers = self.inbound_handlers.write().await;
+            handlers
+                .iter_mut()
+                .filter_map(|(opts, entry)| {
+                    entry
+                        .handle
+                        .take()
+                        .map(|handle| (opts.common_opts().name.clone(), handle))
+                })
+                .collect::<Vec<_>>()
+        };
+        let provider_handles = {
+            let mut providers = self.provider_handles.write().await;
+            providers
+                .values_mut()
+                .flat_map(|handles| handles.iter_mut())
+                .filter_map(|(opts, entry)| {
+                    entry
+                        .handle
+                        .take()
+                        .map(|handle| (opts.common_opts().name.clone(), handle))
+                })
+                .collect::<Vec<_>>()
+        };
+        for (name, handle) in static_handles {
+            warn!("Shutting down inbound handler: {name}");
+            handle.abort();
+            let _ = handle.await;
         }
-        for handles in self.provider_handles.write().await.values_mut() {
-            for (opt, entry) in handles.iter_mut() {
-                if let Some(h) = entry.handle.take() {
-                    warn!(
-                        "Shutting down provider inbound handler: {}",
-                        opt.common_opts().name
-                    );
-                    h.abort();
-                }
-            }
+        for (name, handle) in provider_handles {
+            warn!("Shutting down provider inbound handler: {name}");
+            handle.abort();
+            let _ = handle.await;
         }
     }
 
@@ -498,8 +552,7 @@ impl InboundManager {
             inbound_handlers,
             cancellation_token,
         )
-        .await;
-        Ok(())
+        .await
     }
 
     pub async fn get_ports(&self) -> Ports {

@@ -147,34 +147,35 @@ async fn get_proxy_delay(
     let mut headers = HeaderMap::new();
     headers.insert(header::CONNECTION, "close".parse().unwrap());
 
-    let (actual, overall) = if proxy.try_as_group_handler().is_some() {
-        match group_url_test(&outbound_manager, proxy, &q.url, timeout).await {
-            Ok(latency) => latency,
-            Err(err) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    headers,
-                    format!("get delay for {name} failed with error: {err}"),
-                )
-                    .into_response();
+    let (actual, overall) =
+        if proxy.try_as_group_handler().is_some() && q.expand_group() {
+            match group_url_test(&outbound_manager, proxy, &q.url, timeout).await {
+                Ok(latency) => latency,
+                Err(err) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        headers,
+                        format!("get delay for {name} failed with error: {err}"),
+                    )
+                        .into_response();
+                }
             }
-        }
-    } else {
-        let result = outbound_manager
-            .url_test(&vec![proxy], &q.url, timeout)
-            .await;
-        match result.first().expect("there must be at least one proxy") {
-            Ok(latency) => *latency,
-            Err(err) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    headers,
-                    format!("get delay for {name} failed with error: {err}"),
-                )
-                    .into_response();
+        } else {
+            let result = outbound_manager
+                .url_test(&vec![proxy], &q.url, timeout)
+                .await;
+            match result.first().expect("there must be at least one proxy") {
+                Ok(latency) => *latency,
+                Err(err) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        headers,
+                        format!("get delay for {name} failed with error: {err}"),
+                    )
+                        .into_response();
+                }
             }
-        }
-    };
+        };
 
     let selected = outbound_manager.selected_delay(actual, overall);
     let mut r = HashMap::new();
