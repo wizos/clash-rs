@@ -79,7 +79,10 @@ pub fn routes(
 
 async fn start_listeners(State(state): State<ConfigState>) -> impl IntoResponse {
     match state.inbound_manager.restart().await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            state.outbound_manager.start_healthchecks();
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("failed to start listeners: {error}"),
