@@ -267,6 +267,9 @@ fn setup_logging_inner(
     let subscriber =
         subscriber.with(Some(OsLogger::new("com.watfaq.clash", "default")));
 
+    #[cfg(target_os = "android")]
+    let subscriber = subscriber.with(android_log::AndroidLogLayer);
+
     tracing::subscriber::set_global_default(subscriber)
         .map_err(|x| anyhow!("setup logging error: {}", x))?;
 
@@ -348,6 +351,46 @@ impl tracing::field::Visit for EventVisitor<'_> {
         value: &dyn std::fmt::Debug,
     ) {
         self.push_debug(field, value);
+    }
+}
+
+#[cfg(target_os = "android")]
+mod android_log {
+    use super::EventVisitor;
+    use std::ffi::CString;
+    use tracing_subscriber::{Layer, layer::Context};
+
+    unsafe extern "C" {
+        fn __android_log_write(prio: i32, tag: *const u8, text: *const u8) -> i32;
+    }
+
+    const LOG_VERBOSE: i32 = 2;
+    const LOG_DEBUG: i32 = 3;
+    const LOG_INFO: i32 = 4;
+    const LOG_WARN: i32 = 5;
+    const LOG_ERROR: i32 = 6;
+
+    pub(super) struct AndroidLogLayer;
+
+    impl<S: tracing::Subscriber> Layer<S> for AndroidLogLayer {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+            let mut strs = vec![];
+            event.record(&mut EventVisitor(&mut strs));
+            let msg = strs.join(" ");
+            let prio = match *event.metadata().level() {
+                tracing::Level::ERROR => LOG_ERROR,
+                tracing::Level::WARN => LOG_WARN,
+                tracing::Level::INFO => LOG_INFO,
+                tracing::Level::DEBUG => LOG_DEBUG,
+                tracing::Level::TRACE => LOG_VERBOSE,
+            };
+            let tag = CString::new("clash-rs").unwrap();
+            if let Ok(cmsg) = CString::new(msg) {
+                unsafe {
+                    __android_log_write(prio, tag.as_ptr(), cmsg.as_ptr());
+                }
+            }
+        }
     }
 }
 
