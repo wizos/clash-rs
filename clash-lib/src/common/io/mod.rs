@@ -457,7 +457,7 @@ where
     A: AsyncRead + AsyncWrite + Unpin + ?Sized,
     B: AsyncRead + AsyncWrite + Unpin + ?Sized,
 {
-    let idle_timeout_duration = Duration::from_secs(60);
+    let idle_timeout_duration = Duration::from_secs(30);
     CopyBidirectional {
         a,
         b,

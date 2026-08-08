@@ -310,7 +310,7 @@ impl EnhancedResolver {
                 None
             },
             lru_cache: Some(RwLock::new(hickory_resolver::ResponseCache::new(
-                4096,
+                1024,
                 hickory_resolver::TtlConfig::default(),
             ))),
             policy: has_domain_policy.then_some(domain_policy),
@@ -331,7 +331,7 @@ impl EnhancedResolver {
                         store: if cfg.store_fake_ip {
                             Box::new(FileStore::new(store))
                         } else {
-                            Box::new(InMemStore::new(1000))
+                            Box::new(InMemStore::new(500))
                         },
                     })
                     .unwrap(),
@@ -355,7 +355,7 @@ impl EnhancedResolver {
                                              * different server after the ip is
                                              * reverse mapped to hostname and
                                              * being resolved again */
-                    4096,
+                    1024,
                 ),
             ))),
         }
