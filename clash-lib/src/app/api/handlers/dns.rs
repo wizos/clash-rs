@@ -26,12 +26,18 @@ pub fn routes(resolver: ThreadSafeDNSResolver) -> Router<Arc<AppState>> {
     Router::new()
         .route("/query", get(query_dns))
         .route("/flush", post(flush_dns))
+        .route("/flush/fakeip", post(flush_fakeip))
         .route("/system", put(update_system_dns))
         .with_state(state)
 }
 
 async fn flush_dns(State(state): State<DNSState>) -> impl IntoResponse {
     state.resolver.flush_cache().await;
+    StatusCode::NO_CONTENT
+}
+
+async fn flush_fakeip(State(state): State<DNSState>) -> impl IntoResponse {
+    state.resolver.flush_fakeip().await;
     StatusCode::NO_CONTENT
 }
 

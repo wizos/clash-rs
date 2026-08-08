@@ -27,6 +27,7 @@ pub trait Store: Sync + Send {
     async fn del_by_ip(&mut self, ip: net::IpAddr);
     async fn exist(&mut self, ip: net::IpAddr) -> bool;
     async fn copy_to(&self, store: &mut Box<dyn Store>);
+    async fn flush(&mut self);
 }
 
 pub type ThreadSafeFakeDns = Arc<RwLock<FakeDns>>;
@@ -154,6 +155,11 @@ impl FakeDns {
         let ip = net::Ipv4Addr::from(self.min + self.offset - 1);
         self.store.put_by_ip(std::net::IpAddr::V4(ip), host).await;
         std::net::IpAddr::V4(ip)
+    }
+
+    pub async fn flush(&mut self) {
+        self.store.flush().await;
+        self.offset = 0;
     }
 
     fn ip_to_uint(ip: &net::Ipv4Addr) -> u32 {

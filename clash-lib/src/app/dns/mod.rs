@@ -113,6 +113,7 @@ pub trait ClashResolver: Sync + Send {
     fn set_ipv6(&self, enable: bool);
 
     async fn flush_cache(&self) {}
+    async fn flush_fakeip(&self) {}
 
     fn kind(&self) -> ResolverKind;
 }

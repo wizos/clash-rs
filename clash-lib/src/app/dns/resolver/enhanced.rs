@@ -820,6 +820,12 @@ impl ClashResolver for EnhancedResolver {
         }
     }
 
+    async fn flush_fakeip(&self) {
+        if let Some(fake_dns) = &self.fake_dns {
+            fake_dns.write().await.flush().await;
+        }
+    }
+
     fn kind(&self) -> ResolverKind {
         ResolverKind::Clash
     }

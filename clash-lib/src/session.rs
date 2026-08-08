@@ -380,9 +380,9 @@ pub enum Type {
     Socks5,
     #[cfg(feature = "tun")]
     Tun,
-    #[cfg(all(target_os = "linux", feature = "tproxy"))]
+    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "tproxy"))]
     Tproxy,
-    #[cfg(all(target_os = "linux", feature = "redir"))]
+    #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "redir"))]
     Redir,
     Tunnel,
     Shadowsocks,

@@ -43,10 +43,10 @@ pub mod http;
 pub mod mixed;
 #[cfg(feature = "openvpn")]
 pub mod openvpn;
-#[cfg(all(target_os = "linux", feature = "tproxy"))]
+#[cfg(all(any(target_os = "linux", target_os = "android"), feature = "tproxy"))]
 pub mod tproxy;
 
-#[cfg(all(target_os = "linux", feature = "redir"))]
+#[cfg(all(any(target_os = "linux", target_os = "android"), feature = "redir"))]
 pub mod redir;
 
 pub(crate) mod datagram;
