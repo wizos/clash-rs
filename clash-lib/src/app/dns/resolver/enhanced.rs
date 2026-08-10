@@ -826,6 +826,33 @@ impl ClashResolver for EnhancedResolver {
         }
     }
 
+    async fn reset_connections(&self) {
+        let mut clients = Vec::new();
+        clients.extend(self.main.iter().cloned());
+        clients.extend(
+            self.fallback
+                .iter()
+                .flat_map(|fallback| fallback.iter().cloned()),
+        );
+        if let Some(policy) = &self.policy {
+            policy.traverse(|_, policy_clients| {
+                clients.extend(policy_clients.iter().cloned());
+                true
+            });
+        }
+        for policy in &self.geosite_policy {
+            clients.extend(policy.clients.iter().cloned());
+        }
+        clients.extend(
+            self.proxy_resolver
+                .iter()
+                .flat_map(|resolvers| resolvers.iter().cloned()),
+        );
+        for client in clients {
+            client.reset_connection().await;
+        }
+    }
+
     fn kind(&self) -> ResolverKind {
         ResolverKind::Clash
     }
@@ -863,7 +890,10 @@ mod tests {
     };
     use std::{
         net::Ipv4Addr,
-        sync::{Arc, OnceLock},
+        sync::{
+            Arc, OnceLock,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::Instant,
     };
     use tokio::sync::RwLock;
@@ -928,6 +958,27 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct ResetCountingDnsClient(Arc<AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl DnsClientTrait for ResetCountingDnsClient {
+        fn id(&self) -> String {
+            "reset-counting".to_owned()
+        }
+
+        async fn exchange(
+            &self,
+            message: &op::Message,
+        ) -> anyhow::Result<op::Message> {
+            Ok(message.clone())
+        }
+
+        async fn reset_connection(&self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
     fn dns_query(domain: &str) -> op::Message {
         let mut message = op::Message::query();
         let mut query = op::Query::new();
@@ -971,6 +1022,17 @@ mod tests {
         let response = resolver.exchange_proxy_server(&message).await.unwrap();
 
         assert_eq!(response.queries[0].query_type(), rr::RecordType::HTTPS);
+    }
+
+    #[tokio::test]
+    async fn reset_connections_reaches_configured_dns_clients() {
+        let resets = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::new_default().await;
+        resolver.main = vec![Arc::new(ResetCountingDnsClient(resets.clone()))];
+
+        resolver.reset_connections().await;
+
+        assert_eq!(resets.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

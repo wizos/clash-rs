@@ -628,6 +628,14 @@ impl Client for DnsClient {
             .map_err(|x| Error::DNSError(x.to_string()).into())
             .map(|x: op::DnsResponse| x.into_message())
     }
+
+    async fn reset_connection(&self) {
+        let mut inner = self.inner.write().await;
+        if let Some(background) = inner.bg_handle.take() {
+            background.abort();
+        }
+        inner.c = None;
+    }
 }
 
 async fn dns_stream_builder(

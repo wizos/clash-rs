@@ -69,6 +69,13 @@ impl Client for DhcpClient {
         )
         .await?
     }
+
+    async fn reset_connection(&self) {
+        let clients = self.inner.lock().await.clients.clone();
+        for client in clients {
+            client.reset_connection().await;
+        }
+    }
 }
 
 impl DhcpClient {

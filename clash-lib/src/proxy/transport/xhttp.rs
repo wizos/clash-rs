@@ -37,6 +37,23 @@ use crate::{
     session::SocksAddr,
 };
 
+/// Log xhttp errors, downgrading benign stream closures to debug level.
+/// Benign closures include: NO_ERROR RST_STREAM ("not a result of an error"),
+/// broken pipe, and inactive stream — the remote peer closed normally.
+macro_rules! xhttp_err {
+    ($($arg:tt)*) => {{
+        let msg = format!($($arg)*);
+        if msg.contains("not a result of an error")
+            || msg.contains("broken pipe")
+            || msg.contains("inactive stream")
+        {
+            debug!("{msg}");
+        } else {
+            error!("{msg}");
+        }
+    }};
+}
+
 const DEFAULT_MAX_EACH_POST_BYTES: usize = 1_000_000;
 const DEFAULT_MIN_POSTS_INTERVAL_MS: usize = 30;
 type H3Sender = h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>;
@@ -942,7 +959,7 @@ impl Client {
                     }
                     .await;
                     if let Err(error_value) = result {
-                        error!("xhttp HTTP/1.1 download error: {error_value}");
+                        xhttp_err!("xhttp HTTP/1.1 download error: {error_value}");
                     }
                     let _ = output.shutdown().await;
                 });
@@ -995,7 +1012,7 @@ impl Client {
             if let Err(error_value) =
                 copy_http1_upload(upload_reader, body_sender).await
             {
-                error!("xhttp HTTP/1.1 stream-one upload error: {error_value}");
+                xhttp_err!("xhttp HTTP/1.1 stream-one upload error: {error_value}");
             }
         });
         tokio::spawn(async move {
@@ -1022,7 +1039,7 @@ impl Client {
             }
             .await;
             if let Err(error_value) = result {
-                error!("xhttp HTTP/1.1 stream-one download error: {error_value}");
+                xhttp_err!("xhttp HTTP/1.1 stream-one download error: {error_value}");
             }
             let _ = download_writer.shutdown().await;
         });
@@ -1098,7 +1115,7 @@ impl Client {
                     if let Err(error_value) =
                         copy_http1_upload(upload_reader, body_sender).await
                     {
-                        error!("xhttp HTTP/1.1 stream-up body error: {error_value}");
+                        xhttp_err!("xhttp HTTP/1.1 stream-up body error: {error_value}");
                     }
                 });
                 tokio::spawn(async move {
@@ -1117,7 +1134,7 @@ impl Client {
                             response.status()
                         ),
                         Err(error_value) => {
-                            error!("xhttp HTTP/1.1 stream-up error: {error_value}")
+                            xhttp_err!("xhttp HTTP/1.1 stream-up error: {error_value}")
                         }
                     }
                 });
@@ -1171,7 +1188,7 @@ impl Client {
                     }
                     .await;
                     if let Err(error_value) = result {
-                        error!("xhttp HTTP/1.1 packet-up error: {error_value}");
+                        xhttp_err!("xhttp HTTP/1.1 packet-up error: {error_value}");
                     }
                 });
             }
@@ -1274,7 +1291,7 @@ impl Client {
             }
             .await;
             if let Err(error_value) = result {
-                error!("xhttp packet-up upload error: {error_value}");
+                xhttp_err!("xhttp packet-up upload error: {error_value}");
             }
         });
         Ok(Box::new(application))
@@ -1343,7 +1360,7 @@ impl Client {
             if error_value.is_h3_no_error() {
                 debug!("xhttp HTTP/3 connection closed: {error_value}");
             } else {
-                error!("xhttp HTTP/3 connection failed: {error_value}");
+                xhttp_err!("xhttp HTTP/3 connection failed: {error_value}");
             }
             drop(endpoint);
         });
@@ -1376,7 +1393,7 @@ impl Client {
         .map_err(map_io_error)?;
         tokio::spawn(async move {
             if let Err(error_value) = connection.await {
-                error!("xhttp HTTP/1.1 {label} connection error: {error_value}");
+                xhttp_err!("xhttp HTTP/1.1 {label} connection error: {error_value}");
             }
         });
         let sender = Arc::new(tokio::sync::Mutex::new(sender));
@@ -1417,7 +1434,7 @@ impl Client {
         let mut ping_pong = connection.ping_pong();
         tokio::spawn(async move {
             if let Err(error_value) = connection.await {
-                error!("xhttp HTTP/2 {label} connection error: {error_value}");
+                xhttp_err!("xhttp HTTP/2 {label} connection error: {error_value}");
             }
         });
         if let Some(interval) =
@@ -1534,7 +1551,7 @@ impl Client {
             if let Err(error_value) =
                 copy_h3_upload(upload_reader, upload_send).await
             {
-                error!("xhttp HTTP/3 stream-up upload error: {error_value}");
+                xhttp_err!("xhttp HTTP/3 stream-up upload error: {error_value}");
             }
         });
         tokio::spawn(async move {
@@ -1623,7 +1640,7 @@ impl Client {
             }
             .await;
             if let Err(error_value) = result {
-                error!("xhttp HTTP/3 packet-up upload error: {error_value}");
+                xhttp_err!("xhttp HTTP/3 packet-up upload error: {error_value}");
             }
         });
         Ok(Box::new(application))
@@ -2632,7 +2649,7 @@ fn spawn_stream(
     spawn_download(response, download_writer, label);
     tokio::spawn(async move {
         if let Err(error_value) = copy_upload(upload_reader, upload).await {
-            error!("xhttp {label} upload error: {error_value}");
+            xhttp_err!("xhttp {label} upload error: {error_value}");
         }
     });
     Box::new(application)
@@ -2648,7 +2665,7 @@ fn spawn_h3_stream(
     let (upload_reader, mut download_writer) = tokio::io::split(worker);
     tokio::spawn(async move {
         if let Err(error_value) = copy_h3_upload(upload_reader, upload).await {
-            error!("xhttp HTTP/3 {label} upload error: {error_value}");
+            xhttp_err!("xhttp HTTP/3 {label} upload error: {error_value}");
         }
     });
     tokio::spawn(async move {
@@ -2748,7 +2765,7 @@ fn spawn_download(
         }
         .await;
         if let Err(error_value) = result {
-            error!("xhttp {label} error: {error_value}");
+            xhttp_err!("xhttp {label} error: {error_value}");
         }
         let _ = output.shutdown().await;
     });

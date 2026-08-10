@@ -19,7 +19,7 @@ use std::{
     collections::{HashMap, VecDeque},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -32,6 +32,39 @@ pub mod providers;
 pub const MIN_HEALTHCHECK_CONCURRENCY: usize = 1;
 pub const DEFAULT_HEALTHCHECK_CONCURRENCY: usize = 40;
 pub const MAX_HEALTHCHECK_CONCURRENCY: usize = 40;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum NetworkLinkState {
+    #[default]
+    Unknown,
+    Available,
+    Unavailable,
+}
+
+impl NetworkLinkState {
+    fn allows_healthcheck(self) -> bool {
+        self != Self::Unavailable
+    }
+}
+
+static NETWORK_LINK_STATE: AtomicU8 = AtomicU8::new(NetworkLinkState::Unknown as u8);
+
+pub fn set_network_link_state(state: NetworkLinkState) {
+    NETWORK_LINK_STATE.store(state as u8, Ordering::Release);
+}
+
+pub fn network_link_state() -> NetworkLinkState {
+    match NETWORK_LINK_STATE.load(Ordering::Acquire) {
+        value if value == NetworkLinkState::Available as u8 => {
+            NetworkLinkState::Available
+        }
+        value if value == NetworkLinkState::Unavailable as u8 => {
+            NetworkLinkState::Unavailable
+        }
+        _ => NetworkLinkState::Unknown,
+    }
+}
 
 struct ProxyCheckOutcome {
     result: std::io::Result<(Duration, Duration)>,
@@ -235,6 +268,15 @@ impl ProxyManager {
         url: &str,
         timeout: Option<Duration>,
     ) -> Vec<std::io::Result<(Duration, Duration)>> {
+        if !network_link_state().allows_healthcheck() {
+            debug!(
+                "skipping healthcheck: network link unavailable, total={}",
+                outbounds.len()
+            );
+            return (0..outbounds.len())
+                .map(|_| Err(new_io_error("network link unavailable")))
+                .collect();
+        }
         let started_at = std::time::Instant::now();
         let concurrency = self.healthcheck_concurrency.load(Ordering::Acquire);
         let manager = self.clone();
@@ -349,6 +391,9 @@ impl ProxyManager {
         outbound: AnyOutboundHandler,
         url: &str,
     ) {
+        if !network_link_state().allows_healthcheck() {
+            return;
+        }
         use crate::config::internal::proxy::{
             PROXY_COMPATIBLE, PROXY_DIRECT, PROXY_REJECT,
         };
@@ -1311,6 +1356,20 @@ mod tests {
         assert_eq!(manager.healthcheck_semaphore.available_permits(), 1);
         assert!(manager.set_healthcheck_concurrency(0).await.is_err());
         assert!(manager.set_healthcheck_concurrency(41).await.is_err());
+    }
+
+    #[test]
+    fn network_link_gate_blocks_only_unavailable_state() {
+        assert!(
+            remote_content_manager::NetworkLinkState::Unknown.allows_healthcheck()
+        );
+        assert!(
+            remote_content_manager::NetworkLinkState::Available.allows_healthcheck()
+        );
+        assert!(
+            !remote_content_manager::NetworkLinkState::Unavailable
+                .allows_healthcheck()
+        );
     }
 
     #[tokio::test]

@@ -90,6 +90,12 @@ impl Client for SystemDnsClient {
         )
         .await?
     }
+
+    async fn reset_connection(&self) {
+        for client in self.get_clients() {
+            client.reset_connection().await;
+        }
+    }
 }
 
 impl SystemDnsClient {

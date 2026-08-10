@@ -18,7 +18,7 @@ use tower_http::{
     services::ServeDir,
     trace::TraceLayer,
 };
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     GlobalState,
@@ -202,7 +202,9 @@ impl Runner for ApiRunner {
         let router = self.api_router();
 
         let ipc_addr = controller_cfg.external_controller_ipc;
-        let tcp_addr = controller_cfg.external_controller;
+        let tcp_addr = controller_cfg
+            .external_controller
+            .filter(|s| !s.trim().is_empty());
 
         let origins: AllowOrigin =
             if let Some(origins) = &controller_cfg.cors_allow_origins {
@@ -313,7 +315,7 @@ impl Runner for ApiRunner {
                 }
             };
             if let Err(e) = result {
-                error!("API server failed to start, error: {}", e);
+                warn!("API server failed to start, error: {}", e);
             }
         });
         *self.task_handle.lock().unwrap() = Some(handle);

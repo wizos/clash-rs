@@ -39,6 +39,7 @@ pub trait Client: Sync + Send + Debug {
     /// used to identify the client for logging
     fn id(&self) -> String;
     async fn exchange(&self, msg: &op::Message) -> anyhow::Result<op::Message>;
+    async fn reset_connection(&self) {}
 }
 
 type ThreadSafeDNSClient = Arc<dyn Client>;
@@ -114,6 +115,7 @@ pub trait ClashResolver: Sync + Send {
 
     async fn flush_cache(&self) {}
     async fn flush_fakeip(&self) {}
+    async fn reset_connections(&self) {}
 
     fn kind(&self) -> ResolverKind;
 }
