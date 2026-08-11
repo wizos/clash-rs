@@ -1039,7 +1039,9 @@ impl Client {
             }
             .await;
             if let Err(error_value) = result {
-                xhttp_err!("xhttp HTTP/1.1 stream-one download error: {error_value}");
+                xhttp_err!(
+                    "xhttp HTTP/1.1 stream-one download error: {error_value}"
+                );
             }
             let _ = download_writer.shutdown().await;
         });
@@ -1115,7 +1117,9 @@ impl Client {
                     if let Err(error_value) =
                         copy_http1_upload(upload_reader, body_sender).await
                     {
-                        xhttp_err!("xhttp HTTP/1.1 stream-up body error: {error_value}");
+                        xhttp_err!(
+                            "xhttp HTTP/1.1 stream-up body error: {error_value}"
+                        );
                     }
                 });
                 tokio::spawn(async move {
@@ -1134,7 +1138,9 @@ impl Client {
                             response.status()
                         ),
                         Err(error_value) => {
-                            xhttp_err!("xhttp HTTP/1.1 stream-up error: {error_value}")
+                            xhttp_err!(
+                                "xhttp HTTP/1.1 stream-up error: {error_value}"
+                            )
                         }
                     }
                 });

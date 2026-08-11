@@ -103,9 +103,15 @@ impl Type {
             Type::Socks5 => "SOCKS",
             #[cfg(feature = "tun")]
             Type::Tun => "TUN",
-            #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "tproxy"))]
+            #[cfg(all(
+                any(target_os = "linux", target_os = "android"),
+                feature = "tproxy"
+            ))]
             Type::Tproxy => "TPROXY",
-            #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "redir"))]
+            #[cfg(all(
+                any(target_os = "linux", target_os = "android"),
+                feature = "redir"
+            ))]
             Type::Redir => "REDIR",
             Type::Tunnel => "TUNNEL",
             Type::Shadowsocks => "SHADOWSOCKS",

@@ -16,7 +16,10 @@ use crate::{
 
 #[cfg(all(any(target_os = "linux", target_os = "android"), feature = "redir"))]
 use crate::proxy::redir::RedirInbound;
-#[cfg(all(any(target_os = "linux", target_os = "android"), feature = "tproxy"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    feature = "tproxy"
+))]
 use crate::proxy::tproxy::TproxyInbound;
 
 use crate::Dispatcher;
