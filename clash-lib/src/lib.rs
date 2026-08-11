@@ -155,6 +155,21 @@ fn external_tun_config(
         }
     }
 
+    let dns_hijack_targets = dns
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::parse::<std::net::IpAddr>)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| {
+            Error::InvalidConfig(format!("invalid DNS hijack address: {error}"))
+        })?;
+    let dns_hijack = !dns_hijack_targets.is_empty();
+    let dns_hijack_targets = dns_hijack_targets
+        .into_iter()
+        .filter(|address| !address.is_unspecified())
+        .collect();
+
     Ok(config::internal::config::TunConfig {
         enable: true,
         device_id: format!("fd://{fd}"),
@@ -162,7 +177,8 @@ fn external_tun_config(
             Error::InvalidConfig("tun requires an IPv4 address".to_string())
         })?,
         gateway_v6,
-        dns_hijack: !dns.trim().is_empty(),
+        dns_hijack,
+        dns_hijack_targets,
         ..Default::default()
     })
 }
@@ -1323,7 +1339,18 @@ mod tests {
             Some("fdfe:dcba:9876::1/126"),
         );
         assert!(config.dns_hijack);
+        assert_eq!(
+            config.dns_hijack_targets,
+            vec![
+                "172.19.0.2".parse::<std::net::IpAddr>().unwrap(),
+                "fdfe:dcba:9876::2".parse::<std::net::IpAddr>().unwrap(),
+            ],
+        );
         assert!(!config.route_all);
+        let any_dns =
+            crate::external_tun_config(42, "172.19.0.1/30", "0.0.0.0").unwrap();
+        assert!(any_dns.dns_hijack);
+        assert!(any_dns.dns_hijack_targets.is_empty());
         assert!(crate::external_tun_config(0, "172.19.0.1/30", "").is_err());
     }
 

@@ -9,8 +9,16 @@ use crate::{
     session::{Network, Session, Type},
 };
 use futures::{Sink, Stream, ready};
-use std::{sync::Arc, task::Poll};
+use std::{net::IpAddr, sync::Arc, task::Poll};
 use tracing::{debug, trace, warn};
+
+fn log_netstack_send_error(error: &std::io::Error) {
+    if error.kind() == std::io::ErrorKind::BrokenPipe {
+        debug!("stopped sending UDP packets to closed netstack");
+    } else {
+        warn!("failed to send udp packet to netstack: {}", error);
+    }
+}
 
 pub(crate) async fn handle_inbound_datagram(
     socket: watfaq_netstack::UdpSocket,
@@ -18,6 +26,7 @@ pub(crate) async fn handle_inbound_datagram(
     resolver: ThreadSafeDNSResolver,
     so_mark: Option<u32>,
     dns_hijack: bool,
+    dns_hijack_targets: Vec<IpAddr>,
 ) {
     // tun i/o
     // lr: app packets went into tun will be accessed from lr
@@ -72,7 +81,7 @@ pub(crate) async fn handle_inbound_datagram(
                 )
                 .await
             {
-                warn!("failed to send udp packet to netstack: {}", e);
+                log_netstack_send_error(&e);
             }
         }
     });
@@ -104,7 +113,12 @@ pub(crate) async fn handle_inbound_datagram(
 
             trace!("tun -> dispatcher: {:?}", pkt);
 
-            if dns_hijack && pkt.dst_addr.port() == 53 {
+            if should_hijack_dns(
+                dns_hijack,
+                &dns_hijack_targets,
+                pkt.dst_addr.ip(),
+                pkt.dst_addr.port(),
+            ) {
                 trace!("got dns packet: {:?}, returning from Clash DNS server", pkt);
 
                 match hickory_proto::op::Message::from_vec(&pkt.data) {
@@ -129,11 +143,7 @@ pub(crate) async fn handle_inbound_datagram(
                                             )
                                             .await
                                         {
-                                            warn!(
-                                                "failed to send udp packet to \
-                                                 netstack: {}",
-                                                e
-                                            );
+                                            log_netstack_send_error(&e);
                                         }
                                     }
                                     Err(e) => {
@@ -191,6 +201,41 @@ pub(crate) async fn handle_inbound_datagram(
     debug!("tun UDP ready");
 
     let _ = futures::future::join(fut1, fut2).await;
+}
+
+pub(super) fn should_hijack_dns(
+    enabled: bool,
+    targets: &[IpAddr],
+    destination: Option<IpAddr>,
+    port: u16,
+) -> bool {
+    enabled
+        && port == 53
+        && (targets.is_empty()
+            || destination.is_some_and(|address| targets.contains(&address)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_hijack_dns;
+
+    #[test]
+    fn dns_hijack_respects_android_target_addresses() {
+        let dns = "172.19.0.2".parse().unwrap();
+        assert!(should_hijack_dns(true, &[dns], Some(dns), 53));
+        assert!(!should_hijack_dns(
+            true,
+            &[dns],
+            Some("8.8.8.8".parse().unwrap()),
+            53,
+        ));
+        assert!(should_hijack_dns(
+            true,
+            &[],
+            Some("8.8.8.8".parse().unwrap()),
+            53,
+        ));
+    }
 }
 
 #[derive(Debug)]

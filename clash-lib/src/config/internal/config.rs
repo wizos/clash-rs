@@ -266,6 +266,7 @@ pub struct TunConfig {
     pub so_mark: Option<u32>,
     pub route_table: u32,
     pub dns_hijack: bool,
+    pub dns_hijack_targets: Vec<IpAddr>,
     pub auto_detect_interface: bool,
 }
 

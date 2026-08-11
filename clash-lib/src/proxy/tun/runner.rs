@@ -350,6 +350,7 @@ impl Runner for TunRunner {
         let dispatcher = self.dispatcher.clone();
         let resolver = self.resolver.clone();
         let dns_hijack = self.cfg.dns_hijack;
+        let dns_hijack_targets = self.cfg.dns_hijack_targets.clone();
         let cancellation_token = self.cancellation_token.clone();
         let ready_tx = self.ready_tx.lock().unwrap().take();
 
@@ -458,6 +459,8 @@ impl Runner for TunRunner {
             };
 
             let dsp = dispatcher.clone();
+            let tcp_resolver = resolver.clone();
+            let tcp_dns_hijack_targets = dns_hijack_targets.clone();
             let mut fut_tcp_dispatch = async || {
                 while let Some(stream) = tcp_listener.next().await {
                     debug!(
@@ -469,7 +472,10 @@ impl Runner for TunRunner {
                     tokio::spawn(handle_inbound_stream(
                         stream,
                         dsp.clone(),
+                        tcp_resolver.clone(),
                         so_mark,
+                        dns_hijack,
+                        tcp_dns_hijack_targets.clone(),
                     ));
                 }
 
@@ -482,6 +488,7 @@ impl Runner for TunRunner {
                     resolver.clone(),
                     so_mark,
                     dns_hijack,
+                    dns_hijack_targets,
                 )
                 .await;
                 Err(Error::Operation("tun stopped unexpectedly 3".to_string()))

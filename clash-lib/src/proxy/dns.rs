@@ -9,7 +9,7 @@ use std::{
 use async_trait::async_trait;
 use erased_serde::Serialize as ErasedSerialize;
 use futures::{Sink, SinkExt, Stream};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_util::sync::PollSender;
 
 use crate::{
@@ -50,6 +50,55 @@ impl Debug for Handler {
 
 impl DialWithConnector for Handler {}
 
+pub(crate) async fn relay_tcp<S>(mut stream: S, resolver: ThreadSafeDNSResolver)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    loop {
+        let size = match stream.read_u16().await {
+            Ok(size) => size as usize,
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(error) => {
+                tracing::debug!("dns TCP read failed: {error}");
+                break;
+            }
+        };
+        let mut data = vec![0u8; size];
+        if let Err(error) = stream.read_exact(&mut data).await {
+            tracing::debug!("dns TCP payload read failed: {error}");
+            break;
+        }
+        let request = match hickory_proto::op::Message::from_vec(&data) {
+            Ok(request) => request,
+            Err(error) => {
+                tracing::debug!("dns TCP decode failed: {error}");
+                break;
+            }
+        };
+        let response = match exchange_with_resolver(&resolver, &request, true).await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::debug!("dns TCP exchange failed: {error}");
+                break;
+            }
+        };
+        let data = match response.to_vec() {
+            Ok(data) => data,
+            Err(error) => {
+                tracing::debug!("dns TCP encode failed: {error}");
+                break;
+            }
+        };
+        if data.len() > u16::MAX as usize
+            || stream.write_u16(data.len() as u16).await.is_err()
+            || stream.write_all(&data).await.is_err()
+        {
+            break;
+        }
+    }
+}
+
 #[async_trait]
 impl OutboundHandler for Handler {
     fn name(&self) -> &str {
@@ -69,56 +118,8 @@ impl OutboundHandler for Handler {
         _sess: &Session,
         resolver: ThreadSafeDNSResolver,
     ) -> io::Result<BoxedChainedStream> {
-        let (client, mut relay) = tokio::io::duplex(128 * 1024);
-        tokio::spawn(async move {
-            loop {
-                let size = match relay.read_u16().await {
-                    Ok(size) => size as usize,
-                    Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
-                        break;
-                    }
-                    Err(error) => {
-                        tracing::debug!("dns outbound TCP read failed: {error}");
-                        break;
-                    }
-                };
-                let mut data = vec![0u8; size];
-                if let Err(error) = relay.read_exact(&mut data).await {
-                    tracing::debug!("dns outbound TCP payload read failed: {error}");
-                    break;
-                }
-                let request = match hickory_proto::op::Message::from_vec(&data) {
-                    Ok(request) => request,
-                    Err(error) => {
-                        tracing::debug!("dns outbound TCP decode failed: {error}");
-                        break;
-                    }
-                };
-                let response =
-                    match exchange_with_resolver(&resolver, &request, true).await {
-                        Ok(response) => response,
-                        Err(error) => {
-                            tracing::debug!(
-                                "dns outbound TCP exchange failed: {error}"
-                            );
-                            break;
-                        }
-                    };
-                let data = match response.to_vec() {
-                    Ok(data) => data,
-                    Err(error) => {
-                        tracing::debug!("dns outbound TCP encode failed: {error}");
-                        break;
-                    }
-                };
-                if data.len() > u16::MAX as usize
-                    || relay.write_u16(data.len() as u16).await.is_err()
-                    || relay.write_all(&data).await.is_err()
-                {
-                    break;
-                }
-            }
-        });
+        let (client, relay) = tokio::io::duplex(128 * 1024);
+        tokio::spawn(relay_tcp(relay, resolver));
 
         let stream = ChainedStreamWrapper::new(client);
         stream.append_to_chain(self.name()).await;
