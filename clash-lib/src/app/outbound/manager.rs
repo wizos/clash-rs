@@ -269,11 +269,13 @@ impl OutboundManager {
     ) {
         let alive = self.proxy_manager.alive(name).await;
         let history = self.proxy_manager.delay_history(name).await;
+        let health_by_url = self.proxy_manager.health_by_url(name).await;
         let support_udp = proxy.support_udp().await;
 
         let id = Uuid::new_v5(&Uuid::NAMESPACE_OID, name.as_bytes());
         m.insert("id".to_string(), Box::new(id.to_string()));
         m.insert("history".to_string(), Box::new(history));
+        m.insert("healthByUrl".to_string(), Box::new(health_by_url));
         m.insert("alive".to_string(), Box::new(alive));
         m.insert("name".to_string(), Box::new(name.to_owned()));
         m.insert("type".to_string(), Box::new(proxy.proto().to_string()));

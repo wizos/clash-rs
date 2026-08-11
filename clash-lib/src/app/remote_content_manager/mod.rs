@@ -351,6 +351,7 @@ impl ProxyManager {
         } else {
             debug!("{summary}{metrics}");
         }
+        crate::app::events::emit_app("healthcheck", ());
         outcomes.into_iter().map(|outcome| outcome.result).collect()
     }
 
@@ -464,6 +465,35 @@ impl ProxyManager {
             .map(|x| x.delay_history.clone())
             .unwrap_or_default()
             .into()
+    }
+
+    pub async fn health_by_url(&self, name: &str) -> HashMap<String, u64> {
+        let mut health: HashMap<String, u64> = self
+            .proxy_state
+            .read()
+            .await
+            .get(name)
+            .map(|state| {
+                state
+                    .delay_by_url
+                    .iter()
+                    .map(|(url, delay)| {
+                        let delay = delay
+                            .map(|value| {
+                                u64::try_from(value.as_millis()).unwrap_or(u64::MAX)
+                            })
+                            .unwrap_or_default();
+                        (url.clone(), delay)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        for ((proxy_name, url), result) in self.failure_checks.lock().await.iter() {
+            if proxy_name == name && result.is_none() {
+                health.insert(url.clone(), 0);
+            }
+        }
+        health
     }
 
     pub async fn last_delay(&self, name: &str) -> Option<Duration> {
@@ -1453,6 +1483,9 @@ mod tests {
                 .await,
             Some(Duration::from_millis(10)),
         );
+        let health = manager.health_by_url("node").await;
+        assert_eq!(health.get("https://failed.example"), Some(&0));
+        assert_eq!(health.get("https://alive.example"), Some(&10));
     }
 
     #[tokio::test]
