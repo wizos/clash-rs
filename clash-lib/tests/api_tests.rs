@@ -116,6 +116,50 @@ rules:
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn listener_start_reports_the_port_bind_error() {
+    let api_port = alloc_ports(2);
+    let mixed_port = api_port + 1;
+    let occupied = std::net::TcpListener::bind(("0.0.0.0", mixed_port)).unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let config = format!(
+        r#"
+external-controller: 127.0.0.1:{api_port}
+mixed-port: {mixed_port}
+mode: direct
+rules:
+  - MATCH,DIRECT
+"#,
+    );
+    let instance = clash_lib::start_scaffold_instance_deferred_inbounds(Options {
+        config: Config::Str(config),
+        cwd: Some(cwd.path().to_string_lossy().to_string()),
+        rt: None,
+        log_file: None,
+        config_path: None,
+    })
+    .unwrap();
+    wait_port_ready(api_port).unwrap();
+
+    let url = format!("http://127.0.0.1:{api_port}/configs/listeners/start");
+    let request = hyper::Request::builder()
+        .method(http::method::Method::POST)
+        .uri(&url)
+        .body(http_body_util::Empty::<Bytes>::new())
+        .unwrap();
+    let response = send_http_request(url.parse().unwrap(), request)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+    let body =
+        String::from_utf8(response.collect().await.unwrap().to_bytes().to_vec())
+            .unwrap();
+    assert!(body.contains("Address already in use"), "{body}");
+
+    drop(occupied);
+    instance.shutdown().unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn test_wildcard_cors_returns_any_origin_header() {
     let port_base = alloc_ports(CLIENT_PORT_BLOCK);
     let wd =

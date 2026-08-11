@@ -40,7 +40,7 @@ struct ProviderHandleEntry {
 
 /// Per-listener handle entry for static (non-provider) inbounds.
 struct StaticHandleEntry {
-    handle: Option<JoinHandle<()>>,
+    handle: Option<JoinHandle<Result<(), crate::Error>>>,
     /// Present only for AnyTLS (and Shadowsocks) listeners — used to push
     /// updated user lists without restarting the listener.
     #[allow(dead_code)]
@@ -421,13 +421,20 @@ impl InboundManager {
                         tokio::select! {
                             result = futures::future::try_join_all(runners) => {
                                 match result {
-                                    Ok(_) => warn!("Inbound handler {} has exited", name),
-                                    Err(error) => error!("Inbound handler {} failed: {error}", name),
+                                    Ok(_) => {
+                                        warn!("Inbound handler {} has exited", name);
+                                        Ok(())
+                                    }
+                                    Err(error) => {
+                                        error!("Inbound handler {} failed: {error}", name);
+                                        Err(error)
+                                    }
                                 }
                             },
-                        _ = cancellation_token.cancelled() => {
-                            info!("Inbound handler {} is closed", name);
-                        },
+                            _ = cancellation_token.cancelled() => {
+                                info!("Inbound handler {} is closed", name);
+                                Ok(())
+                            },
                     }
                     })
                 });
@@ -449,10 +456,13 @@ impl InboundManager {
             })
         };
         if let Some((name, handle)) = failed {
-            let _ = handle.await;
-            return Err(crate::Error::Operation(format!(
-                "inbound listener {name} exited during startup"
-            )));
+            return match handle.await {
+                Ok(Err(error)) => Err(error),
+                Ok(Ok(())) => Err(crate::Error::Operation(format!(
+                    "inbound listener {name} exited during startup"
+                ))),
+                Err(error) => Err(std::io::Error::other(error).into()),
+            };
         }
         Ok(())
     }
@@ -505,14 +515,14 @@ impl InboundManager {
         for (opt, entry) in self.inbound_handlers.write().await.iter_mut() {
             if let Some(handler) = entry.handle.take() {
                 warn!("Shutting down inbound handler: {}", opt.common_opts().name);
-                handler.await.unwrap_or_else(|e| {
+                if let Err(e) = handler.await {
                     warn!(
                         "Inbound handler {} shutdown with error: {}",
                         opt.common_opts().name,
                         e
                     );
                     last_join_error = Some(e);
-                });
+                }
             }
         }
         for handles in self.provider_handles.write().await.values_mut() {
