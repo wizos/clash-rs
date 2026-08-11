@@ -1,5 +1,5 @@
 use crate::{stack::IfaceEvent, tcp_listener::TcpStreamHandle};
-use log::{error, trace};
+use log::trace;
 use std::{
     io::{Error, ErrorKind},
     net::SocketAddr,
@@ -33,7 +33,7 @@ impl Drop for TcpStream {
         self.handle.recv_waker.wake();
         self.handle.send_waker.wake();
         if let Err(e) = self.stack_notifier.send(IfaceEvent::TcpSocketClosed) {
-            error!("Failed to notify TCP socket closed: {e}");
+            trace!("TCP stack notifier already closed while dropping socket: {e}");
         }
     }
 }
@@ -58,7 +58,7 @@ impl TcpStream {
 
     fn notify_tcp_socket_ready(&self) {
         if let Err(e) = self.stack_notifier.send(IfaceEvent::TcpSocketReady) {
-            error!("Failed to notify TCP socket ready: {e}");
+            trace!("TCP stack notifier already closed while notifying ready: {e}");
         }
     }
 }

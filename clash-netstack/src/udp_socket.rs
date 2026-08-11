@@ -151,9 +151,32 @@ impl SplitWrite {
         match self.send.try_send(Packet::new(ip_packet_writer)) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                Err(std::io::Error::other("packet outbound channel closed"))
-            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "packet outbound channel closed",
+            )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn closed_outbound_channel_is_broken_pipe() {
+        let (send, recv) = mpsc::channel(1);
+        drop(recv);
+        let mut writer = SplitWrite { send };
+        let packet = (
+            vec![1],
+            "127.0.0.1:1000".parse().unwrap(),
+            "127.0.0.1:2000".parse().unwrap(),
+        )
+            .into();
+
+        let error = writer.send(packet).await.unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
     }
 }
