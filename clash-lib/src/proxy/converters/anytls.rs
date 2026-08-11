@@ -1,7 +1,5 @@
 use std::time::Duration;
 
-use tracing::warn;
-
 use crate::{
     Error,
     config::internal::proxy::OutboundAnytls,
@@ -27,12 +25,6 @@ impl TryFrom<&OutboundAnytls> for Handler {
 
     fn try_from(s: &OutboundAnytls) -> Result<Self, Self::Error> {
         let skip_cert_verify = s.skip_cert_verify.unwrap_or_default();
-        if skip_cert_verify {
-            warn!(
-                "skipping TLS cert verification for {}",
-                s.common_opts.server
-            );
-        }
         Ok(Handler::new(HandlerOptions {
             name: s.common_opts.name.to_owned(),
             common_opts: HandlerCommonOptions {

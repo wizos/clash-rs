@@ -1,5 +1,3 @@
-use tracing::warn;
-
 const DEFAULT_ALPN: [&str; 2] = ["h2", "http/1.1"];
 const DEFAULT_WS_ALPN: [&str; 1] = ["http/1.1"];
 
@@ -59,12 +57,6 @@ impl TryFrom<&OutboundTrojan> for Handler {
         }
 
         let skip_cert_verify = s.skip_cert_verify.unwrap_or_default();
-        if skip_cert_verify {
-            warn!(
-                "skipping TLS cert verification for {}",
-                s.common_opts.server
-            );
-        }
         if s.reality_opts.is_some()
             && !matches!(s.network.as_deref(), None | Some("" | "tcp"))
         {

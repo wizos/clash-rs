@@ -18,7 +18,6 @@ use crate::{
     },
 };
 use std::sync::Arc;
-use tracing::warn;
 
 fn xhttp_reuse_config(
     config: Option<&XHttpReuseSettings>,
@@ -194,14 +193,6 @@ impl TryFrom<&OutboundVless> for Handler {
         }
         if xudp {
             packet_addr = false;
-        }
-
-        let skip_cert_verify = s.skip_cert_verify.unwrap_or_default();
-        if skip_cert_verify {
-            warn!(
-                "skipping TLS cert verification for {}",
-                s.common_opts.server
-            );
         }
 
         let xhttp_h3 = s.network.as_deref() == Some("xhttp")

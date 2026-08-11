@@ -1,5 +1,3 @@
-use tracing::warn;
-
 use crate::{
     Error,
     config::internal::proxy::OutboundVmess,
@@ -43,13 +41,6 @@ impl TryFrom<&OutboundVmess> for Handler {
             packet_addr = false;
         }
 
-        let skip_cert_verify = s.skip_cert_verify.unwrap_or_default();
-        if skip_cert_verify {
-            warn!(
-                "skipping TLS cert verification for {}",
-                s.common_opts.server
-            );
-        }
         if s.reality_opts.is_some()
             && !matches!(s.network.as_deref(), None | Some("" | "tcp"))
         {
