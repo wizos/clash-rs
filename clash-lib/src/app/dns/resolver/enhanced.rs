@@ -331,7 +331,7 @@ impl EnhancedResolver {
                         store: if cfg.store_fake_ip {
                             Box::new(FileStore::new(store))
                         } else {
-                            Box::new(InMemStore::new(500))
+                            Box::new(InMemStore::new(1000))
                         },
                     })
                     .unwrap(),
