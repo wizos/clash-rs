@@ -26,6 +26,7 @@ pub(super) fn convert(
                     });
                     RuleProviderDef::Http(HttpRuleProvider {
                         url: h.url,
+                        proxy: h.proxy,
                         interval: h.interval,
                         behavior: h.behavior,
                         path,

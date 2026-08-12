@@ -20,6 +20,7 @@ use crate::{
         dns::{ThreadSafeDNSResolver, config::DNSListenAddr},
         inbound::manager::{InboundEndpoint, InboundManager, Ports},
         outbound::manager::ThreadSafeOutboundManager,
+        router::ArcRouter,
     },
     config::{def, internal::config::BindAddress},
 };
@@ -47,6 +48,7 @@ struct ConfigState {
     dns_listen_addr: DNSListenAddr,
     dns_enabled: bool,
     outbound_manager: ThreadSafeOutboundManager,
+    router: ArcRouter,
 }
 
 pub fn routes(
@@ -57,6 +59,7 @@ pub fn routes(
     dns_listen_addr: DNSListenAddr,
     dns_enabled: bool,
     outbound_manager: ThreadSafeOutboundManager,
+    router: ArcRouter,
 ) -> Router<Arc<AppState>> {
     Router::new()
         .route(
@@ -73,24 +76,50 @@ pub fn routes(
             dns_listen_addr,
             dns_enabled,
             outbound_manager,
+            router,
         })
 }
 
-async fn start_listeners(State(state): State<ConfigState>) -> impl IntoResponse {
+#[derive(Default, Deserialize)]
+struct StartListenerQuery {
+    #[serde(default, rename = "defer-healthchecks")]
+    defer_healthchecks: bool,
+}
+
+async fn start_listeners(
+    State(state): State<ConfigState>,
+    Query(query): Query<StartListenerQuery>,
+) -> impl IntoResponse {
+    let dns_listener = state.global_state.lock().await.dns_listener.clone();
+    if let Err(error) = dns_listener.start_and_wait().await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to start DNS listener: {error}"),
+        )
+            .into_response();
+    }
     match state.inbound_manager.restart().await {
         Ok(()) => {
-            state.outbound_manager.start_healthchecks();
+            if !query.defer_healthchecks {
+                state.outbound_manager.start_background_proxy_providers();
+                state.router.initialize_rule_providers();
+                state.outbound_manager.start_healthchecks();
+            }
             StatusCode::NO_CONTENT.into_response()
         }
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to start listeners: {error}"),
-        )
-            .into_response(),
+        Err(error) => {
+            dns_listener.stop_listener();
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to start listeners: {error}"),
+            )
+                .into_response()
+        }
     }
 }
 
 async fn stop_listeners(State(state): State<ConfigState>) -> impl IntoResponse {
+    state.global_state.lock().await.dns_listener.stop_listener();
     state.inbound_manager.stop_listeners().await;
     StatusCode::NO_CONTENT
 }
@@ -338,8 +367,7 @@ async fn patch_configs(
     if let Some(bind_address) = payload.bind_address.clone() {
         match bind_address.parse::<BindAddress>() {
             Ok(bind_address) => {
-                inbound_manager.set_bind_address(bind_address).await;
-                need_restart = true;
+                need_restart |= inbound_manager.set_bind_address(bind_address).await;
             }
             Err(_) => {
                 return (

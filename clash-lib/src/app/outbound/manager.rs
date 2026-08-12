@@ -59,7 +59,13 @@ use crate::{
 use anyhow::Result;
 use erased_serde::Serialize;
 use hyper::Uri;
-use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
+use parking_lot::Mutex;
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 use tracing::{debug, error, info};
 use uuid::Uuid;
 
@@ -82,6 +88,7 @@ pub struct OutboundManager {
     proxy_providers: HashMap<String, ArcProxyProvider>,
     proxy_manager: ProxyManager,
     selector_control: HashMap<String, ThreadSafeSelectorControl>,
+    started_proxy_providers: Mutex<HashSet<String>>,
 }
 
 pub type ThreadSafeOutboundManager = Arc<OutboundManager>;
@@ -129,6 +136,7 @@ impl OutboundManager {
             proxy_manager,
             selector_control,
             proxy_providers: provider_registry,
+            started_proxy_providers: Mutex::new(HashSet::new()),
         };
 
         debug!("initializing proxy providers");
@@ -335,6 +343,79 @@ impl OutboundManager {
 
     pub fn get_proxy_providers(&self) -> HashMap<String, ArcProxyProvider> {
         self.proxy_providers.clone()
+    }
+
+    pub async fn initialize_proxy_providers(
+        &self,
+        required: &HashSet<String>,
+    ) -> Result<(), Error> {
+        if required.is_empty() {
+            return Ok(());
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let providers = {
+            let mut started = self.started_proxy_providers.lock();
+            self.proxy_providers
+                .iter()
+                .filter(|(name, _)| {
+                    required.contains(*name) && started.insert((*name).clone())
+                })
+                .map(|(_, provider)| provider.clone())
+                .collect::<Vec<_>>()
+        };
+        for provider in providers {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let name = provider.name().to_owned();
+                info!("initializing proxy provider {name}");
+                let result = provider.initialize().await;
+                if let Err(error) = &result {
+                    error!("failed to initialize proxy provider {name}: {error}");
+                } else {
+                    info!("initialized proxy provider {name}");
+                }
+                let _ = tx.send((name, result));
+            });
+        }
+        drop(tx);
+
+        let mut failures = Vec::new();
+        while let Some((name, result)) = rx.recv().await {
+            if !required.contains(&name) {
+                continue;
+            }
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error) => failures.push(format!("{name}: {error}")),
+            }
+            if failures.len() == required.len() {
+                break;
+            }
+        }
+        Err(Error::Operation(format!(
+            "required proxy provider unavailable: {}",
+            failures.join("; ")
+        )))
+    }
+
+    pub fn start_background_proxy_providers(&self) {
+        let providers = {
+            let mut started = self.started_proxy_providers.lock();
+            self.proxy_providers
+                .iter()
+                .filter(|(name, _)| started.insert((*name).clone()))
+                .map(|(_, provider)| provider.clone())
+                .collect::<Vec<_>>()
+        };
+        for provider in providers {
+            tokio::spawn(async move {
+                let name = provider.name().to_owned();
+                info!("initializing background proxy provider {name}");
+                if let Err(error) = provider.initialize().await {
+                    error!("failed to initialize proxy provider {name}: {error}");
+                }
+            });
+        }
     }
 
     // API handlers end
@@ -714,6 +795,7 @@ mod tests {
                 None,
             ),
             selector_control: HashMap::new(),
+            started_proxy_providers: Mutex::new(HashSet::new()),
         };
 
         assert!(manager.get_provider_proxy("provider-proxy").await.is_some());
@@ -1272,28 +1354,6 @@ impl OutboundManager {
                 override_options,
             )?;
             provider_registry.insert(name, provider);
-        }
-
-        for p in provider_registry.values() {
-            let p = p.clone();
-            let rule_dispatch = rule_dispatch.clone();
-            tokio::spawn(async move {
-                let name = p.name().to_owned();
-                info!("initializing provider {}", name);
-                // Provider downloads must not race the late-bound router. The
-                // race made a cache miss fall back to DIRECT, which commonly
-                // fails for GitHub-backed providers on a new device.
-                while rule_dispatch.router.get().is_none()
-                    || rule_dispatch.outbound_manager.get().is_none()
-                {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-                if let Err(err) = p.initialize().await {
-                    error!("failed to initialize proxy provider {}: {}", name, err);
-                    return;
-                }
-                info!("initialized provider {}", name);
-            });
         }
 
         Ok(())

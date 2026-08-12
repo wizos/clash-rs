@@ -1,5 +1,5 @@
 use super::{
-    dns::ThreadSafeDNSResolver,
+    dns::{RuleDispatch, ThreadSafeDNSResolver},
     remote_content_manager::providers::{
         file_vehicle, http_vehicle,
         rule_provider::{RuleProviderImpl, ThreadSafeRuleProvider},
@@ -16,7 +16,15 @@ use crate::{
     session::Session,
 };
 
-use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use hyper::Uri;
 use rules::domain_regex::DomainRegex;
@@ -35,6 +43,7 @@ pub struct Router {
     country_mmdb: Option<MmdbLookup>,
     asn_mmdb: Option<MmdbLookup>,
     rule_providers: HashMap<String, ThreadSafeRuleProvider>,
+    rule_providers_started: AtomicBool,
 }
 
 pub type ArcRouter = Arc<Router>;
@@ -56,6 +65,7 @@ impl Router {
         asn_mmdb: Option<MmdbLookup>,
         geodata: Option<GeoDataLookup>,
         cwd: String,
+        rule_dispatch: Arc<RuleDispatch>,
     ) -> Self {
         let mut rule_provider_registry = HashMap::new();
 
@@ -67,6 +77,7 @@ impl Router {
             asn_mmdb.clone(),
             geodata.clone(),
             cwd,
+            rule_dispatch,
         )
         .await
         .ok();
@@ -117,6 +128,7 @@ impl Router {
             country_mmdb,
             asn_mmdb,
             rule_providers: rule_provider_registry,
+            rule_providers_started: AtomicBool::new(false),
         }
     }
 
@@ -230,11 +242,12 @@ impl Router {
         asn_mmdb: Option<MmdbLookup>,
         geodata: Option<GeoDataLookup>,
         cwd: String,
+        rule_dispatch: Arc<RuleDispatch>,
     ) -> Result<(), Error> {
         for (name, provider) in rule_providers.into_iter() {
             match provider {
                 RuleProviderDef::Http(http) => {
-                    let vehicle = http_vehicle::Vehicle::new(
+                    let mut vehicle = http_vehicle::Vehicle::new(
                         http.url.parse::<Uri>().map_err(|error| {
                             Error::InvalidConfig(format!(
                                 "invalid URL for rule provider `{name}`: {error}"
@@ -243,7 +256,12 @@ impl Router {
                         http.path,
                         Some(cwd.clone()),
                         resolver.clone(),
-                    );
+                    )
+                    .with_rule_dispatch(rule_dispatch.clone());
+                    if let Some(proxy) = http.proxy.filter(|value| !value.is_empty())
+                    {
+                        vehicle = vehicle.with_outbound(proxy);
+                    }
 
                     // Default to yaml if not specified
                     let format = http.format.unwrap_or_default();
@@ -308,7 +326,14 @@ impl Router {
             }
         }
 
-        for p in rule_provider_registry.values() {
+        Ok(())
+    }
+
+    pub fn initialize_rule_providers(&self) {
+        if self.rule_providers_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        for p in self.rule_providers.values() {
             let p = p.clone();
             tokio::spawn(async move {
                 info!("initializing rule provider {}", p.name());
@@ -326,8 +351,6 @@ impl Router {
                 }
             });
         }
-
-        Ok(())
     }
 
     /// API handlers
@@ -661,7 +684,7 @@ mod tests {
     use anyhow::Ok;
 
     use crate::{
-        app::dns::{MockClashResolver, SystemResolver},
+        app::dns::{MockClashResolver, RuleDispatch, SystemResolver},
         common::{
             geodata::{DEFAULT_GEOSITE_DOWNLOAD_URL, GeoData},
             http::new_http_client,
@@ -748,6 +771,7 @@ mod tests {
             None,
             Some(Arc::new(geodata)),
             temp_dir.path().to_str().unwrap().to_string(),
+            RuleDispatch::new(),
         )
         .await;
 
@@ -814,6 +838,7 @@ mod tests {
             None,
             None,
             std::env::temp_dir().to_str().unwrap().to_string(),
+            RuleDispatch::new(),
         )
         .await;
 
@@ -883,6 +908,7 @@ mod tests {
             None,
             None,
             std::env::temp_dir().to_str().unwrap().to_string(),
+            RuleDispatch::new(),
         )
         .await;
 

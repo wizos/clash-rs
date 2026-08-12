@@ -22,7 +22,7 @@ use rustls::{server::AlwaysResolvesServerRawPublicKeys, sign::CertifiedKey};
 use std::{sync::Arc, time::Duration};
 use thiserror::Error;
 use tokio::net::{TcpListener, UdpSocket};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 struct CertificateKeyPair {
     certs: Vec<rustls::pki_types::CertificateDer<'static>>,
@@ -204,7 +204,10 @@ pub async fn get_dns_listener<X>(
     listen: DNSListenAddr,
     exchanger: X,
     cwd: &std::path::Path,
-) -> Option<futures::future::BoxFuture<'static, Result<(), DNSError>>>
+) -> Result<
+    Option<futures::future::BoxFuture<'static, Result<(), DNSError>>>,
+    DNSError,
+>
 where
     X: DnsMessageExchanger + Sync + Send + Unpin + 'static,
 {
@@ -214,31 +217,35 @@ where
     let mut has_server = false;
 
     if let Some(addr) = listen.udp {
-        has_server = UdpSocket::bind(addr)
+        UdpSocket::bind(addr)
             .await
             .map(|x| {
                 info!("UDP dns server listening on: {}", addr);
                 s.register_socket(x);
             })
-            .inspect_err(|x| {
-                error!("failed to listen UDP DNS server on {}: {}", addr, x);
-            })
-            .is_ok();
+            .map_err(|error| {
+                DNSError::Io(new_io_error(format!(
+                    "DNS UDP listener {addr}: {error}"
+                )))
+            })?;
+        has_server = true;
     }
     if let Some(addr) = listen.tcp {
-        has_server |= TcpListener::bind(addr)
+        TcpListener::bind(addr)
             .await
             .map(|x| {
                 info!("TCP dns server listening on: {}", addr);
                 s.register_listener(x, DEFAULT_DNS_SERVER_TIMEOUT, 4096);
             })
-            .inspect_err(|x| {
-                error!("failed to listen TCP DNS server on {}: {}", addr, x);
-            })
-            .is_ok();
+            .map_err(|error| {
+                DNSError::Io(new_io_error(format!(
+                    "DNS TCP listener {addr}: {error}"
+                )))
+            })?;
+        has_server = true;
     }
     if let Some(c) = listen.doh {
-        has_server |= TcpListener::bind(c.addr)
+        TcpListener::bind(c.addr)
             .await
             .and_then(|x| {
                 if let (Some(k), Some(c)) = (&c.ca_key, &c.ca_cert) {
@@ -273,13 +280,16 @@ where
                 info!("DoH server listening on: {}", c.addr);
                 Ok(())
             })
-            .inspect_err(|x| {
-                error!("failed to listen DoH server on {}: {}", c.addr, x);
-            })
-            .is_ok();
+            .map_err(|error| {
+                DNSError::Io(new_io_error(format!(
+                    "DNS DoH listener {}: {error}",
+                    c.addr
+                )))
+            })?;
+        has_server = true;
     }
     if let Some(c) = listen.dot {
-        has_server |= TcpListener::bind(c.addr)
+        TcpListener::bind(c.addr)
             .await
             .and_then(|x| {
                 if let (Some(k), Some(c)) = (&c.ca_key, &c.ca_cert) {
@@ -312,14 +322,17 @@ where
                 info!("DoT dns server listening on: {}", c.addr);
                 Ok(())
             })
-            .inspect_err(|x| {
-                error!("failed to listen DoT DNS server on {}: {}", c.addr, x);
-            })
-            .is_ok();
+            .map_err(|error| {
+                DNSError::Io(new_io_error(format!(
+                    "DNS DoT listener {}: {error}",
+                    c.addr
+                )))
+            })?;
+        has_server = true;
     }
 
     if let Some(c) = listen.doh3 {
-        has_server |= UdpSocket::bind(c.addr)
+        UdpSocket::bind(c.addr)
             .await
             .and_then(|x| {
                 if let (Some(k), Some(c)) = (&c.ca_key, &c.ca_cert) {
@@ -353,25 +366,28 @@ where
                 info!("DoT3 dns server listening on: {}", c.addr);
                 Ok(())
             })
-            .inspect_err(|x| {
-                error!("failed to listen DoH3 DNS server on {}: {}", c.addr, x);
-            })
-            .is_ok();
+            .map_err(|error| {
+                DNSError::Io(new_io_error(format!(
+                    "DNS DoH3 listener {}: {error}",
+                    c.addr
+                )))
+            })?;
+        has_server = true;
     }
 
     if !has_server {
-        return None;
+        return Ok(None);
     }
 
     let mut l = DnsListener { server: s };
 
-    Some(Box::pin(async move {
+    Ok(Some(Box::pin(async move {
         info!("starting DNS server");
         l.server.block_until_done().await.map_err(|x| {
             warn!("dns server error: {}", x);
             DNSError::Io(new_io_error(format!("dns server error: {x}")))
         })
-    }))
+    })))
 }
 
 #[cfg(test)]
@@ -512,7 +528,7 @@ mod tests {
 
         let listener =
             super::get_dns_listener(cfg, mock_exchanger, std::path::Path::new("."))
-                .await;
+                .await?;
 
         assert!(listener.is_some());
         let _: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
@@ -606,6 +622,35 @@ mod tests {
         tokio::spawn(bg);
 
         send_query(&mut client).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reports_dns_bind_conflict() -> anyhow::Result<()> {
+        let socket = UdpSocket::bind("127.0.0.1:0").await?;
+        let addr = socket.local_addr()?;
+        let mut exchanger = MockDnsMessageExchanger::new();
+        exchanger.expect_ipv6().returning(|| false);
+
+        let result = super::get_dns_listener(
+            DNSListenAddr {
+                udp: Some(addr),
+                ..Default::default()
+            },
+            exchanger,
+            std::path::Path::new("."),
+        )
+        .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("occupied DNS port must fail startup"),
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("DNS UDP listener {addr}"))
+        );
         Ok(())
     }
 }

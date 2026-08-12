@@ -75,6 +75,14 @@ pub struct InboundEndpoint {
     pub active: bool,
 }
 
+fn requested_port_changed(current: u16, requested: Option<u16>) -> bool {
+    requested.is_some_and(|port| port != current)
+}
+
+fn is_default_listener(opts: &InboundOpts) -> bool {
+    opts.common_opts().name.starts_with("DEFAULT-")
+}
+
 pub struct InboundManager {
     dispatcher: Arc<Dispatcher>,
     authenticator: ThreadSafeAuthenticator,
@@ -569,6 +577,9 @@ impl InboundManager {
         let mut ports = Ports::default();
         let guard = self.inbound_handlers.read().await;
         for opts in guard.keys() {
+            if !is_default_listener(opts) {
+                continue;
+            }
             match &opts {
                 InboundOpts::Http { common_opts } => {
                     ports.port = Some(common_opts.port)
@@ -595,7 +606,9 @@ impl InboundManager {
 
     pub async fn get_allow_lan(&self) -> bool {
         let guard = self.inbound_handlers.read().await;
-        if let Some((opts, _)) = guard.iter().next() {
+        if let Some((opts, _)) =
+            guard.iter().find(|(opts, _)| is_default_listener(opts))
+        {
             opts.common_opts().allow_lan
         } else {
             false
@@ -607,7 +620,9 @@ impl InboundManager {
         let new_map = guard
             .drain()
             .map(|(mut opts, entry)| {
-                opts.common_opts_mut().allow_lan = allow_lan;
+                if is_default_listener(&opts) {
+                    opts.common_opts_mut().allow_lan = allow_lan;
+                }
                 (opts, entry)
             })
             .collect::<HashMap<_, _>>();
@@ -616,7 +631,9 @@ impl InboundManager {
 
     pub async fn get_bind_address(&self) -> BindAddress {
         let guard = self.inbound_handlers.read().await;
-        if let Some((opts, _)) = guard.iter().next() {
+        if let Some((opts, _)) =
+            guard.iter().find(|(opts, _)| is_default_listener(opts))
+        {
             opts.common_opts().listen
         } else {
             BindAddress::default()
@@ -657,16 +674,24 @@ impl InboundManager {
         result
     }
 
-    pub async fn set_bind_address(&self, bind_address: BindAddress) {
+    pub async fn set_bind_address(&self, bind_address: BindAddress) -> bool {
         let mut guard = self.inbound_handlers.write().await;
+        if !guard.keys().any(|opts| {
+            is_default_listener(opts) && opts.common_opts().listen != bind_address
+        }) {
+            return false;
+        }
         let new_map = guard
             .drain()
             .map(|(mut opts, entry)| {
-                opts.common_opts_mut().listen = bind_address;
+                if is_default_listener(&opts) {
+                    opts.common_opts_mut().listen = bind_address;
+                }
                 (opts, entry)
             })
             .collect::<HashMap<_, _>>();
         *guard = new_map;
+        true
     }
 
     // returns true if any listener ports were changed (i.e. a restart is needed)
@@ -674,29 +699,30 @@ impl InboundManager {
         let mut guard = self.inbound_handlers.write().await;
 
         let listeners: HashMap<InboundOpts, StaticHandleEntry> = guard
-            .extract_if(|opts, _| match &opts {
-                InboundOpts::Http { common_opts } => {
-                    ports.port.is_some() && Some(common_opts.port) == ports.port
+            .extract_if(|opts, _| {
+                if !is_default_listener(opts) {
+                    return false;
                 }
-                InboundOpts::Socks { common_opts, .. } => {
-                    ports.socks_port.is_some()
-                        && Some(common_opts.port) == ports.socks_port
+                match &opts {
+                    InboundOpts::Http { common_opts } => {
+                        requested_port_changed(common_opts.port, ports.port)
+                    }
+                    InboundOpts::Socks { common_opts, .. } => {
+                        requested_port_changed(common_opts.port, ports.socks_port)
+                    }
+                    InboundOpts::Mixed { common_opts, .. } => {
+                        requested_port_changed(common_opts.port, ports.mixed_port)
+                    }
+                    #[cfg(feature = "tproxy")]
+                    InboundOpts::TProxy { common_opts, .. } => {
+                        requested_port_changed(common_opts.port, ports.tproxy_port)
+                    }
+                    #[cfg(feature = "redir")]
+                    InboundOpts::Redir { common_opts } => {
+                        requested_port_changed(common_opts.port, ports.redir_port)
+                    }
+                    _ => false,
                 }
-                InboundOpts::Mixed { common_opts, .. } => {
-                    ports.mixed_port.is_some()
-                        && Some(common_opts.port) == ports.mixed_port
-                }
-                #[cfg(feature = "tproxy")]
-                InboundOpts::TProxy { common_opts, .. } => {
-                    ports.tproxy_port.is_some()
-                        && Some(common_opts.port) == ports.tproxy_port
-                }
-                #[cfg(feature = "redir")]
-                InboundOpts::Redir { common_opts } => {
-                    ports.redir_port.is_some()
-                        && Some(common_opts.port) == ports.redir_port
-                }
-                _ => false,
             })
             .collect();
 
@@ -734,5 +760,37 @@ impl InboundManager {
         }
 
         changed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_default_listener, requested_port_changed};
+    use crate::config::internal::{
+        config::BindAddress,
+        listener::{CommonInboundOpts, InboundOpts},
+    };
+
+    #[test]
+    fn only_changed_requested_ports_require_restart() {
+        assert!(!requested_port_changed(7890, None));
+        assert!(!requested_port_changed(7890, Some(7890)));
+        assert!(requested_port_changed(7890, Some(7891)));
+    }
+
+    #[test]
+    fn global_listener_settings_ignore_custom_listeners() {
+        let listener = |name: &str| InboundOpts::Http {
+            common_opts: CommonInboundOpts {
+                name: name.to_owned(),
+                listen: BindAddress::default(),
+                port: 7890,
+                allow_lan: false,
+                fw_mark: None,
+            },
+        };
+
+        assert!(is_default_listener(&listener("DEFAULT-HTTP")));
+        assert!(!is_default_listener(&listener("custom-http")));
     }
 }

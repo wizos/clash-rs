@@ -111,6 +111,21 @@ impl Config {
                         "invalid URL for proxy provider `{name}`: {error}"
                     ))
                 })?;
+                if let Some(proxy) = provider.proxy.as_deref()
+                    && !self.proxies.contains_key(proxy)
+                    && !self.proxy_groups.contains_key(proxy)
+                {
+                    return Err(Error::InvalidConfig(format!(
+                        "proxy `{proxy}` referenced by proxy provider `{name}` was not found"
+                    )));
+                }
+                if provider.proxy.is_some()
+                    && !self.provider_has_bootstrap_path(name, &mut HashSet::new())
+                {
+                    return Err(Error::InvalidConfig(format!(
+                        "provider bootstrap cycle: `{name}` has no independent outbound"
+                    )));
+                }
             }
         }
         for (name, provider) in &self.rule_providers {
@@ -120,6 +135,14 @@ impl Config {
                         "invalid URL for rule provider `{name}`: {error}"
                     ))
                 })?;
+                if let Some(proxy) = provider.proxy.as_deref()
+                    && !self.proxies.contains_key(proxy)
+                    && !self.proxy_groups.contains_key(proxy)
+                {
+                    return Err(Error::InvalidConfig(format!(
+                        "proxy `{proxy}` referenced by rule provider `{name}` was not found"
+                    )));
+                }
             }
         }
         // Check for duplicate AnyTLS user passwords
@@ -142,6 +165,58 @@ impl Config {
             }
         }
         Ok(self)
+    }
+
+    fn provider_has_bootstrap_path(
+        &self,
+        name: &str,
+        visiting: &mut HashSet<String>,
+    ) -> bool {
+        if !visiting.insert(format!("provider:{name}")) {
+            return false;
+        }
+        let result = match self.proxy_providers.get(name) {
+            Some(OutboundProxyProviderDef::File(_)) => true,
+            Some(OutboundProxyProviderDef::Http(provider)) => provider
+                .proxy
+                .as_deref()
+                .is_none_or(|proxy| self.proxy_has_bootstrap_path(proxy, visiting)),
+            None => false,
+        };
+        visiting.remove(&format!("provider:{name}"));
+        result
+    }
+
+    fn proxy_has_bootstrap_path(
+        &self,
+        name: &str,
+        visiting: &mut HashSet<String>,
+    ) -> bool {
+        if self.proxies.contains_key(name) {
+            return true;
+        }
+        if !visiting.insert(format!("group:{name}")) {
+            return false;
+        }
+        let result = self
+            .proxy_groups
+            .get(name)
+            .and_then(|proxy| match proxy {
+                OutboundProxy::ProxyGroup(group) => Some(group),
+                _ => None,
+            })
+            .is_some_and(|group| {
+                group
+                    .proxies()
+                    .into_iter()
+                    .flatten()
+                    .any(|proxy| self.proxy_has_bootstrap_path(proxy, visiting))
+                    || group.use_providers().into_iter().flatten().any(|provider| {
+                        self.provider_has_bootstrap_path(provider, visiting)
+                    })
+            });
+        visiting.remove(&format!("group:{name}"));
+        result
     }
 
     fn validate_rule_target(&self, rule: &RuleType) -> Result<(), crate::Error> {
@@ -363,6 +438,7 @@ pub enum RuleProviderDef {
 #[derive(Serialize, Deserialize)]
 pub struct HttpRuleProvider {
     pub url: String,
+    pub proxy: Option<String>,
     pub interval: u64,
     pub behavior: RuleSetBehavior,
     pub path: String,
@@ -391,7 +467,10 @@ pub struct InlineRuleProvider {
 
 #[cfg(test)]
 mod validation_tests {
-    use crate::{Config as SourceConfig, config::internal::proxy::OutboundProxy};
+    use crate::{
+        Config as SourceConfig,
+        config::internal::{config::RuleProviderDef, proxy::OutboundProxy},
+    };
 
     fn parse_error(yaml: &str) -> String {
         SourceConfig::Str(yaml.to_owned())
@@ -453,6 +532,53 @@ rules:
             error.contains("circular reference"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn rejects_proxy_provider_bootstrap_cycle() {
+        let error = parse_error(
+            r#"
+proxy-providers:
+  remote:
+    type: http
+    url: https://example.com/proxies.yaml
+    proxy: bootstrap
+    path: ./remote.yaml
+    interval: 3600
+proxy-groups:
+  - name: bootstrap
+    type: select
+    use: [remote]
+rules:
+  - MATCH,bootstrap
+"#,
+        );
+        assert!(error.contains("provider bootstrap cycle"), "{error}");
+    }
+
+    #[test]
+    fn keeps_mihomo_rule_provider_proxy() {
+        let config = SourceConfig::Str(
+            r#"
+rule-providers:
+  remote:
+    type: http
+    url: https://example.com/rules.yaml
+    proxy: DIRECT
+    behavior: domain
+rules:
+  - RULE-SET,remote,DIRECT
+  - MATCH,DIRECT
+"#
+            .to_owned(),
+        )
+        .try_parse()
+        .expect("rule-provider proxy should validate");
+        let RuleProviderDef::Http(provider) = &config.rule_providers["remote"]
+        else {
+            panic!("expected HTTP rule provider");
+        };
+        assert_eq!(provider.proxy.as_deref(), Some("DIRECT"));
     }
 
     #[test]

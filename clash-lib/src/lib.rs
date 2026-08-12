@@ -25,14 +25,18 @@ use crate::{
     },
     config::{
         InternalConfig,
-        def::{self, LogLevel},
-        internal::proxy::OutboundProxy,
+        def::{self, LogLevel, RunMode},
+        internal::{
+            proxy::{OutboundProxy, PROXY_COMPATIBLE, PROXY_DIRECT, PROXY_REJECT},
+            rule::RuleType,
+        },
     },
     runner::Runner,
 };
 
 use std::sync::{Mutex as StdMutex, mpsc as std_mpsc};
 use std::{
+    collections::HashSet,
     io,
     path::PathBuf,
     sync::{Arc, OnceLock},
@@ -101,6 +105,7 @@ pub enum Error {
 }
 pub type Result<T> = std::result::Result<T, Error>;
 
+#[cfg(feature = "tun")]
 type ArcRunner = Arc<dyn Runner>;
 
 #[cfg(feature = "tun")]
@@ -364,7 +369,7 @@ pub struct GlobalState {
     reload_phase: String,
     #[cfg(feature = "tun")]
     tunnel_runner: ArcRunner,
-    dns_listener: ArcRunner,
+    dns_listener: Arc<dns::DnsRunner>,
     reload_tx: mpsc::Sender<(u64, Config)>,
     cwd: String,
     /// Path to the config file used at startup. Used by the dashboard "Reload"
@@ -856,13 +861,19 @@ struct RuntimeComponents {
 
     #[cfg(feature = "tun")]
     tun_runner: ArcRunner,
-    dns_listener: ArcRunner,
+    dns_listener: Arc<dns::DnsRunner>,
     inbound_manager: Arc<InboundManager>,
     dns_listen: DNSListenAddr,
     dns_enabled: bool,
 }
 
 impl RuntimeComponents {
+    fn start_post_ready_tasks(&self) {
+        self.outbound_manager.start_background_proxy_providers();
+        self.router.initialize_rule_providers();
+        self.outbound_manager.start_healthchecks();
+    }
+
     #[cfg(feature = "tun")]
     async fn replace_tun(
         &mut self,
@@ -922,7 +933,7 @@ impl RuntimeComponents {
         }
         if enabled && result.is_ok() {
             let hc_started = Instant::now();
-            self.outbound_manager.start_healthchecks();
+            self.start_post_ready_tasks();
             warn!(
                 "replace_tun: start_healthchecks took {}ms",
                 hc_started.elapsed().as_millis(),
@@ -940,9 +951,13 @@ impl RuntimeComponents {
     async fn start_all(&self, start_inbounds: bool) -> Result<()> {
         #[cfg(feature = "tun")]
         self.tun_runner.run_async();
-        self.dns_listener.run_async();
         if start_inbounds {
-            self.inbound_manager.restart().await?;
+            self.dns_listener.start_and_wait().await?;
+            if let Err(error) = self.inbound_manager.restart().await {
+                self.dns_listener.stop_listener();
+                return Err(error);
+            }
+            self.start_post_ready_tasks();
         }
         Ok(())
     }
@@ -966,10 +981,88 @@ impl RuntimeComponents {
     }
 }
 
+fn group_has_static_path(
+    name: &str,
+    config: &InternalConfig,
+    visiting: &mut HashSet<String>,
+) -> bool {
+    if !visiting.insert(name.to_owned()) {
+        return false;
+    }
+    let result = config
+        .proxy_groups
+        .get(name)
+        .and_then(|proxy| match proxy {
+            OutboundProxy::ProxyGroup(group) => Some(group),
+            _ => None,
+        })
+        .and_then(|group| group.proxies())
+        .is_some_and(|proxies| {
+            proxies.iter().any(|proxy| {
+                config.proxies.contains_key(proxy)
+                    || group_has_static_path(proxy, config, visiting)
+            })
+        });
+    visiting.remove(name);
+    result
+}
+
+fn collect_group_providers(
+    name: &str,
+    config: &InternalConfig,
+    providers: &mut HashSet<String>,
+    visiting: &mut HashSet<String>,
+) {
+    if !visiting.insert(name.to_owned()) {
+        return;
+    }
+    if let Some(OutboundProxy::ProxyGroup(group)) = config.proxy_groups.get(name) {
+        providers.extend(group.use_providers().into_iter().flatten().cloned());
+        for proxy in group.proxies().into_iter().flatten() {
+            collect_group_providers(proxy, config, providers, visiting);
+        }
+    }
+    visiting.remove(name);
+}
+
+fn required_proxy_providers(config: &InternalConfig) -> HashSet<String> {
+    let has_user_proxy = config.proxies.keys().any(|name| {
+        !matches!(
+            name.as_str(),
+            PROXY_DIRECT | PROXY_REJECT | PROXY_COMPATIBLE
+        )
+    });
+    let target = match config.general.mode {
+        RunMode::Direct => return HashSet::new(),
+        RunMode::Global if has_user_proxy => return HashSet::new(),
+        RunMode::Global => None,
+        RunMode::Rule => config.rules.iter().rev().find_map(|rule| match rule {
+            RuleType::Match { target } => Some(target.as_str()),
+            _ => None,
+        }),
+    };
+    let Some(target) = target else {
+        return if has_user_proxy {
+            HashSet::new()
+        } else {
+            config.proxy_providers.keys().cloned().collect()
+        };
+    };
+    if config.proxies.contains_key(target)
+        || group_has_static_path(target, config, &mut HashSet::new())
+    {
+        return HashSet::new();
+    }
+    let mut providers = HashSet::new();
+    collect_group_providers(target, config, &mut providers, &mut HashSet::new());
+    providers
+}
+
 async fn create_components(
     cwd: PathBuf,
     config: InternalConfig,
 ) -> Result<RuntimeComponents> {
+    let required_proxy_providers = required_proxy_providers(&config);
     let sniffer = Sniffer::from_config(config.general.sniffer.as_ref())?;
     let unified_delay = config.general.unified_delay;
     crate::proxy::utils::set_tcp_concurrent(config.general.tcp_concurrent);
@@ -1193,6 +1286,7 @@ async fn create_components(
             asn_mmdb,
             geodata,
             cwd.to_string_lossy().to_string(),
+            rule_dispatch.clone(),
         )
         .await,
     );
@@ -1203,6 +1297,9 @@ async fn create_components(
              indicates a double-initialization bug"
         );
     }
+    outbound_manager
+        .initialize_proxy_providers(&required_proxy_providers)
+        .await?;
 
     let statistics_manager = StatisticsManager::new();
 
@@ -1252,7 +1349,7 @@ async fn create_components(
     )?);
 
     debug!("initializing dns listener");
-    let dns_listener: ArcRunner = Arc::new(dns::DnsRunner::new(
+    let dns_listener = Arc::new(dns::DnsRunner::new(
         dns_enable,
         dns_listen.clone(),
         dns_resolver.clone(),
@@ -1279,7 +1376,9 @@ async fn create_components(
 
 #[cfg(test)]
 mod tests {
-    use crate::{Config, Options, shutdown, start_scaffold};
+    use crate::{
+        Config, Options, required_proxy_providers, shutdown, start_scaffold,
+    };
     use std::{sync::Once, thread, time::Duration};
 
     static INIT: Once = Once::new();
@@ -1289,6 +1388,65 @@ mod tests {
             env_logger::init();
             crate::setup_default_crypto_provider();
         });
+    }
+
+    #[test]
+    fn waits_for_provider_when_match_has_no_static_path() {
+        let config = Config::Str(
+            r#"
+proxy-providers:
+  remote:
+    type: http
+    url: https://example.com/proxies.yaml
+    path: ./remote.yaml
+    interval: 3600
+proxy-groups:
+  - name: proxy
+    type: select
+    use: [remote]
+rules:
+  - MATCH,proxy
+"#
+            .to_owned(),
+        )
+        .try_parse()
+        .unwrap();
+
+        assert_eq!(
+            required_proxy_providers(&config),
+            ["remote".to_owned()].into()
+        );
+    }
+
+    #[test]
+    fn static_match_path_does_not_wait_for_provider() {
+        let config = Config::Str(
+            r#"
+proxies:
+  - name: local
+    type: socks5
+    server: 127.0.0.1
+    port: 1080
+proxy-providers:
+  remote:
+    type: http
+    url: https://example.com/proxies.yaml
+    path: ./remote.yaml
+    interval: 3600
+proxy-groups:
+  - name: proxy
+    type: select
+    proxies: [local]
+    use: [remote]
+rules:
+  - MATCH,proxy
+"#
+            .to_owned(),
+        )
+        .try_parse()
+        .unwrap();
+
+        assert!(required_proxy_providers(&config).is_empty());
     }
 
     #[test]

@@ -1018,6 +1018,9 @@ pub enum RuleProviderDef {
 pub struct HttpRuleProviderDef {
     /// Remote URL to fetch the rule set from.
     pub url: String,
+    /// Optional outbound used to download this provider (Mihomo `proxy`).
+    #[serde(default)]
+    pub proxy: Option<String>,
     /// Refresh interval in seconds. `0` disables automatic refresh.
     #[serde(default)]
     pub interval: u64,
@@ -1258,6 +1261,7 @@ rule-providers:
   http-rules:
     type: http
     url: "https://example.com/rules.yaml"
+    proxy: DIRECT
     interval: 3600
     behavior: domain
   file-rules:
@@ -1282,6 +1286,7 @@ rule-providers:
         if let RuleProviderDef::Http(h) = &providers["http-rules"] {
             assert_eq!(h.url, "https://example.com/rules.yaml");
             assert_eq!(h.interval, 3600);
+            assert_eq!(h.proxy.as_deref(), Some("DIRECT"));
         }
         if let RuleProviderDef::Inline(i) = &providers["inline-rules"] {
             assert_eq!(i.inline_rules.len(), 1);
