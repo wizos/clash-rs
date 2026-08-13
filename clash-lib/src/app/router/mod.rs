@@ -32,6 +32,9 @@ use tracing::{error, info, trace};
 
 mod rules;
 
+#[cfg(feature = "bench")]
+pub mod benchmark;
+
 use crate::common::{geodata::GeoDataLookup, mmdb::MmdbLookup};
 pub use rules::RuleMatcher;
 pub(crate) use rules::geodata::GeoSiteMatcher;
