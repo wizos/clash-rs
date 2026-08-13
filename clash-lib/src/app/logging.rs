@@ -12,7 +12,7 @@ use opentelemetry_semantic_conventions::{
 use serde::Serialize;
 use std::{
     io::IsTerminal,
-    sync::{LazyLock, Once},
+    sync::{LazyLock, Once, OnceLock},
 };
 use tokio::sync::broadcast::{self, Receiver, Sender};
 use tracing::level_filters::LevelFilter;
@@ -22,7 +22,8 @@ use tracing_opentelemetry::OpenTelemetryLayer;
 #[cfg(target_os = "ios")]
 use tracing_oslog::OsLogger;
 use tracing_subscriber::{
-    EnvFilter, Layer, filter::filter_fn, fmt::time::LocalTime, prelude::*,
+    EnvFilter, Layer, Registry, filter::filter_fn, fmt::time::LocalTime, prelude::*,
+    reload,
 };
 
 impl From<LogLevel> for LevelFilter {
@@ -101,6 +102,27 @@ struct LoggingGuard {
 
 static SETUP_LOGGING: Once = Once::new();
 static mut LOGGING_GUARD: Option<LoggingGuard> = None;
+static LOG_FILTER_RELOAD: OnceLock<reload::Handle<EnvFilter, Registry>> =
+    OnceLock::new();
+
+fn log_filter(level: LogLevel) -> EnvFilter {
+    EnvFilter::new(match level {
+        LogLevel::Trace => "warn,clash=trace,viaport=trace",
+        LogLevel::Debug => "warn,clash=debug,viaport=debug",
+        LogLevel::Info => "warn,clash=info,viaport=info",
+        LogLevel::Warning => "warn",
+        LogLevel::Error => "error",
+        LogLevel::Silent => "off",
+    })
+}
+
+pub fn set_log_level(level: LogLevel) -> anyhow::Result<()> {
+    LOG_FILTER_RELOAD
+        .get()
+        .ok_or_else(|| anyhow!("logging is not initialized"))?
+        .reload(log_filter(level))
+        .map_err(|error| anyhow!("failed to reload log level: {error}"))
+}
 
 pub fn setup_logging(
     level: LogLevel,
@@ -123,6 +145,9 @@ pub fn setup_logging(
                 });
         });
     }
+    if let Err(error) = set_log_level(level) {
+        eprintln!("Failed to apply log level: {error}");
+    }
 }
 
 fn setup_logging_inner(
@@ -131,18 +156,7 @@ fn setup_logging_inner(
     cwd: &str,
     log_file: Option<String>,
 ) -> anyhow::Result<Option<LoggingGuard>> {
-    let default_log_level = format!("warn,clash={level}");
-    let filter = EnvFilter::try_from_default_env()
-        .inspect(|f| {
-            eprintln!("using env log level: {f}");
-        })
-        .inspect_err(|_| {
-            if let Ok(log_level) = std::env::var("RUST_LOG") {
-                eprintln!("Failed to parse log level from environment: {log_level}");
-                eprintln!("Using default log level: {default_log_level}");
-            }
-        })
-        .unwrap_or(EnvFilter::new(default_log_level));
+    let (filter, reload_handle) = reload::Layer::new(log_filter(level));
 
     let (appender, guard) = if let Some(log_file) = log_file {
         let path_buf = std::path::PathBuf::from(&log_file);
@@ -272,6 +286,9 @@ fn setup_logging_inner(
 
     tracing::subscriber::set_global_default(subscriber)
         .map_err(|x| anyhow!("setup logging error: {}", x))?;
+    LOG_FILTER_RELOAD
+        .set(reload_handle)
+        .map_err(|_| anyhow!("log filter reload handle is already initialized"))?;
 
     Ok(Some(LoggingGuard {
         _file_appender: guard,
@@ -396,9 +413,9 @@ mod android_log {
 
 #[cfg(test)]
 mod tests {
-    use super::{EventCollector, LogLevel};
+    use super::{EventCollector, LogLevel, log_filter};
     use tokio::sync::broadcast;
-    use tracing_subscriber::{layer::SubscriberExt, registry};
+    use tracing_subscriber::{layer::SubscriberExt, registry, reload};
 
     #[test]
     fn collector_keeps_message_and_fields_inline() {
@@ -417,5 +434,26 @@ mod tests {
         assert!(event.msg.contains("answer=42"));
         assert!(event.msg.contains("kind=demo"));
         assert!(event.msg.contains("success=true"));
+    }
+
+    #[test]
+    fn reloads_log_level_without_restarting_the_subscriber() {
+        let (filter, handle) = reload::Layer::new(log_filter(LogLevel::Info));
+        let subscriber = registry().with(filter);
+
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(
+                !tracing::enabled!(target: "clash::test", tracing::Level::DEBUG)
+            );
+            assert!(tracing::enabled!(target: "clash::test", tracing::Level::INFO));
+
+            handle.reload(log_filter(LogLevel::Debug)).unwrap();
+            assert!(tracing::enabled!(target: "clash::test", tracing::Level::DEBUG));
+
+            handle.reload(log_filter(LogLevel::Silent)).unwrap();
+            assert!(
+                !tracing::enabled!(target: "clash::test", tracing::Level::ERROR)
+            );
+        });
     }
 }

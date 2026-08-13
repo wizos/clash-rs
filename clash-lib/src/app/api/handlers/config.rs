@@ -19,6 +19,7 @@ use crate::{
         dispatcher,
         dns::{ThreadSafeDNSResolver, config::DNSListenAddr},
         inbound::manager::{InboundEndpoint, InboundManager, Ports},
+        logging,
         outbound::manager::ThreadSafeOutboundManager,
         router::ArcRouter,
     },
@@ -448,6 +449,10 @@ async fn patch_configs(
     // Holding it across inbound_manager.restart() (which can be slow) was
     // blocking concurrent GET /configs requests unnecessarily.
     if let Some(log_level) = payload.log_level {
+        if let Err(error) = logging::set_log_level(log_level) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+                .into_response();
+        }
         let mut global_state = state.global_state.lock().await;
         global_state.log_level = log_level;
     }

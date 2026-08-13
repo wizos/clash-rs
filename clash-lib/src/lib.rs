@@ -729,6 +729,7 @@ async fn start_runtime(
             };
 
             let controller_cfg = config.general.controller.clone();
+            let log_level = config.general.log_level;
 
             {
                 let mut state = global_state.lock().await;
@@ -763,6 +764,9 @@ async fn start_runtime(
                 state.reload_error = Some(error.to_string());
                 state.reload_phase = "failed".to_owned();
                 continue;
+            }
+            if let Err(error) = app::logging::set_log_level(log_level) {
+                error!("failed to apply reloaded log level: {error}");
             }
 
             // TODO: every reload is causing the API server to restart, we should
@@ -807,6 +811,7 @@ async fn start_runtime(
             api_listener = new_api_listener;
             components = new_components;
             let mut g = global_state.lock().await;
+            g.log_level = log_level;
             g.reload_generation = g.reload_generation.saturating_add(1);
             g.reload_completed = reload_attempt;
             g.reload_error = None;
