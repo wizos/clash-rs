@@ -1,6 +1,3 @@
-#![feature(cfg_version)]
-#![cfg_attr(not(version("1.88.0")), feature(let_chains))]
-
 fn main() {
     // Watch both CLASH_* and GitHub-provided env vars so rebuilds trigger correctly
     let vars = ["CLASH_GIT_REF", "CLASH_GIT_SHA", "GITHUB_REF", "GITHUB_SHA"];

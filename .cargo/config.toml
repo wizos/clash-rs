@@ -5,7 +5,8 @@ rustflags = ["--cfg", "tokio_unstable"]
 
 [env]
 SENTRY_DSN = { value = "PLEASE DEFINE AT COMPILE TIME" }
-RUSTC_BOOTSTRAP = { value = "1" }
+# Scope unstable standard-library APIs to clash-lib only.
+RUSTC_BOOTSTRAP = { value = "clash_lib" }
 
 [target.x86_64-pc-windows-msvc]
 linker = "link.exe"

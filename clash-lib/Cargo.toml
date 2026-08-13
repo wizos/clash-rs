@@ -3,6 +3,7 @@ name = "clash-lib"
 repository = { workspace = true }
 version = { workspace = true }
 edition = { workspace = true }
+rust-version = { workspace = true }
 
 [features]
 default = ["zero_copy", "aws-lc-rs", "dashboard"]

@@ -19,7 +19,7 @@ defaults:
 env:
   RUST_LOG: "clash_lib=TRACE"
   RUST_TOOLCHAIN: "stable"
-  RUSTC_BOOTSTRAP: "1"
+  RUSTC_BOOTSTRAP: "clash_lib"
   SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
 
 jobs:
