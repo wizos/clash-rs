@@ -5,8 +5,8 @@ use crate::{
     Dispatcher,
     common::auth::ThreadSafeAuthenticator,
     proxy::{
-        inbound::InboundHandlerTrait,
-        utils::{ToCanonical, apply_tcp_options, try_create_dualstack_tcplistener},
+        inbound::{InboundHandlerTrait, accept_tcp_stream},
+        utils::try_create_dualstack_tcplistener,
     },
     session::{Network, Session, Type},
 };
@@ -65,20 +65,13 @@ impl InboundHandlerTrait for SocksInbound {
         let listener = try_create_dualstack_tcplistener(self.addr)?;
 
         loop {
-            let (socket, _) = listener.accept().await?;
-            let src_addr = socket.peer_addr()?.to_canonical();
-            if !self.allow_lan
-                && src_addr.ip() != socket.local_addr()?.ip().to_canonical()
-            {
-                warn!("Connection from {} is not allowed", src_addr);
-                continue;
-            }
-            apply_tcp_options(&socket)?;
+            let (socket, src_addr) =
+                accept_tcp_stream(&listener, self.allow_lan).await?;
 
             let mut sess = Session {
                 network: Network::Tcp,
                 typ: Type::Socks5,
-                source: socket.peer_addr()?.to_canonical(),
+                source: src_addr,
                 so_mark: self.fw_mark,
 
                 ..Default::default()

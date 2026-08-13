@@ -1,11 +1,11 @@
 use crate::{
     Dispatcher,
     common::auth::ThreadSafeAuthenticator,
-    proxy::utils::{ToCanonical, try_create_dualstack_tcplistener},
+    proxy::{inbound::accept_tcp_stream, utils::try_create_dualstack_tcplistener},
     session::{Network, Session},
 };
 
-use super::{http, inbound::InboundHandlerTrait, socks, utils::apply_tcp_options};
+use super::{http, inbound::InboundHandlerTrait, socks};
 use crate::common::errors::new_io_error;
 use async_trait::async_trait;
 use hyper_util::rt::TokioIo;
@@ -58,27 +58,8 @@ impl InboundHandlerTrait for MixedInbound {
         let listener = try_create_dualstack_tcplistener(self.addr)?;
 
         loop {
-            let (socket, _) = match listener.accept().await {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!("failed to accept socket on {}: {:?}", self.addr, e);
-                    continue;
-                }
-            };
-            let src_addr = match socket.peer_addr() {
-                Ok(a) => a.to_canonical(),
-                Err(e) => {
-                    warn!("failed to get peer address: {:?}", e);
-                    continue;
-                }
-            };
-            if !self.allow_lan
-                && src_addr.ip() != socket.local_addr()?.ip().to_canonical()
-            {
-                warn!("Connection from {} is not allowed", src_addr);
-                continue;
-            }
-            apply_tcp_options(&socket)?;
+            let (socket, src_addr) =
+                accept_tcp_stream(&listener, self.allow_lan).await?;
 
             let mut p = [0; 1];
             let n = match socket.peek(&mut p).await {
@@ -104,7 +85,7 @@ impl InboundHandlerTrait for MixedInbound {
                 socks::SOCKS5_VERSION => {
                     let mut sess = Session {
                         network: Network::Tcp,
-                        source: socket.peer_addr()?.to_canonical(),
+                        source: src_addr,
                         so_mark: fw_mark,
                         ..Default::default()
                     };
@@ -121,13 +102,12 @@ impl InboundHandlerTrait for MixedInbound {
                 }
 
                 _ => {
-                    let src = socket.peer_addr()?.to_canonical();
                     let dispatcher = dispatcher.clone();
                     let authenticator = authenticator.clone();
                     tokio::spawn(async move {
                         http::handle_http(
                             TokioIo::new(Box::new(socket) as _),
-                            src,
+                            src_addr,
                             dispatcher,
                             authenticator,
                             fw_mark,

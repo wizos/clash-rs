@@ -2,9 +2,8 @@ use super::inbound::InboundHandlerTrait;
 use crate::{
     app::dispatcher::Dispatcher,
     common::errors::new_io_error,
-    proxy::utils::{
-        ToCanonical, apply_tcp_options, try_create_dualstack_tcplistener,
-    },
+    proxy::inbound::accept_tcp_stream,
+    proxy::utils::{ToCanonical, try_create_dualstack_tcplistener},
     session::{Network, Session, Type},
 };
 
@@ -56,20 +55,19 @@ impl InboundHandlerTrait for RedirInbound {
         let listener = try_create_dualstack_tcplistener(self.addr)?;
 
         loop {
-            let (socket, _) = listener.accept().await?;
-            let src_addr = socket.peer_addr()?.to_canonical();
-
-            if !self.allow_lan
-                && src_addr.ip() != socket.local_addr()?.ip().to_canonical()
-            {
-                warn!("Connection from {} is not allowed", src_addr);
-                continue;
-            }
-
-            apply_tcp_options(&socket)?;
+            let (socket, src_addr) =
+                accept_tcp_stream(&listener, self.allow_lan).await?;
 
             // get redirect traffic original destination
-            let orig_dst = get_original_destination_addr(&socket)?.to_canonical();
+            let orig_dst = match get_original_destination_addr(&socket) {
+                Ok(address) => address.to_canonical(),
+                Err(error) => {
+                    warn!(
+                        "discarding redir connection without destination: {error}"
+                    );
+                    continue;
+                }
+            };
 
             let sess = Session {
                 network: Network::Tcp,

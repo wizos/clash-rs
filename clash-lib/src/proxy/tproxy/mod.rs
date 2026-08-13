@@ -1,10 +1,13 @@
-use super::{inbound::InboundHandlerTrait, tun::TunDatagram};
+use super::{
+    inbound::{InboundHandlerTrait, accept_tcp_stream},
+    tun::TunDatagram,
+};
 use crate::{
     app::dispatcher::Dispatcher,
     common::errors::new_io_error,
     proxy::{
         datagram::UdpPacket,
-        utils::{ToCanonical, apply_tcp_options, try_create_dualstack_socket},
+        utils::{ToCanonical, try_create_dualstack_socket},
     },
     session::{Network, Session, Type},
 };
@@ -70,8 +73,7 @@ impl InboundHandlerTrait for TproxyInbound {
         let listener = TcpListener::from_std(socket.into())?;
 
         loop {
-            let (socket, _) = listener.accept().await?;
-            let src_addr = socket.peer_addr()?.to_canonical();
+            let (socket, src_addr) = accept_tcp_stream(&listener, true).await?;
             // for dualstack socket src_addr may be ipv4 or ipv6;
             // tcpstream.local_addr() is the proxy destination
             // listener.local_addr() is [::]:port for dualstack
@@ -82,10 +84,16 @@ impl InboundHandlerTrait for TproxyInbound {
             // src_addr,listener.local_addr()?);     continue;
             // }
 
-            apply_tcp_options(&socket)?;
-
             // local_addr is getsockname
-            let orig_dst = socket.local_addr()?.to_canonical();
+            let orig_dst = match socket.local_addr() {
+                Ok(address) => address.to_canonical(),
+                Err(error) => {
+                    warn!(
+                        "discarding tproxy connection without destination: {error}"
+                    );
+                    continue;
+                }
+            };
 
             let sess = Session {
                 network: Network::Tcp,

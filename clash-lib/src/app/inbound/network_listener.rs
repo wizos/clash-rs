@@ -30,6 +30,192 @@ use tracing::{error, info, warn};
 use crate::proxy::shadowsocks::inbound::{InboundOptions, ShadowsocksInbound};
 use std::sync::Arc;
 
+const LISTENER_RESTART_DELAYS: [std::time::Duration; 5] = [
+    std::time::Duration::from_millis(100),
+    std::time::Duration::from_millis(250),
+    std::time::Duration::from_millis(500),
+    std::time::Duration::from_secs(1),
+    std::time::Duration::from_secs(2),
+];
+const LISTENER_STARTUP_GRACE: std::time::Duration =
+    std::time::Duration::from_millis(100);
+const LISTENER_STABLE_RUNTIME: std::time::Duration =
+    std::time::Duration::from_secs(30);
+
+pub(crate) async fn supervise_network_listener(
+    name: String,
+    handler: Arc<dyn InboundHandlerTrait>,
+    tcp: bool,
+) -> Result<(), crate::Error> {
+    supervise_listener(name, tcp, || {
+        let handler = handler.clone();
+        async move {
+            if tcp {
+                handler.listen_tcp().await
+            } else {
+                handler.listen_udp().await
+            }
+        }
+    })
+    .await
+}
+
+async fn supervise_listener<F, Fut>(
+    name: String,
+    tcp: bool,
+    mut listen: F,
+) -> Result<(), crate::Error>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<()>>,
+{
+    let protocol = if tcp { "TCP" } else { "UDP" };
+    let mut failures = 0;
+    let mut starting = true;
+    loop {
+        let started = tokio::time::Instant::now();
+        let listener = listen();
+        tokio::pin!(listener);
+        let result = if starting {
+            tokio::select! {
+                result = &mut listener => return result.map_err(Into::into),
+                _ = tokio::time::sleep(LISTENER_STARTUP_GRACE) => {
+                    starting = false;
+                    listener.await
+                }
+            }
+        } else {
+            listener.await
+        };
+
+        let error = match result {
+            Ok(()) => std::io::Error::other("listener exited unexpectedly"),
+            Err(error) => error,
+        };
+        if started.elapsed() >= LISTENER_STABLE_RUNTIME {
+            failures = 0;
+        }
+        let Some(delay) = LISTENER_RESTART_DELAYS.get(failures).copied() else {
+            error!(
+                "handler {} {} unavailable after {} restart attempts: {}",
+                name,
+                protocol,
+                LISTENER_RESTART_DELAYS.len(),
+                error,
+            );
+            crate::app::events::emit_app(
+                "listenerFailure",
+                serde_json::json!({
+                    "name": name,
+                    "protocol": protocol.to_ascii_lowercase(),
+                    "error": error.to_string(),
+                    "attempts": LISTENER_RESTART_DELAYS.len(),
+                }),
+            );
+            return Err(error.into());
+        };
+
+        failures += 1;
+        warn!(
+            "handler {} {} failed: {}; restarting in {}ms ({}/{})",
+            name,
+            protocol,
+            error,
+            delay.as_millis(),
+            failures,
+            LISTENER_RESTART_DELAYS.len(),
+        );
+        tokio::time::sleep(delay).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_failure_is_returned_without_retry() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let result = supervise_listener("test".to_owned(), true, {
+            let attempts = attempts.clone();
+            move || {
+                attempts.fetch_add(1, Ordering::Relaxed);
+                std::future::ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::AddrInUse,
+                    "busy",
+                )))
+            }
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn runtime_failure_retries_until_the_limit() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let result = supervise_listener("test".to_owned(), true, {
+            let attempts = attempts.clone();
+            move || {
+                let attempt = attempts.fetch_add(1, Ordering::Relaxed);
+                async move {
+                    if attempt == 0 {
+                        tokio::time::sleep(
+                            LISTENER_STARTUP_GRACE
+                                + std::time::Duration::from_millis(1),
+                        )
+                        .await;
+                    }
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::NotConnected,
+                        "disconnected",
+                    ))
+                }
+            }
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            attempts.load(Ordering::Relaxed),
+            LISTENER_RESTART_DELAYS.len() + 1,
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unexpected_listener_exit_is_retried() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let result = supervise_listener("test".to_owned(), true, {
+            let attempts = attempts.clone();
+            move || {
+                let attempt = attempts.fetch_add(1, Ordering::Relaxed);
+                async move {
+                    if attempt == 0 {
+                        tokio::time::sleep(
+                            LISTENER_STARTUP_GRACE
+                                + std::time::Duration::from_millis(1),
+                        )
+                        .await;
+                    }
+                    Ok(())
+                }
+            }
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            attempts.load(Ordering::Relaxed),
+            LISTENER_RESTART_DELAYS.len() + 1,
+        );
+    }
+}
+
 pub(crate) fn build_network_listeners(
     inbound_opts: &InboundOpts,
     dispatcher: Arc<Dispatcher>,
@@ -53,13 +239,7 @@ pub(crate) fn build_network_listeners(
             let name = name.clone();
             runners.push(Box::pin(async move {
                 info!("{} TCP listening at: {}:{}", name, addr, port,);
-                tcp_listener
-                    .listen_tcp()
-                    .await
-                    .inspect_err(|x| {
-                        error!("handler {} tcp listen failed: {x}", name);
-                    })
-                    .map_err(|e| e.into())
+                supervise_network_listener(name, tcp_listener, true).await
             }));
         }
 
@@ -68,13 +248,7 @@ pub(crate) fn build_network_listeners(
             let name = name.clone();
             runners.push(Box::pin(async move {
                 info!("{} UDP listening at: {}:{}", name, addr, port,);
-                udp_listener
-                    .listen_udp()
-                    .await
-                    .inspect_err(|x| {
-                        error!("handler {} udp listen failed: {x}", name);
-                    })
-                    .map_err(|e| e.into())
+                supervise_network_listener(name, udp_listener, false).await
             }));
         }
 

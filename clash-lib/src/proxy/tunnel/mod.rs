@@ -19,7 +19,8 @@ use tokio::{io::ReadBuf, net::UdpSocket};
 use tracing::{info, warn};
 
 use super::{
-    datagram::UdpPacket, inbound::InboundHandlerTrait, utils::apply_tcp_options,
+    datagram::UdpPacket,
+    inbound::{InboundHandlerTrait, accept_tcp_stream},
 };
 
 #[derive(Clone)]
@@ -58,17 +59,14 @@ impl TunnelInbound {
 #[async_trait]
 impl InboundHandlerTrait for TunnelInbound {
     fn handle_tcp(&self) -> bool {
-        true
+        self.network.iter().any(|network| network == "tcp")
     }
 
     fn handle_udp(&self) -> bool {
-        true
+        self.network.iter().any(|network| network == "udp")
     }
 
     async fn listen_tcp(&self) -> std::io::Result<()> {
-        if !self.network.contains(&"tcp".to_string()) {
-            return Ok(());
-        }
         info!(
             "[Tunnel-TCP] listening on {}, remote: {}",
             self.listen, self.target
@@ -76,9 +74,7 @@ impl InboundHandlerTrait for TunnelInbound {
         let listener = try_create_dualstack_tcplistener(self.listen)?;
 
         loop {
-            let (socket, src_addr) = listener.accept().await?;
-
-            apply_tcp_options(&socket)?;
+            let (socket, src_addr) = accept_tcp_stream(&listener, true).await?;
 
             let dispatcher = self.dispatcher.clone();
             let sess = Session {
@@ -97,9 +93,6 @@ impl InboundHandlerTrait for TunnelInbound {
     }
 
     async fn listen_udp(&self) -> std::io::Result<()> {
-        if !self.network.contains(&"udp".to_string()) {
-            return Ok(());
-        }
         info!(
             "[Tunnel-UDP] listening on {}, remote: {}",
             self.listen, self.target
