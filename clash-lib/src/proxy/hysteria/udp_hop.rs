@@ -11,10 +11,9 @@ use std::{
 
 use quinn::{AsyncUdpSocket, Runtime, TokioRuntime, UdpPoller, udp::Transmit};
 
-#[cfg(target_os = "android")]
-use std::os::fd::AsRawFd;
-
-use crate::proxy::converters::hysteria::PortGenerator;
+use crate::proxy::{
+    converters::hysteria::PortGenerator, utils::bind_protected_udp_socket,
+};
 
 struct HopState {
     prev_conn: Option<Arc<dyn AsyncUdpSocket>>,
@@ -48,9 +47,7 @@ impl UdpHop {
         interval: Option<Duration>,
     ) -> io::Result<Self> {
         let socket =
-            std::net::UdpSocket::bind(SocketAddr::new([0, 0, 0, 0].into(), 0))?;
-        #[cfg(target_os = "android")]
-        crate::process_resolver::protect_socket(socket.as_raw_fd());
+            bind_protected_udp_socket(SocketAddr::new([0, 0, 0, 0].into(), 0))?;
 
         let state = HopState {
             prev_conn: None,
@@ -84,11 +81,7 @@ impl UdpHop {
             *last = now;
             tracing::trace!("port hopping");
 
-            std::net::UdpSocket::bind(SocketAddr::new([0, 0, 0, 0].into(), 0))
-                .inspect(|_socket| {
-                    #[cfg(target_os = "android")]
-                    crate::process_resolver::protect_socket(_socket.as_raw_fd());
-                })
+            bind_protected_udp_socket(SocketAddr::new([0, 0, 0, 0].into(), 0))
                 .and_then(|udp| TokioRuntime.wrap_udp_socket(udp))
                 .map(|new_conn| {
                     *new_hop_port = self.port_range.get();

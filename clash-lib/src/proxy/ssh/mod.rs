@@ -31,7 +31,8 @@ use crate::{
 
 use super::{
     ConnectorType, DialWithConnector, HandlerCommonOptions, OutboundHandler,
-    OutboundType, PlainProxyAPIResponse, ProxyStream, utils::RemoteConnector,
+    OutboundType, PlainProxyAPIResponse, ProxyStream,
+    utils::{GLOBAL_DIRECT_CONNECTOR, RemoteConnector},
 };
 
 /// Wrapper for `ChannelStream` for `Debug` trait
@@ -167,7 +168,7 @@ impl OutboundHandler for Handler {
     async fn connect_stream(
         &self,
         sess: &Session,
-        _resolver: ThreadSafeDNSResolver,
+        resolver: ThreadSafeDNSResolver,
     ) -> io::Result<BoxedChainedStream> {
         // key exchange algorithms
         let kex = Cow::Borrowed(KEX_ALGORITHMS);
@@ -198,11 +199,22 @@ impl OutboundHandler for Handler {
         });
         let sh = connector::Client { server_public_key };
 
-        // TODO: adding fw_mark
-        let mut session =
-            client::connect(config, (self.opts.server.as_str(), self.opts.port), sh)
-                .await
-                .map_err(io::Error::other)?;
+        let connector = self.connector.read().await;
+        let direct = GLOBAL_DIRECT_CONNECTOR.clone();
+        let connector = connector.as_ref().unwrap_or(&direct);
+        let stream = connector
+            .connect_stream(
+                resolver,
+                &self.opts.server,
+                self.opts.port,
+                sess.iface.as_ref(),
+                #[cfg(target_os = "linux")]
+                sess.so_mark,
+            )
+            .await?;
+        let mut session = client::connect_stream(config, stream, sh)
+            .await
+            .map_err(io::Error::other)?;
 
         auth0(&mut session, &self.opts).await?;
 
@@ -271,6 +283,81 @@ async fn auth0(
             tracing::error!("ssh auth failed: {:?}", e);
             Err(new_io_error("ssh auth failed"))
         }
+    }
+}
+
+#[cfg(test)]
+mod connector_tests {
+    use super::*;
+    use crate::{
+        app::dns::ThreadSafeDNSResolver,
+        proxy::{
+            AnyOutboundDatagram, AnyStream, utils::test_utils::noop::NoopResolver,
+        },
+        session::SocksAddr,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone, Debug)]
+    struct RecordingConnector(Arc<AtomicUsize>);
+
+    #[async_trait]
+    impl RemoteConnector for RecordingConnector {
+        fn clone_connector(&self) -> Arc<dyn RemoteConnector> {
+            Arc::new(self.clone())
+        }
+
+        async fn connect_stream(
+            &self,
+            _resolver: ThreadSafeDNSResolver,
+            _address: &str,
+            _port: u16,
+            _iface: Option<&crate::app::net::OutboundInterface>,
+            #[cfg(target_os = "linux")] _packet_mark: Option<u32>,
+        ) -> io::Result<AnyStream> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(tokio::io::duplex(64).0))
+        }
+
+        async fn connect_datagram(
+            &self,
+            _resolver: ThreadSafeDNSResolver,
+            _src: Option<std::net::SocketAddr>,
+            _destination: SocksAddr,
+            _iface: Option<&crate::app::net::OutboundInterface>,
+            #[cfg(target_os = "linux")] _packet_mark: Option<u32>,
+        ) -> io::Result<AnyOutboundDatagram> {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn ssh_uses_registered_connector() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler = Handler::new(HandlerOptions {
+            name: "ssh".to_owned(),
+            common_opts: Default::default(),
+            server: "proxy.test".to_owned(),
+            port: 22,
+            username: "user".to_owned(),
+            password: None,
+            private_key: None,
+            private_key_passphrase: None,
+            host_key: None,
+            host_key_algorithms: None,
+            totp: None,
+        });
+        handler
+            .register_connector(Arc::new(RecordingConnector(calls.clone())))
+            .await;
+
+        assert!(
+            handler
+                .connect_stream(&Session::default(), Arc::new(NoopResolver))
+                .await
+                .is_err()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }
 

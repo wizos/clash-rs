@@ -24,7 +24,7 @@ pub type AndroidProcessResolver = unsafe extern "C" fn(
 ) -> *mut c_char;
 pub type AndroidStringFree = unsafe extern "C" fn(value: *mut c_char);
 pub type AndroidSocketProtector =
-    unsafe extern "C" fn(context: *mut c_void, fd: c_int);
+    unsafe extern "C" fn(context: *mut c_void, fd: c_int) -> bool;
 
 #[derive(Clone, Copy)]
 struct Resolver {
@@ -90,13 +90,18 @@ pub fn clear_android_resolver() {
     *resolver().write().expect("process resolver lock poisoned") = None;
 }
 
-pub fn protect_socket(fd: c_int) {
+pub fn protect_socket(fd: c_int) -> std::io::Result<()> {
     let resolver = resolver().read().expect("process resolver lock poisoned");
     if let Some(resolver) = resolver.as_ref()
         && let Some(protect) = resolver.protect
+        && !unsafe { protect(resolver.context as *mut c_void, fd) }
     {
-        unsafe { protect(resolver.context as *mut c_void, fd) };
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "VpnService.protect rejected socket",
+        ));
     }
+    Ok(())
 }
 
 /// Resolve and attach Android UID/package metadata for a concrete IP flow.
@@ -304,11 +309,16 @@ mod tests {
         std::ptr::null_mut()
     }
 
-    unsafe extern "C" fn assert_locked_protect(_context: *mut c_void, _fd: c_int) {
+    unsafe extern "C" fn assert_locked_protect(
+        _context: *mut c_void,
+        _fd: c_int,
+    ) -> bool {
         assert!(resolver().try_write().is_err());
+        true
     }
 
     #[test]
+    #[serial_test::serial]
     fn resolver_is_a_noop_without_callback() {
         clear_android_resolver();
         let mut session = Session::default();
@@ -318,6 +328,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn keeps_android_callback_alive_while_it_is_invoked() {
         unsafe {
             set_android_resolver(
@@ -328,7 +339,7 @@ mod tests {
                 Some(assert_locked_protect),
             );
         }
-        protect_socket(1);
+        protect_socket(1).unwrap();
         let mut session = Session {
             source: "172.19.0.1:45678".parse().unwrap(),
             destination: SocksAddr::Ip("1.1.1.1:443".parse().unwrap()),

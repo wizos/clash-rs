@@ -3,7 +3,7 @@ use crate::app::net::OutboundInterface;
 
 use futures::io;
 use socket2::TcpKeepalive;
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", all(test, unix)))]
 use std::os::fd::AsRawFd;
 use std::{
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -14,6 +14,27 @@ use tokio::{
     time::timeout,
 };
 use tracing::{debug, error, instrument, trace};
+
+pub(crate) fn new_protected_socket(
+    domain: socket2::Domain,
+    socket_type: socket2::Type,
+) -> std::io::Result<socket2::Socket> {
+    let socket = socket2::Socket::new(domain, socket_type, None)?;
+    #[cfg(any(target_os = "android", all(test, unix)))]
+    crate::process_resolver::protect_socket(socket.as_raw_fd())?;
+    Ok(socket)
+}
+
+pub(crate) fn bind_protected_udp_socket(
+    bind_addr: SocketAddr,
+) -> std::io::Result<std::net::UdpSocket> {
+    let socket = new_protected_socket(
+        socket2::Domain::for_address(bind_addr),
+        socket2::Type::DGRAM,
+    )?;
+    socket.bind(&bind_addr.into())?;
+    Ok(socket.into())
+}
 
 pub fn apply_tcp_options(s: &TcpStream) -> std::io::Result<()> {
     #[cfg(not(target_os = "windows"))]
@@ -49,25 +70,15 @@ pub async fn new_tcp_stream(
 ) -> std::io::Result<TcpStream> {
     let (socket, family) = match endpoint {
         SocketAddr::V4(_) => (
-            socket2::Socket::new(
-                socket2::Domain::IPV4,
-                socket2::Type::STREAM,
-                None,
-            )?,
+            new_protected_socket(socket2::Domain::IPV4, socket2::Type::STREAM)?,
             socket2::Domain::IPV4,
         ),
         SocketAddr::V6(_) => (
-            socket2::Socket::new(
-                socket2::Domain::IPV6,
-                socket2::Type::STREAM,
-                None,
-            )?,
+            new_protected_socket(socket2::Domain::IPV6, socket2::Type::STREAM)?,
             socket2::Domain::IPV6,
         ),
     };
     debug!("created tcp socket");
-    #[cfg(target_os = "android")]
-    crate::process_resolver::protect_socket(socket.as_raw_fd());
 
     if !cfg!(target_os = "android")
         && let Some(iface) = iface
@@ -132,8 +143,8 @@ pub async fn new_udp_socket(
         ),
     };
     debug!("created udp socket");
-    #[cfg(target_os = "android")]
-    crate::process_resolver::protect_socket(socket.as_raw_fd());
+    #[cfg(any(target_os = "android", all(test, unix)))]
+    crate::process_resolver::protect_socket(socket.as_raw_fd())?;
 
     if !cfg!(target_os = "android") {
         // Skip interface binding for loopback destinations — binding a socket
@@ -261,8 +272,8 @@ pub fn new_dual_stack_udp_socket(
             ),
         };
 
-    #[cfg(target_os = "android")]
-    crate::process_resolver::protect_socket(socket.as_raw_fd());
+    #[cfg(any(target_os = "android", all(test, unix)))]
+    crate::process_resolver::protect_socket(socket.as_raw_fd())?;
 
     if let Some(iface) = iface {
         let family = socket2::Domain::for_address(bind_addr);
@@ -306,6 +317,208 @@ pub fn try_create_dualstack_tcplistener(
 mod tests {
     use super::*;
     use std::{net::SocketAddrV6, time::Duration};
+
+    #[cfg(unix)]
+    mod android_outbound {
+        use super::*;
+        use crate::{
+            app::dns::MockClashResolver,
+            process_resolver::{clear_android_resolver, set_android_resolver},
+            proxy::utils::resolve_and_connect_tcp,
+        };
+        use std::{
+            ffi::{c_char, c_int, c_void},
+            os::fd::BorrowedFd,
+            ptr,
+            sync::{
+                Arc, Mutex,
+                atomic::{AtomicBool, AtomicUsize, Ordering},
+            },
+            thread::ThreadId,
+        };
+
+        static PROTECT_CALLS: AtomicUsize = AtomicUsize::new(0);
+        static PRE_OPERATION: AtomicBool = AtomicBool::new(false);
+        static RESOLVED_BEFORE_PROTECT: AtomicBool = AtomicBool::new(false);
+        static RESOLVE_CALLS: AtomicUsize = AtomicUsize::new(0);
+        // Other tests can install the same process-global callback in parallel.
+        // Ignore their socket creation instead of serializing the whole crate.
+        static EXPECTED_THREAD: Mutex<Option<ThreadId>> = Mutex::new(None);
+
+        const TCP: usize = 1;
+        const UDP: usize = 2;
+
+        struct AndroidResolverGuard;
+
+        impl Drop for AndroidResolverGuard {
+            fn drop(&mut self) {
+                clear_android_resolver();
+                *EXPECTED_THREAD.lock().unwrap() = None;
+            }
+        }
+
+        unsafe extern "C" fn noop_resolve(
+            _context: *mut c_void,
+            _protocol: c_int,
+            _source: *const c_char,
+            _target: *const c_char,
+            _uid: c_int,
+        ) -> *mut c_char {
+            ptr::null_mut()
+        }
+
+        unsafe extern "C" fn record_socket_state(
+            context: *mut c_void,
+            fd: c_int,
+        ) -> bool {
+            if EXPECTED_THREAD.lock().unwrap().as_ref()
+                != Some(&std::thread::current().id())
+            {
+                return true;
+            }
+            let fd = unsafe { BorrowedFd::borrow_raw(fd) };
+            let socket = socket2::SockRef::from(&fd);
+            let before_operation = match context as usize {
+                TCP => socket.peer_addr().is_err(),
+                UDP => socket
+                    .local_addr()
+                    .ok()
+                    .and_then(|addr| addr.as_socket())
+                    .is_some_and(|addr| addr.port() == 0),
+                _ => false,
+            };
+            PRE_OPERATION.store(before_operation, Ordering::SeqCst);
+            RESOLVED_BEFORE_PROTECT
+                .store(RESOLVE_CALLS.load(Ordering::SeqCst) > 0, Ordering::SeqCst);
+            PROTECT_CALLS.fetch_add(1, Ordering::SeqCst);
+            true
+        }
+
+        unsafe extern "C" fn reject_socket(
+            _context: *mut c_void,
+            _fd: c_int,
+        ) -> bool {
+            false
+        }
+
+        fn install_protector(socket_type: usize) -> AndroidResolverGuard {
+            PROTECT_CALLS.store(0, Ordering::SeqCst);
+            PRE_OPERATION.store(false, Ordering::SeqCst);
+            RESOLVED_BEFORE_PROTECT.store(false, Ordering::SeqCst);
+            RESOLVE_CALLS.store(0, Ordering::SeqCst);
+            *EXPECTED_THREAD.lock().unwrap() = Some(std::thread::current().id());
+            unsafe {
+                set_android_resolver(
+                    socket_type as *mut c_void,
+                    36,
+                    Some(noop_resolve),
+                    None,
+                    Some(record_socket_state),
+                );
+            }
+            AndroidResolverGuard
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn tcp_is_protected_once_before_connect() {
+            let _guard = install_protector(TCP);
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+
+            let _stream = new_tcp_stream(
+                listener.local_addr().unwrap(),
+                None,
+                #[cfg(target_os = "linux")]
+                None,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(PROTECT_CALLS.load(Ordering::SeqCst), 1);
+            assert!(PRE_OPERATION.load(Ordering::SeqCst));
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn protect_failure_aborts_before_connect() {
+            *EXPECTED_THREAD.lock().unwrap() = Some(std::thread::current().id());
+            unsafe {
+                set_android_resolver(
+                    std::ptr::null_mut(),
+                    36,
+                    Some(noop_resolve),
+                    None,
+                    Some(reject_socket),
+                );
+            }
+            let _guard = AndroidResolverGuard;
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+
+            let error = new_tcp_stream(
+                listener.local_addr().unwrap(),
+                None,
+                #[cfg(target_os = "linux")]
+                None,
+            )
+            .await
+            .unwrap_err();
+
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn udp_is_protected_once_before_bind() {
+            let _guard = install_protector(UDP);
+
+            let socket = new_udp_socket(
+                Some("127.0.0.1:0".parse().unwrap()),
+                None,
+                #[cfg(target_os = "linux")]
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(PROTECT_CALLS.load(Ordering::SeqCst), 1);
+            assert!(PRE_OPERATION.load(Ordering::SeqCst));
+            assert_ne!(socket.local_addr().unwrap().port(), 0);
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn hostname_uses_clash_resolver_before_protected_connect() {
+            let _guard = install_protector(TCP);
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut resolver = MockClashResolver::new();
+            resolver
+                .expect_resolve()
+                .once()
+                .returning(|host, enhanced| {
+                    assert_eq!(host, "proxy.test");
+                    assert!(!enhanced);
+                    RESOLVE_CALLS.fetch_add(1, Ordering::SeqCst);
+                    Ok(Some(Ipv4Addr::LOCALHOST.into()))
+                });
+
+            let _stream = resolve_and_connect_tcp(
+                Arc::new(resolver),
+                "proxy.test",
+                listener.local_addr().unwrap().port(),
+                None,
+                #[cfg(target_os = "linux")]
+                None,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(RESOLVE_CALLS.load(Ordering::SeqCst), 1);
+            assert_eq!(PROTECT_CALLS.load(Ordering::SeqCst), 1);
+            assert!(RESOLVED_BEFORE_PROTECT.load(Ordering::SeqCst));
+            assert!(PRE_OPERATION.load(Ordering::SeqCst));
+        }
+    }
 
     /// Locate the loopback network interface on the current host.
     /// Returns `None` if the interface cannot be found or enumeration fails.
