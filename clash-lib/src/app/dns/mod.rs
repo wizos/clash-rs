@@ -109,6 +109,9 @@ pub trait ClashResolver: Sync + Send {
     async fn reverse_lookup(&self, ip: std::net::IpAddr) -> Option<String>;
     async fn is_fake_ip(&self, ip: std::net::IpAddr) -> bool;
     fn fake_ip_enabled(&self) -> bool;
+    async fn fake_ip_active_for(&self, _host: &str) -> bool {
+        false
+    }
 
     fn ipv6(&self) -> bool;
     fn set_ipv6(&self, enable: bool);

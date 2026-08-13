@@ -24,15 +24,37 @@ use futures::{FutureExt, TryFutureExt};
 use hickory_proto::{op, rr};
 use rand::seq::IndexedRandom;
 use std::{
+    collections::HashMap,
     net,
     sync::{
-        Arc, OnceLock,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering::Relaxed},
     },
     time::{Duration, Instant},
 };
 use tokio::sync::RwLock;
 use tracing::{debug, error, instrument, trace, warn};
+
+type InflightDnsQuery = Arc<tokio::sync::OnceCell<Result<op::Message, String>>>;
+
+struct InflightDnsGuard<'a> {
+    queries: &'a Mutex<HashMap<op::Query, InflightDnsQuery>>,
+    query: op::Query,
+    cell: InflightDnsQuery,
+}
+
+impl Drop for InflightDnsGuard<'_> {
+    fn drop(&mut self) {
+        let mut queries = self.queries.lock().expect("DNS inflight lock poisoned");
+        if queries
+            .get(&self.query)
+            .is_some_and(|cell| Arc::ptr_eq(cell, &self.cell))
+            && Arc::strong_count(&self.cell) == 2
+        {
+            queries.remove(&self.query);
+        }
+    }
+}
 
 struct GeoSiteDnsPolicy {
     country_code: String,
@@ -80,6 +102,7 @@ pub struct EnhancedResolver {
     lru_cache: Option<RwLock<hickory_resolver::ResponseCache>>,
     policy: Option<trie::StringTrie<Vec<ThreadSafeDNSClient>>>,
     geosite_policy: Vec<GeoSiteDnsPolicy>,
+    inflight: Mutex<HashMap<op::Query, InflightDnsQuery>>,
 
     proxy_resolver: Option<Vec<ThreadSafeDNSClient>>,
     proxy_server_domains: Option<trie::StringTrie<bool>>,
@@ -127,6 +150,7 @@ impl EnhancedResolver {
             lru_cache: None,
             policy: None,
             geosite_policy: vec![],
+            inflight: Mutex::new(HashMap::new()),
 
             proxy_resolver: None,
             proxy_server_domains: None,
@@ -167,6 +191,7 @@ impl EnhancedResolver {
             lru_cache: None,
             policy: None,
             geosite_policy: vec![],
+            inflight: Mutex::new(HashMap::new()),
 
             proxy_resolver: None,
             proxy_server_domains: None,
@@ -315,6 +340,7 @@ impl EnhancedResolver {
             ))),
             policy: has_domain_policy.then_some(domain_policy),
             geosite_policy,
+            inflight: Mutex::new(HashMap::new()),
             fake_dns: match cfg.enhance_mode {
                 DNSMode::FakeIp => Some(Arc::new(RwLock::new(
                     fakeip::FakeDns::new(fakeip::Opts {
@@ -456,14 +482,36 @@ impl EnhancedResolver {
             return Ok(reply);
         }
 
+        let cell = {
+            let mut queries =
+                self.inflight.lock().expect("DNS inflight lock poisoned");
+            queries.entry(q.clone()).or_default().clone()
+        };
+        let guard = InflightDnsGuard {
+            queries: &self.inflight,
+            query: q.clone(),
+            cell,
+        };
+
         trace!(q = q.to_string(), "querying resolver");
-        let res = self.exchange_no_cache(message).await.map(|mut r| {
-            if let Some(edns) = r.edns.as_mut() {
-                // Remove only padding options, keep everything else
-                edns.options_mut().remove(rr::rdata::opt::EdnsCode::Padding);
-            }
-            r
-        });
+        let res = guard
+            .cell
+            .get_or_init(|| async {
+                self.exchange_no_cache(message)
+                    .await
+                    .map_err(|error| format!("{error:#}"))
+            })
+            .await
+            .clone()
+            .map_err(anyhow::Error::msg)
+            .map(|mut r| {
+                r.metadata.id = message.metadata.id;
+                if let Some(edns) = r.edns.as_mut() {
+                    // Remove only padding options, keep everything else
+                    edns.options_mut().remove(rr::rdata::opt::EdnsCode::Padding);
+                }
+                r
+            });
         trace!(q = q.to_string(), "query completed");
         res
     }
@@ -861,6 +909,23 @@ impl ClashResolver for EnhancedResolver {
         self.fake_dns.is_some()
     }
 
+    async fn fake_ip_active_for(&self, host: &str) -> bool {
+        if self
+            .hosts
+            .as_ref()
+            .and_then(|hosts| hosts.search(host))
+            .is_some_and(|value| {
+                matches!(value.get_data(), Some(net::IpAddr::V4(_)))
+            })
+        {
+            return false;
+        }
+        let Some(fake_dns) = &self.fake_dns else {
+            return false;
+        };
+        !fake_dns.read().await.should_skip(host)
+    }
+
     async fn is_fake_ip(&self, ip: std::net::IpAddr) -> bool {
         if !self.fake_ip_enabled() {
             return false;
@@ -894,7 +959,7 @@ mod tests {
             Arc, OnceLock,
             atomic::{AtomicUsize, Ordering},
         },
-        time::Instant,
+        time::{Duration, Instant},
     };
     use tokio::sync::RwLock;
 
@@ -979,6 +1044,57 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct CountingDnsClient {
+        calls: Arc<AtomicUsize>,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl DnsClientTrait for CountingDnsClient {
+        fn id(&self) -> String {
+            "counting".to_owned()
+        }
+
+        async fn exchange(
+            &self,
+            message: &op::Message,
+        ) -> anyhow::Result<op::Message> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            if self.fail {
+                anyhow::bail!("expected DNS failure");
+            }
+            Ok(message.clone())
+        }
+    }
+
+    #[derive(Debug)]
+    struct CancelThenSucceedDnsClient {
+        calls: Arc<AtomicUsize>,
+        started: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl DnsClientTrait for CancelThenSucceedDnsClient {
+        fn id(&self) -> String {
+            "cancel-then-succeed".to_owned()
+        }
+
+        async fn exchange(
+            &self,
+            message: &op::Message,
+        ) -> anyhow::Result<op::Message> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            self.started.notify_one();
+            if call == 0 {
+                std::future::pending().await
+            } else {
+                Ok(message.clone())
+            }
+        }
+    }
+
     fn dns_query(domain: &str) -> op::Message {
         let mut message = op::Message::query();
         let mut query = op::Query::new();
@@ -986,6 +1102,150 @@ mod tests {
         query.set_query_type(rr::RecordType::A);
         message.add_query(query);
         message
+    }
+
+    fn counting_client(calls: Arc<AtomicUsize>, fail: bool) -> ThreadSafeDNSClient {
+        Arc::new(CountingDnsClient { calls, fail })
+    }
+
+    #[tokio::test]
+    async fn singleflight_reduces_eight_upstream_queries_to_one() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::new_default().await;
+        resolver.main = vec![counting_client(calls.clone(), false)];
+        let request = dns_query("singleflight.example");
+
+        let baseline = futures::future::join_all(
+            (0..8).map(|_| resolver.exchange_no_cache(&request)),
+        )
+        .await;
+        assert!(baseline.iter().all(Result::is_ok));
+        assert_eq!(calls.swap(0, Ordering::SeqCst), 8);
+
+        let requests = (0..8)
+            .map(|id| {
+                let mut request = request.clone();
+                request.metadata.id = id;
+                request
+            })
+            .collect::<Vec<_>>();
+        let coalesced = futures::future::join_all(
+            requests.iter().map(|request| resolver.exchange(request)),
+        )
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        for (id, response) in coalesced.into_iter().enumerate() {
+            assert_eq!(response.unwrap().metadata.id, id as u16);
+        }
+    }
+
+    #[tokio::test]
+    async fn singleflight_shares_failures() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::new_default().await;
+        resolver.main = vec![counting_client(calls.clone(), true)];
+        let request = dns_query("failure.example");
+
+        let responses =
+            futures::future::join_all((0..8).map(|_| resolver.exchange(&request)))
+                .await;
+
+        assert!(responses.iter().all(Result::is_err));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn singleflight_does_not_merge_policy_or_record_type() {
+        let main_calls = Arc::new(AtomicUsize::new(0));
+        let policy_calls = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::new_default().await;
+        resolver.main = vec![counting_client(main_calls.clone(), false)];
+        let mut policy = trie::StringTrie::new();
+        policy.insert(
+            "policy.example",
+            Arc::new(vec![counting_client(policy_calls.clone(), false)]),
+        );
+        resolver.policy = Some(policy);
+
+        let mut requests = vec![];
+        for domain in ["main.example", "policy.example"] {
+            for record_type in [rr::RecordType::A, rr::RecordType::AAAA] {
+                let mut request = dns_query(domain);
+                request.queries[0].set_query_type(record_type);
+                requests.push(request.clone());
+                requests.push(request);
+            }
+        }
+        let responses = futures::future::join_all(
+            requests.iter().map(|request| resolver.exchange(request)),
+        )
+        .await;
+
+        assert!(responses.iter().all(Result::is_ok));
+        assert_eq!(main_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(policy_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn singleflight_recovers_when_leader_is_cancelled() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let mut resolver = EnhancedResolver::new_default().await;
+        resolver.main = vec![Arc::new(CancelThenSucceedDnsClient {
+            calls: calls.clone(),
+            started: started.clone(),
+        })];
+        let resolver = Arc::new(resolver);
+        let request = dns_query("cancel.example");
+        let leader = tokio::spawn({
+            let resolver = resolver.clone();
+            let request = request.clone();
+            async move { resolver.exchange(&request).await }
+        });
+        started.notified().await;
+        leader.abort();
+        let _ = leader.await;
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            resolver.exchange(&request),
+        )
+        .await
+        .expect("cancelled leader must not leave followers stuck");
+
+        assert!(response.is_ok());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn fake_ip_active_respects_filter_and_hosts() {
+        use crate::app::dns::fakeip::{FakeDns, InMemStore, Opts};
+
+        let mut skipped = trie::StringTrie::new();
+        skipped.insert("filtered.example", Arc::new(true));
+        let mut resolver = EnhancedResolver::new_default().await;
+        resolver.fake_dns = Some(Arc::new(RwLock::new(
+            FakeDns::new(Opts {
+                ipnet: "198.18.0.1/16".parse().unwrap(),
+                skipped_hostnames: Some(skipped),
+                store: Box::new(InMemStore::new(16)),
+            })
+            .unwrap(),
+        )));
+
+        assert!(resolver.fake_ip_active_for("normal.example").await);
+        assert!(!resolver.fake_ip_active_for("filtered.example").await);
+
+        let mut hosts = trie::StringTrie::new();
+        hosts.insert("hosts.example", Arc::new("192.0.2.1".parse().unwrap()));
+        hosts.insert(
+            "ipv6-hosts.example",
+            Arc::new("2001:db8::1".parse().unwrap()),
+        );
+        resolver.hosts = Some(hosts);
+        assert!(!resolver.fake_ip_active_for("hosts.example").await);
+        assert!(resolver.fake_ip_active_for("ipv6-hosts.example").await);
     }
 
     async fn resolver_with_domain_policy(domain: &str) -> EnhancedResolver {

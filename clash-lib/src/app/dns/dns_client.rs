@@ -169,6 +169,19 @@ mod tests {
             _ => panic!("unexpected edns option"),
         }
     }
+
+    #[tokio::test]
+    async fn selected_client_survives_connection_reset() {
+        let client = client_with_ecs(None);
+
+        for _ in 0..8 {
+            let (selected, ()) = tokio::join!(
+                client.client_for_exchange(),
+                client.reset_connection(),
+            );
+            drop(selected.expect("client selection must not race with reset"));
+        }
+    }
 }
 
 impl FromStr for DNSNetMode {
@@ -298,6 +311,40 @@ pub struct DnsClient {
 }
 
 impl DnsClient {
+    async fn client_for_exchange(
+        &self,
+    ) -> anyhow::Result<client::Client<DnsRuntimeProvider>> {
+        let mut inner = self.inner.write().await;
+        if inner.c.is_none()
+            || inner
+                .bg_handle
+                .as_ref()
+                .is_none_or(|background| background.is_finished())
+        {
+            if inner
+                .bg_handle
+                .as_ref()
+                .is_some_and(|background| background.is_finished())
+            {
+                warn!(
+                    "dns client background task is finished, likely connection closed, restarting a new one"
+                );
+            } else {
+                info!("initializing dns client: {}", &self.cfg);
+            }
+            let (client, background) = self.rebuild_with_retries().await?;
+            inner.c = Some(client);
+            inner.bg_handle = Some(background);
+        } else {
+            trace!(
+                "dns client background task is still running, reusing existing connection"
+            );
+        }
+        inner.c.clone().ok_or_else(|| {
+            anyhow!("dns client initialization completed without a client")
+        })
+    }
+
     /// Rebuild the DNS stream with retries, waiting between attempts.
     /// Observed on iOS: EADDRNOTAVAIL during network transitions can break
     /// DNS client connections; retrying gives the OS time to settle.
@@ -574,40 +621,7 @@ impl Client for DnsClient {
 
     #[instrument(skip(msg), level = "trace")]
     async fn exchange(&self, msg: &Message) -> anyhow::Result<Message> {
-        let need_initialize = {
-            let inner = self.inner.read().await;
-            inner.c.is_none()
-                || inner.bg_handle.as_ref().is_none_or(|bg| bg.is_finished())
-        };
-        if need_initialize {
-            let mut inner = self.inner.write().await;
-
-            match &inner.bg_handle {
-                Some(bg) => {
-                    if bg.is_finished() {
-                        warn!(
-                            "dns client background task is finished, likely \
-                             connection closed, restarting a new one"
-                        );
-                        let (client, bg) = self.rebuild_with_retries().await?;
-                        inner.c.replace(client);
-                        inner.bg_handle.replace(bg);
-                    } else {
-                        trace!(
-                            "dns client background task is still running, reusing \
-                             existing connection"
-                        );
-                    }
-                }
-                _ => {
-                    // initializing client
-                    info!("initializing dns client: {}", &self.cfg);
-                    let (client, bg) = self.rebuild_with_retries().await?;
-                    inner.c.replace(client);
-                    inner.bg_handle.replace(bg);
-                }
-            }
-        }
+        let client = self.client_for_exchange().await?;
 
         let mut outbound = msg.clone();
         self.apply_edns_client_subnet(&mut outbound);
@@ -616,12 +630,7 @@ impl Client for DnsClient {
         if req.metadata.id == 0 {
             req.metadata.id = rand::random::<u16>();
         }
-        self.inner
-            .read()
-            .await
-            .c
-            .as_ref()
-            .unwrap()
+        client
             .send(req)
             .first_answer()
             .await
