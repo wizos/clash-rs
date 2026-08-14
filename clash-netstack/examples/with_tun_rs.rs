@@ -117,6 +117,7 @@ mod macos {
                         data: watfaq_netstack::Packet::new(buf[..n].to_vec()),
                         local_addr: peer,
                         remote_addr: packet.local_addr,
+                        dscp: 0,
                     })
                     .await
                     .expect("Failed to send UDP packet");

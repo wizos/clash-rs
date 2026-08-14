@@ -56,8 +56,8 @@ impl std::fmt::Debug for IfaceEvent<'_> {
 /// will process the packets accordingly and write back to the stack Stream
 /// Application can Stream the packets from the stack
 pub struct NetStack {
-    // where the packets get into UDP Stack
-    udp_inbound: mpsc::UnboundedSender<Packet>,
+    // where packets enter the bounded UDP ingress processor
+    udp_inbound: mpsc::Sender<Packet>,
     // inject TCP packets into the stack
     // where the packets get into TCP Stack
     tcp_inbound: mpsc::UnboundedSender<Packet>,
@@ -108,8 +108,7 @@ impl NetStack {
         // can drain them.
         let (udp_packet_sender, udp_packet_receiver) = mpsc::channel::<Packet>(4096);
 
-        let (udp_inbound_app, udp_outbound_stack) =
-            mpsc::unbounded_channel::<Packet>();
+        let (udp_inbound_app, udp_outbound_stack) = mpsc::channel::<Packet>(4096);
 
         // this UdpSocket is essentially an Iface for UDP but much simpler as it only
         // does packets forwarding
@@ -137,14 +136,14 @@ impl NetStack {
 }
 
 pub struct StackSplitSink {
-    udp_inbound: mpsc::UnboundedSender<Packet>,
+    udp_inbound: mpsc::Sender<Packet>,
     tcp_inbound: mpsc::UnboundedSender<Packet>,
 
     packet_container: Option<(Packet, IpProtocol)>,
 }
 impl StackSplitSink {
     pub fn new(
-        udp_inbound: mpsc::UnboundedSender<Packet>,
+        udp_inbound: mpsc::Sender<Packet>,
         tcp_inbound: mpsc::UnboundedSender<Packet>,
     ) -> Self {
         Self {
@@ -207,11 +206,16 @@ impl futures::Sink<Packet> for StackSplitSink {
         };
 
         match proto {
-            IpProtocol::Udp => match self.udp_inbound.send(item) {
-                Ok(()) => {}
-                Err(e) => {
-                    debug!("Failed to send UDP packet: {e}");
-                    self.packet_container = Some((e.0, proto));
+            // UDP is lossy by design. Bound the ingress queue and drop on
+            // overload instead of allowing a packet flood to grow memory
+            // without limit.
+            IpProtocol::Udp => match self.udp_inbound.try_send(item) {
+                Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    return std::task::Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "UDP ingress processor closed",
+                    )));
                 }
             },
             IpProtocol::Tcp | IpProtocol::Icmp | IpProtocol::Icmpv6 => {

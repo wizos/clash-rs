@@ -1,8 +1,23 @@
 use crate::{Packet, packet::IpPacket};
 use etherparse::PacketBuilder;
-use log::{error, trace};
+use log::trace;
+use smoltcp::{
+    iface::{Config, Interface, PollIngressSingleResult, SocketHandle, SocketSet},
+    phy::{
+        ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken,
+    },
+    socket::raw,
+    time::Instant as SmolInstant,
+    wire::{
+        HardwareAddress, IpAddress, IpCidr, IpProtocol, UdpPacket as SmolUdpPacket,
+        UdpRepr,
+    },
+};
 use std::net::SocketAddr;
 use tokio::sync::mpsc;
+
+// IPv6's 16-bit payload length excludes the 40-byte base header.
+const RAW_PACKET_CAPACITY: usize = u16::MAX as usize + 40;
 
 pub struct UdpPacket {
     pub data: Packet,
@@ -43,20 +58,23 @@ impl UdpPacket {
 }
 
 pub struct UdpSocket {
-    inbound: mpsc::UnboundedReceiver<Packet>,
+    inbound: mpsc::Receiver<Packet>,
     outbound: mpsc::Sender<Packet>,
 }
 
 impl UdpSocket {
     pub fn new(
-        inbound: mpsc::UnboundedReceiver<Packet>,
+        inbound: mpsc::Receiver<Packet>,
         outbound: mpsc::Sender<Packet>,
     ) -> Self {
         Self { inbound, outbound }
     }
 
     pub fn split(self) -> (SplitRead, SplitWrite) {
-        let read = SplitRead { recv: self.inbound };
+        let read = SplitRead {
+            recv: self.inbound,
+            processor: UdpIngressProcessor::new(),
+        };
         let write = SplitWrite {
             send: self.outbound,
         };
@@ -65,50 +83,207 @@ impl UdpSocket {
 }
 
 pub struct SplitRead {
-    recv: mpsc::UnboundedReceiver<Packet>,
+    recv: mpsc::Receiver<Packet>,
+    processor: UdpIngressProcessor,
 }
 
 impl SplitRead {
     pub async fn recv(&mut self) -> Option<UdpPacket> {
-        self.recv.recv().await.and_then(|data| {
-            let packet = match IpPacket::new_checked(data.data()) {
-                Ok(p) => p,
-                Err(err) => {
-                    error!("invalid IP packet: {err}");
-                    return None;
-                }
-            };
+        while let Some(packet) = self.recv.recv().await {
+            if let Some(datagram) = self.processor.process(packet) {
+                return Some(datagram);
+            }
+        }
+        None
+    }
+}
 
-            let src_ip = packet.src_addr();
-            let dst_ip = packet.dst_addr();
-            let dscp = packet.dscp();
-            let payload = packet.payload();
+/// Runs UDP packets through smoltcp's IP ingress path while exposing raw
+/// datagrams to clash-rs. A raw socket is intentional here: a transparent TUN
+/// proxy must accept every destination port, while a normal smoltcp UDP socket
+/// must bind one concrete local port.
+struct UdpIngressProcessor {
+    iface: Interface,
+    device: UdpIngressDevice,
+    sockets: SocketSet<'static>,
+    raw_socket: SocketHandle,
+}
 
-            let packet = match smoltcp::wire::UdpPacket::new_checked(payload) {
-                Ok(p) => p,
-                Err(err) => {
-                    error!(
-                        "invalid err: {err}, src_ip: {src_ip}, dst_ip: {dst_ip}, \
-                         payload: {payload:?}"
-                    );
-                    return None;
-                }
-            };
-            let src_port = packet.src_port();
-            let dst_port = packet.dst_port();
+impl UdpIngressProcessor {
+    fn new() -> Self {
+        let mut device = UdpIngressDevice::new();
+        let mut config = Config::new(HardwareAddress::Ip);
+        config.random_seed = rand::random();
+        let mut iface = Interface::new(config, &mut device, SmolInstant::now());
+        iface.set_any_ip(true);
+        iface.update_ip_addrs(|ip_addrs| {
+            let _ = ip_addrs.push(IpCidr::new(
+                smoltcp::wire::Ipv4Address::new(10, 0, 0, 1).into(),
+                24,
+            ));
+            let _ = ip_addrs.push(IpCidr::new(
+                smoltcp::wire::Ipv6Address::new(0x0, 0xfac, 0, 0, 0, 0, 0, 1).into(),
+                64,
+            ));
+        });
+        iface
+            .routes_mut()
+            .add_default_ipv4_route(smoltcp::wire::Ipv4Address::new(10, 0, 0, 1))
+            .expect("failed to add UDP IPv4 route");
+        iface
+            .routes_mut()
+            .add_default_ipv6_route(smoltcp::wire::Ipv6Address::new(
+                0x0, 0xfac, 0, 0, 0, 0, 0, 1,
+            ))
+            .expect("failed to add UDP IPv6 route");
 
-            let src_addr = SocketAddr::new(src_ip, src_port);
-            let dst_addr = SocketAddr::new(dst_ip, dst_port);
+        // Ingress is processed one packet at a time, so one raw packet slot is
+        // sufficient. The payload storage still accepts the largest valid IP
+        // packet after IPv4 reassembly.
+        let rx_buffer = raw::PacketBuffer::new(
+            vec![raw::PacketMetadata::EMPTY; 1],
+            vec![0; RAW_PACKET_CAPACITY],
+        );
+        let tx_buffer = raw::PacketBuffer::new(Vec::new(), Vec::new());
+        let socket =
+            raw::Socket::new(None, Some(IpProtocol::Udp), rx_buffer, tx_buffer);
+        let mut sockets = SocketSet::new(Vec::new());
+        let raw_socket = sockets.add(socket);
 
-            trace!("created UDP socket for {src_addr} <-> {dst_addr}");
+        Self {
+            iface,
+            device,
+            sockets,
+            raw_socket,
+        }
+    }
 
-            Some(UdpPacket {
-                data: Packet::new(packet.payload().to_vec()),
-                local_addr: src_addr,
-                remote_addr: dst_addr,
-                dscp,
-            })
-        })
+    fn process(&mut self, packet: Packet) -> Option<UdpPacket> {
+        let dscp = IpPacket::new_checked(packet.data()).ok()?.dscp();
+        self.device.replace(packet);
+
+        let now = SmolInstant::now();
+        while !matches!(
+            self.iface
+                .poll_ingress_single(now, &mut self.device, &mut self.sockets),
+            PollIngressSingleResult::None
+        ) {}
+
+        let socket = self.sockets.get_mut::<raw::Socket>(self.raw_socket);
+        let packet = match socket.recv() {
+            Ok(packet) => packet,
+            Err(_) => return None,
+        };
+
+        parse_udp_datagram(packet, dscp)
+    }
+}
+
+fn parse_udp_datagram(packet: &[u8], dscp: u8) -> Option<UdpPacket> {
+    let ip_packet = IpPacket::new_checked(packet).ok()?;
+    let src_ip = ip_packet.src_addr();
+    let dst_ip = ip_packet.dst_addr();
+    let (src_smol, dst_smol) = smoltcp_ip_addresses(&ip_packet);
+    let udp_packet = SmolUdpPacket::new_checked(ip_packet.payload()).ok()?;
+
+    // A raw socket receives the packet before smoltcp's UDP socket dispatch.
+    // Validate the UDP checksum explicitly so the adapter cannot pass a packet
+    // that the normal smoltcp UDP path would reject.
+    UdpRepr::parse(
+        &udp_packet,
+        &src_smol,
+        &dst_smol,
+        &ChecksumCapabilities::default(),
+    )
+    .ok()?;
+
+    let local_addr = SocketAddr::new(src_ip, udp_packet.src_port());
+    let remote_addr = SocketAddr::new(dst_ip, udp_packet.dst_port());
+
+    trace!("created UDP datagram for {local_addr} <-> {remote_addr}");
+    Some(UdpPacket {
+        data: Packet::new(udp_packet.payload().to_vec()),
+        local_addr,
+        remote_addr,
+        dscp,
+    })
+}
+
+fn smoltcp_ip_addresses(packet: &IpPacket<&[u8]>) -> (IpAddress, IpAddress) {
+    match packet {
+        IpPacket::Ipv4(packet) => {
+            (packet.src_addr().into(), packet.dst_addr().into())
+        }
+        IpPacket::Ipv6(packet) => {
+            (packet.src_addr().into(), packet.dst_addr().into())
+        }
+    }
+}
+
+struct UdpIngressDevice {
+    packet: Option<Packet>,
+    capabilities: DeviceCapabilities,
+}
+
+impl UdpIngressDevice {
+    fn new() -> Self {
+        let mut capabilities = DeviceCapabilities::default();
+        capabilities.max_transmission_unit = RAW_PACKET_CAPACITY;
+        capabilities.medium = Medium::Ip;
+        Self {
+            packet: None,
+            capabilities,
+        }
+    }
+
+    fn replace(&mut self, packet: Packet) {
+        debug_assert!(self.packet.is_none());
+        self.packet = Some(packet);
+    }
+}
+
+impl Device for UdpIngressDevice {
+    type RxToken<'a> = UdpRxToken;
+    type TxToken<'a> = UdpTxToken;
+
+    fn receive(
+        &mut self,
+        _timestamp: SmolInstant,
+    ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        self.packet
+            .take()
+            .map(|packet| (UdpRxToken(packet), UdpTxToken))
+    }
+
+    fn transmit(&mut self, _timestamp: SmolInstant) -> Option<Self::TxToken<'_>> {
+        Some(UdpTxToken)
+    }
+
+    fn capabilities(&self) -> DeviceCapabilities {
+        self.capabilities.clone()
+    }
+}
+
+struct UdpRxToken(Packet);
+
+impl RxToken for UdpRxToken {
+    fn consume<R, F>(self, f: F) -> R
+    where
+        F: FnOnce(&[u8]) -> R,
+    {
+        f(self.0.data())
+    }
+}
+
+struct UdpTxToken;
+
+impl TxToken for UdpTxToken {
+    fn consume<R, F>(self, len: usize, f: F) -> R
+    where
+        F: FnOnce(&mut [u8]) -> R,
+    {
+        let mut discarded = vec![0; len];
+        f(&mut discarded)
     }
 }
 

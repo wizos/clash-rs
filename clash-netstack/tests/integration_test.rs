@@ -1,13 +1,14 @@
 use futures::{SinkExt, StreamExt};
-use watfaq_netstack::{NetStack, Packet};
+use watfaq_netstack::{NetStack, Packet, StackSplitSink};
 
 mod common;
 mod mock_tun;
 
 use common::{
-    build_tcp_ack, build_tcp_syn_packet, build_tcp_syn_packet_with_port,
-    build_udp_packet, init, is_rst, is_syn_ack, parse_server_isn, parse_tcp_data,
-    tcp_dst_port,
+    build_fragmented_udp_packet, build_ipv6_udp_packet, build_tcp_ack,
+    build_tcp_syn_packet, build_tcp_syn_packet_with_port, build_udp_packet,
+    build_udp_packet_with_payload_dscp, init, is_rst, is_syn_ack, parse_server_isn,
+    parse_tcp_data, tcp_dst_port,
 };
 use mock_tun::MockTun;
 
@@ -56,6 +57,153 @@ async fn test_stack_with_mock_tun_real_tcp_udp() {
     };
     assert_eq!(udp_packet.local_addr, "1.1.1.1:5000".parse().unwrap());
     assert_eq!(udp_packet.remote_addr, "2.2.2.2:5001".parse().unwrap());
+}
+
+#[tokio::test]
+async fn test_udp_preserves_dscp_and_payload() {
+    let (stack, _tcp_listener, udp_socket) = NetStack::new();
+    let (mut stack_sink, _stack_stream) = stack.split();
+    let (mut udp_read, _udp_write) = udp_socket.split();
+    let payload = b"viaport-udp";
+
+    stack_sink
+        .send(Packet::new(build_udp_packet_with_payload_dscp(payload, 46)))
+        .await
+        .unwrap();
+
+    let datagram =
+        tokio::time::timeout(std::time::Duration::from_secs(1), udp_read.recv())
+            .await
+            .expect("UDP ingress timed out")
+            .expect("UDP ingress closed");
+    assert_eq!(datagram.data(), payload);
+    assert_eq!(datagram.dscp, 46);
+    assert_eq!(datagram.local_addr, "1.1.1.1:5000".parse().unwrap());
+    assert_eq!(datagram.remote_addr, "2.2.2.2:5001".parse().unwrap());
+}
+
+#[tokio::test]
+async fn test_udp_reassembles_out_of_order_ipv4_fragments() {
+    let (stack, _tcp_listener, udp_socket) = NetStack::new();
+    let (mut stack_sink, _stack_stream) = stack.split();
+    let (mut udp_read, _udp_write) = udp_socket.split();
+    let payload = vec![0x5a; u16::MAX as usize - 20 - 8];
+    let mut fragments = build_fragmented_udp_packet(&payload, 34);
+
+    fragments.reverse();
+    for fragment in fragments {
+        stack_sink.send(Packet::new(fragment)).await.unwrap();
+    }
+
+    let datagram =
+        tokio::time::timeout(std::time::Duration::from_secs(1), udp_read.recv())
+            .await
+            .expect("fragmented UDP ingress timed out")
+            .expect("UDP ingress closed");
+    assert_eq!(datagram.data(), payload);
+    assert_eq!(datagram.dscp, 34);
+    assert_eq!(datagram.local_addr, "1.1.1.1:5000".parse().unwrap());
+    assert_eq!(datagram.remote_addr, "2.2.2.2:5001".parse().unwrap());
+}
+
+#[tokio::test]
+async fn test_udp_accepts_ipv6_and_preserves_dscp() {
+    let (stack, _tcp_listener, udp_socket) = NetStack::new();
+    let (mut stack_sink, _stack_stream) = stack.split();
+    let (mut udp_read, _udp_write) = udp_socket.split();
+    let payload = b"viaport-ipv6-udp";
+
+    stack_sink
+        .send(Packet::new(build_ipv6_udp_packet(payload, 12)))
+        .await
+        .unwrap();
+
+    let datagram =
+        tokio::time::timeout(std::time::Duration::from_secs(1), udp_read.recv())
+            .await
+            .expect("IPv6 UDP ingress timed out")
+            .expect("UDP ingress closed");
+    assert_eq!(datagram.data(), payload);
+    assert_eq!(datagram.dscp, 12);
+    assert_eq!(datagram.local_addr, "[2001:db8::1]:5000".parse().unwrap(),);
+    assert_eq!(datagram.remote_addr, "[2001:db8::2]:5001".parse().unwrap(),);
+}
+
+#[tokio::test]
+async fn test_udp_rejects_invalid_checksum() {
+    let (stack, _tcp_listener, udp_socket) = NetStack::new();
+    let (mut stack_sink, _stack_stream) = stack.split();
+    let (mut udp_read, _udp_write) = udp_socket.split();
+    let mut packet = build_udp_packet_with_payload_dscp(b"bad-checksum", 0).to_vec();
+    packet[26] ^= 0xff;
+
+    stack_sink.send(Packet::new(packet)).await.unwrap();
+
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            udp_read.recv(),
+        )
+        .await
+        .is_err(),
+        "invalid UDP checksum must be dropped",
+    );
+}
+
+#[tokio::test]
+async fn test_udp_ingress_drops_when_queue_is_full() {
+    let (udp_sender, mut udp_receiver) = tokio::sync::mpsc::channel(1);
+    let (tcp_sender, _tcp_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let mut stack_sink = StackSplitSink::new(udp_sender, tcp_sender);
+
+    stack_sink
+        .send(Packet::new(build_udp_packet()))
+        .await
+        .unwrap();
+    stack_sink
+        .send(Packet::new(build_udp_packet()))
+        .await
+        .unwrap();
+
+    assert!(udp_receiver.try_recv().is_ok());
+    assert!(udp_receiver.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn test_udp_reply_path_is_unchanged() {
+    let (stack, _tcp_listener, udp_socket) = NetStack::new();
+    let (_stack_sink, mut stack_stream) = stack.split();
+    let (_udp_read, mut udp_write) = udp_socket.split();
+
+    udp_write
+        .send(
+            (
+                b"reply".to_vec(),
+                "2.2.2.2:5001".parse().unwrap(),
+                "1.1.1.1:5000".parse().unwrap(),
+            )
+                .into(),
+        )
+        .await
+        .unwrap();
+
+    let packet =
+        tokio::time::timeout(std::time::Duration::from_secs(1), stack_stream.next())
+            .await
+            .expect("UDP reply timed out")
+            .expect("stack output closed")
+            .expect("stack output failed");
+    assert_eq!(&packet.data()[12..16], &[2, 2, 2, 2]);
+    assert_eq!(&packet.data()[16..20], &[1, 1, 1, 1]);
+    assert_eq!(
+        u16::from_be_bytes([packet.data()[20], packet.data()[21]]),
+        5001
+    );
+    assert_eq!(
+        u16::from_be_bytes([packet.data()[22], packet.data()[23]]),
+        5000
+    );
+    assert_eq!(&packet.data()[28..], b"reply");
 }
 
 /// Verifies that a relay can sustain a 16 MB bulk TCP transfer through the
