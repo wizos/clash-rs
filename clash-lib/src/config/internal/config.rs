@@ -75,6 +75,14 @@ impl Config {
                 )));
             }
 
+            let empty_fallback = &group.selection().empty_fallback;
+            if !self.proxies.contains_key(empty_fallback) {
+                return Err(Error::InvalidConfig(format!(
+                    "empty fallback proxy `{empty_fallback}` referenced by proxy group `{}` was not found",
+                    group.name()
+                )));
+            }
+
             if let Some(proxies) = group.proxies() {
                 for proxy in proxies {
                     if !self.proxies.contains_key(proxy)
@@ -305,6 +313,7 @@ pub struct General {
     pub controller: Controller,
     pub mode: RunMode,
     pub log_level: LogLevel,
+    pub global_ua: http::HeaderValue,
     pub ipv6: bool,
     pub interface: Option<Interface>,
     pub routing_mask: Option<u32>,
@@ -442,6 +451,8 @@ pub struct HttpRuleProvider {
     pub interval: u64,
     pub behavior: RuleSetBehavior,
     pub path: String,
+    #[serde(default)]
+    pub header: HashMap<String, super::proxy::StringList>,
     pub format: Option<RuleSetFormat>,
     #[serde(alias = "payload")]
     pub inline_rules: Option<Vec<String>>,
@@ -469,7 +480,13 @@ pub struct InlineRuleProvider {
 mod validation_tests {
     use crate::{
         Config as SourceConfig,
-        config::internal::{config::RuleProviderDef, proxy::OutboundProxy},
+        config::internal::{
+            config::RuleProviderDef,
+            proxy::{
+                OutboundProxy, OutboundProxyProviderDef, PROXY_COMPATIBLE,
+                PROXY_REJECT,
+            },
+        },
     };
 
     fn parse_error(yaml: &str) -> String {
@@ -582,6 +599,49 @@ rules:
     }
 
     #[test]
+    fn keeps_global_user_agent_and_explicit_provider_headers() {
+        let config = SourceConfig::Str(
+            r#"
+global-ua: Viaport/test
+proxy-providers:
+  proxies:
+    type: http
+    url: https://example.com/proxies.yaml
+    path: ./proxies.yaml
+    interval: 3600
+    header:
+      User-Agent: Proxy/test
+rule-providers:
+  rules:
+    type: http
+    url: https://example.com/rules.yaml
+    behavior: domain
+    header:
+      User-Agent: Rule/test
+rules:
+  - RULE-SET,rules,DIRECT
+  - MATCH,DIRECT
+"#
+            .to_owned(),
+        )
+        .try_parse()
+        .expect("global and provider user agents should parse");
+
+        assert_eq!(config.general.global_ua, "Viaport/test");
+        let OutboundProxyProviderDef::Http(proxy_provider) =
+            &config.proxy_providers["proxies"]
+        else {
+            panic!("expected HTTP proxy provider");
+        };
+        assert_eq!(proxy_provider.header["User-Agent"].to_vec(), ["Proxy/test"]);
+        let RuleProviderDef::Http(rule_provider) = &config.rule_providers["rules"]
+        else {
+            panic!("expected HTTP rule provider");
+        };
+        assert_eq!(rule_provider.header["User-Agent"].to_vec(), ["Rule/test"]);
+    }
+
+    #[test]
     fn rejects_missing_rule_provider_reference() {
         let error = parse_error(
             r#"
@@ -626,6 +686,118 @@ rules:
             panic!("expected proxy group");
         };
         assert_eq!(group.proxies().unwrap(), &["Hong Kong 01 🇭🇰"]);
+    }
+
+    #[test]
+    fn empty_mihomo_include_all_group_uses_compatible_fallback() {
+        let config = SourceConfig::Str(
+            r#"
+proxies:
+  - name: Tokyo
+    type: socks5
+    server: 127.0.0.1
+    port: 1080
+proxy-groups:
+  - name: Hong Kong
+    type: select
+    include-all: true
+    filter: Hong Kong
+rules:
+  - MATCH,Hong Kong
+"#
+            .to_owned(),
+        )
+        .try_parse()
+        .expect("dynamic empty group should use COMPATIBLE");
+
+        let OutboundProxy::ProxyGroup(group) = &config.proxy_groups["Hong Kong"]
+        else {
+            panic!("expected proxy group");
+        };
+        assert_eq!(group.proxies().unwrap(), &[PROXY_COMPATIBLE]);
+    }
+
+    #[test]
+    fn empty_mihomo_include_all_group_honors_custom_fallback() {
+        let config = SourceConfig::Str(
+            r#"
+proxy-groups:
+  - name: Empty
+    type: select
+    include-all-proxies: true
+    filter: never-matches
+    empty-fallback: REJECT
+rules:
+  - MATCH,Empty
+"#
+            .to_owned(),
+        )
+        .try_parse()
+        .expect("custom empty fallback should validate");
+
+        let OutboundProxy::ProxyGroup(group) = &config.proxy_groups["Empty"] else {
+            panic!("expected proxy group");
+        };
+        assert_eq!(group.proxies().unwrap(), &[PROXY_REJECT]);
+    }
+
+    #[test]
+    fn empty_include_all_providers_group_uses_fallback() {
+        let config = SourceConfig::Str(
+            r#"
+proxy-groups:
+  - name: Empty
+    type: select
+    include-all-providers: true
+rules:
+  - MATCH,Empty
+"#
+            .to_owned(),
+        )
+        .try_parse()
+        .expect("empty provider expansion should use COMPATIBLE");
+
+        let OutboundProxy::ProxyGroup(group) = &config.proxy_groups["Empty"] else {
+            panic!("expected proxy group");
+        };
+        assert_eq!(group.proxies().unwrap(), &[PROXY_COMPATIBLE]);
+    }
+
+    #[test]
+    fn rejects_plain_empty_proxy_group() {
+        let error = parse_error(
+            r#"
+proxy-groups:
+  - name: Empty
+    type: select
+rules:
+  - MATCH,Empty
+"#,
+        );
+        assert!(
+            error.contains("has no proxies or proxy providers"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rejects_proxy_group_as_empty_fallback() {
+        let error = parse_error(
+            r#"
+proxy-groups:
+  - name: Other
+    type: select
+    proxies: [DIRECT]
+  - name: Empty
+    type: select
+    include-all-proxies: true
+    filter: never-matches
+    empty-fallback: Other
+rules:
+  - MATCH,Empty
+"#,
+        );
+        assert!(error.contains("empty fallback proxy `Other`"), "{error}");
     }
 
     #[test]

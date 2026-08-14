@@ -21,13 +21,21 @@ pub type PendingOutboundManager = Arc<OnceLock<ThreadSafeOutboundManager>>;
 pub struct RuleDispatch {
     pub router: PendingRouter,
     pub outbound_manager: PendingOutboundManager,
+    pub user_agent: http::HeaderValue,
 }
 
 impl RuleDispatch {
     pub fn new() -> Arc<Self> {
+        Self::new_with_user_agent(
+            crate::common::http::DEFAULT_USER_AGENT.parse().unwrap(),
+        )
+    }
+
+    pub fn new_with_user_agent(user_agent: http::HeaderValue) -> Arc<Self> {
         Arc::new(Self {
             router: Arc::new(OnceLock::new()),
             outbound_manager: Arc::new(OnceLock::new()),
+            user_agent,
         })
     }
 }

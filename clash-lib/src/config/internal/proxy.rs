@@ -1078,7 +1078,7 @@ pub enum OutboundGroupProtocol {
     Select(OutboundGroupSelect),
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct OutboundGroupSelection {
     #[serde(rename = "include-all", default)]
     pub include_all: bool,
@@ -1089,6 +1089,25 @@ pub struct OutboundGroupSelection {
     pub filter: Option<String>,
     #[serde(rename = "exclude-filter")]
     pub exclude_filter: Option<String>,
+    #[serde(rename = "empty-fallback", default = "default_empty_fallback")]
+    pub empty_fallback: String,
+}
+
+impl Default for OutboundGroupSelection {
+    fn default() -> Self {
+        Self {
+            include_all: false,
+            include_all_proxies: false,
+            include_all_providers: false,
+            filter: None,
+            exclude_filter: None,
+            empty_fallback: default_empty_fallback(),
+        }
+    }
+}
+
+fn default_empty_fallback() -> String {
+    PROXY_COMPATIBLE.to_owned()
 }
 
 impl OutboundGroupSelection {
@@ -1102,34 +1121,41 @@ impl OutboundGroupSelection {
         if self.include_all || self.include_all_providers {
             *use_provider = Some(all_providers.to_vec());
         }
-        if !(self.include_all || self.include_all_proxies) {
-            return Ok(());
-        }
-
-        let filters = self
-            .filter
-            .as_deref()
-            .filter(|filter| !filter.is_empty())
-            .map(|filter| {
-                filter
-                    .split('`')
-                    .map(regex::Regex::new)
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|error| {
-                        crate::Error::InvalidConfig(format!(
-                            "invalid proxy group filter: {error}"
-                        ))
-                    })
-            })
-            .transpose()?;
-        let proxies = proxies.get_or_insert_default();
-        for name in all_proxies {
-            if filters.as_ref().is_none_or(|filters| {
-                filters.iter().any(|filter| filter.is_match(name))
-            }) && !proxies.contains(name)
-            {
-                proxies.push(name.clone());
+        if self.include_all || self.include_all_proxies {
+            let filters = self
+                .filter
+                .as_deref()
+                .filter(|filter| !filter.is_empty())
+                .map(|filter| {
+                    filter
+                        .split('`')
+                        .map(regex::Regex::new)
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|error| {
+                            crate::Error::InvalidConfig(format!(
+                                "invalid proxy group filter: {error}"
+                            ))
+                        })
+                })
+                .transpose()?;
+            let proxies = proxies.get_or_insert_default();
+            for name in all_proxies {
+                if filters.as_ref().is_none_or(|filters| {
+                    filters.iter().any(|filter| filter.is_match(name))
+                }) && !proxies.contains(name)
+                {
+                    proxies.push(name.clone());
+                }
             }
+        }
+        if (self.include_all
+            || self.include_all_proxies
+            || self.include_all_providers)
+            && proxies.as_ref().is_none_or(Vec::is_empty)
+            && use_provider.as_ref().is_none_or(Vec::is_empty)
+        {
+            let proxies = proxies.get_or_insert_default();
+            proxies.push(self.empty_fallback.clone());
         }
         Ok(())
     }
@@ -1396,6 +1422,8 @@ pub struct OutboundHttpProvider {
     pub proxy: Option<String>,
     pub interval: u64,
     pub path: String,
+    #[serde(default)]
+    pub header: HashMap<String, StringList>,
     #[serde(default)]
     pub health_check: HealthCheck,
     #[serde(rename = "override", default)]

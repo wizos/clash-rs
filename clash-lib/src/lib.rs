@@ -1067,6 +1067,7 @@ async fn create_components(
     cwd: PathBuf,
     config: InternalConfig,
 ) -> Result<RuntimeComponents> {
+    let global_ua = config.general.global_ua.clone();
     let required_proxy_providers = required_proxy_providers(&config);
     let sniffer = Sniffer::from_config(config.general.sniffer.as_ref())?;
     let unified_delay = config.general.unified_delay;
@@ -1113,6 +1114,7 @@ async fn create_components(
 
     let client =
         new_http_client(system_resolver.clone(), Some(outbound_registry.clone()))
+            .map(|client| client.with_user_agent(global_ua.clone()))
             .map_err(|x| Error::DNSError(x.to_string()))?;
 
     // Download the dashboard if both `external-ui` and `external-ui-url` are
@@ -1157,7 +1159,7 @@ async fn create_components(
     // resolver and the (later-built) router + outbound manager. The DNS
     // runtime provider consults the OnceLocks at dial time and falls back to
     // DIRECT until they are populated.
-    let rule_dispatch = dns::RuleDispatch::new();
+    let rule_dispatch = dns::RuleDispatch::new_with_user_agent(global_ua.clone());
     let dns_rule_dispatch = config.dns.respect_rules.then(|| rule_dispatch.clone());
 
     let dns_resolver = dns::new_resolver(
@@ -1339,6 +1341,7 @@ async fn create_components(
                 cwd.to_string_lossy().to_string(),
                 config.inbound_providers,
                 dns_resolver.clone(),
+                global_ua,
             )
             .await;
     }

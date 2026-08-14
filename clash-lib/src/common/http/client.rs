@@ -10,6 +10,17 @@ use hyper_util::rt::TokioIo;
 use std::sync::Arc;
 use tracing::{trace, warn};
 
+use super::DEFAULT_USER_AGENT;
+
+fn apply_default_user_agent(
+    headers: &mut http::HeaderMap,
+    user_agent: &http::HeaderValue,
+) {
+    headers
+        .entry(http::header::USER_AGENT)
+        .or_insert_with(|| user_agent.clone());
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ClashHTTPClientExt {
     pub(crate) outbound: Option<String>,
@@ -24,6 +35,7 @@ pub struct HttpClient {
     rule_dispatch: Option<Arc<RuleDispatch>>,
     tls_config: Arc<rustls::ClientConfig>,
     timeout: tokio::time::Duration,
+    user_agent: http::HeaderValue,
 }
 
 impl HttpClient {
@@ -45,7 +57,15 @@ impl HttpClient {
             rule_dispatch: None,
             tls_config: Arc::new(tls_config),
             timeout: timeout.unwrap_or(tokio::time::Duration::from_secs(10)),
+            user_agent: DEFAULT_USER_AGENT
+                .parse()
+                .expect("valid default user agent"),
         })
+    }
+
+    pub fn with_user_agent(mut self, user_agent: http::HeaderValue) -> Self {
+        self.user_agent = user_agent;
+        self
     }
 
     pub fn with_rule_dispatch(mut self, rule_dispatch: Arc<RuleDispatch>) -> Self {
@@ -62,6 +82,7 @@ impl HttpClient {
         <T as hyper::body::Body>::Data: Send,
         <T as hyper::body::Body>::Error: std::error::Error + Send + Sync,
     {
+        apply_default_user_agent(req.headers_mut(), &self.user_agent);
         let uri = req.uri().clone();
 
         let host = uri
@@ -218,4 +239,24 @@ pub fn new_http_client(
     bootstrap_outbounds: Option<OutboundHandlerRegistry>,
 ) -> std::io::Result<HttpClient> {
     HttpClient::new(dns_resolver, bootstrap_outbounds, None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn global_user_agent_is_a_default_not_an_override() {
+        let global = http::HeaderValue::from_static("Viaport/test");
+        let mut headers = http::HeaderMap::new();
+        apply_default_user_agent(&mut headers, &global);
+        assert_eq!(headers[http::header::USER_AGENT], global);
+
+        headers.insert(
+            http::header::USER_AGENT,
+            http::HeaderValue::from_static("Provider/test"),
+        );
+        apply_default_user_agent(&mut headers, &global);
+        assert_eq!(headers[http::header::USER_AGENT], "Provider/test");
+    }
 }

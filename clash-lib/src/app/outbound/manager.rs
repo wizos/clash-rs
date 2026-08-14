@@ -951,7 +951,7 @@ impl OutboundManager {
                 }
             }
 
-            providers
+            let mut providers = providers
                 .into_iter()
                 .map(|provider| {
                     FilteredProvider::wrap(
@@ -960,7 +960,30 @@ impl OutboundManager {
                         selection.exclude_filter.as_deref(),
                     )
                 })
-                .collect()
+                .collect::<Result<Vec<_>, Error>>()?;
+            let fallback = handlers
+                .get(&selection.empty_fallback)
+                .cloned()
+                .ok_or_else(|| {
+                    Error::InvalidConfig(format!(
+                        "empty fallback proxy `{}` referenced by proxy group \
+                         `{name}` was not loaded",
+                        selection.empty_fallback
+                    ))
+                })?;
+            let hc = HealthCheck::new(
+                vec![fallback.clone()],
+                health_check_url.to_owned(),
+                0,
+                true,
+                proxy_manager.clone(),
+            );
+            providers.push(Arc::new(PlainProvider::new_fallback(
+                format!("{name}#empty-fallback"),
+                vec![fallback],
+                hc,
+            )?));
+            Ok(providers)
         }
 
         #[allow(clippy::too_many_arguments)]
@@ -1303,6 +1326,7 @@ impl OutboundManager {
                             Some(cwd.clone()),
                             resolver.clone(),
                         )
+                        .with_headers(http.header)?
                         .with_rule_dispatch(rule_dispatch.clone());
                         if let Some(proxy) =
                             http.proxy.filter(|value| !value.is_empty())

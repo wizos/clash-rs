@@ -2,7 +2,7 @@ use crate::{
     Error,
     common::{
         errors::new_io_error,
-        http::{ClashHTTPClientExt, DEFAULT_USER_AGENT, HttpClient},
+        http::{ClashHTTPClientExt, HttpClient},
     },
 };
 use async_recursion::async_recursion;
@@ -134,7 +134,6 @@ where
     let url_no_fragment = url.rsplit_once('#').map(|x| x.0).unwrap_or(url);
     let url = url_no_fragment.parse::<hyper::Uri>()?;
     let mut req = http::Request::builder()
-        .header(http::header::USER_AGENT, DEFAULT_USER_AGENT)
         .uri(&url)
         .method(http::Method::GET)
         .body(Empty::<bytes::Bytes>::new())?;

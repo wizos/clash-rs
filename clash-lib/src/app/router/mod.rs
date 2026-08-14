@@ -260,6 +260,7 @@ impl Router {
                         Some(cwd.clone()),
                         resolver.clone(),
                     )
+                    .with_headers(http.header)?
                     .with_rule_dispatch(rule_dispatch.clone());
                     if let Some(proxy) = http.proxy.filter(|value| !value.is_empty())
                     {

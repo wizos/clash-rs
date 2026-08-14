@@ -21,6 +21,7 @@ pub struct PlainProvider {
     name: String,
     proxies: Vec<AnyOutboundHandler>,
     hc: Arc<HealthCheck>,
+    fallback: bool,
 }
 
 impl PlainProvider {
@@ -43,7 +44,23 @@ impl PlainProvider {
             });
         }
 
-        Ok(Self { name, proxies, hc })
+        Ok(Self {
+            name,
+            proxies,
+            hc,
+            fallback: false,
+        })
+    }
+
+    pub fn new_fallback(
+        name: String,
+        proxies: Vec<AnyOutboundHandler>,
+        hc: HealthCheck,
+    ) -> anyhow::Result<Self> {
+        Self::new(name, proxies, hc).map(|mut provider| {
+            provider.fallback = true;
+            provider
+        })
     }
 }
 
@@ -104,5 +121,9 @@ impl ProxyProvider for PlainProvider {
                 hc.kick_off().await;
             });
         }
+    }
+
+    fn is_fallback(&self) -> bool {
+        self.fallback
     }
 }

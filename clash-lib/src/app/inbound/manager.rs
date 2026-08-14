@@ -167,6 +167,7 @@ impl InboundManager {
         cwd: String,
         providers: HashMap<String, InboundProviderDef>,
         dns_resolver: ThreadSafeDNSResolver,
+        global_ua: http::HeaderValue,
     ) {
         for (name, def) in providers {
             let (vehicle, interval): (
@@ -191,7 +192,8 @@ impl InboundManager {
                         path,
                         Some(cwd.clone()),
                         dns_resolver.clone(),
-                    );
+                    )
+                    .with_user_agent(global_ua.clone());
                     (Arc::new(v), Duration::from_secs(interval))
                 }
                 InboundProviderDef::File(InboundFileProvider { path, interval, .. }) => {

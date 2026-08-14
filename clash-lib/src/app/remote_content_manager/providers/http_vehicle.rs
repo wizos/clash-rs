@@ -12,7 +12,6 @@ use async_trait::async_trait;
 use http_body_util::BodyExt;
 use hyper::Uri;
 
-use crate::common::http::DEFAULT_USER_AGENT;
 use http::Request;
 use std::{
     io,
@@ -31,6 +30,7 @@ pub struct Vehicle {
     pub path: PathBuf,
     http_client: HttpClient,
     outbound: Option<String>,
+    headers: http::HeaderMap,
     subscription_info: RwLock<Option<SubscriptionInfo>>,
 }
 
@@ -52,12 +52,21 @@ impl Vehicle {
             },
             http_client: client,
             outbound: None,
+            headers: http::HeaderMap::new(),
             subscription_info: RwLock::new(None),
         }
     }
 
     pub fn with_rule_dispatch(mut self, rule_dispatch: Arc<RuleDispatch>) -> Self {
-        self.http_client = self.http_client.with_rule_dispatch(rule_dispatch);
+        self.http_client = self
+            .http_client
+            .with_user_agent(rule_dispatch.user_agent.clone())
+            .with_rule_dispatch(rule_dispatch);
+        self
+    }
+
+    pub fn with_user_agent(mut self, user_agent: http::HeaderValue) -> Self {
+        self.http_client = self.http_client.with_user_agent(user_agent);
         self
     }
 
@@ -66,15 +75,33 @@ impl Vehicle {
         self
     }
 
+    pub fn with_headers(
+        mut self,
+        headers: std::collections::HashMap<
+            String,
+            crate::config::internal::proxy::StringList,
+        >,
+    ) -> io::Result<Self> {
+        for (name, values) in headers {
+            let name = name.parse::<http::HeaderName>().map_err(io::Error::other)?;
+            for value in values.to_vec() {
+                self.headers.append(
+                    name.clone(),
+                    value
+                        .parse::<http::HeaderValue>()
+                        .map_err(io::Error::other)?,
+                );
+            }
+        }
+        Ok(self)
+    }
+
     async fn read_with_redirects(&self) -> std::io::Result<Vec<u8>> {
         let mut url =
             url::Url::parse(&self.url.to_string()).map_err(io::Error::other)?;
         for redirects in 0..=10 {
             let mut req = Request::default();
-            req.headers_mut().insert(
-                http::header::USER_AGENT,
-                DEFAULT_USER_AGENT.parse().expect("must parse user agent"),
-            );
+            *req.headers_mut() = self.headers.clone();
             *req.body_mut() = http_body_util::Empty::<bytes::Bytes>::new();
             *req.uri_mut() =
                 url.as_str().parse::<Uri>().map_err(io::Error::other)?;

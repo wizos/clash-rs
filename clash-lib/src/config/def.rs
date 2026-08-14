@@ -505,6 +505,8 @@ pub struct Config {
     /// Log level
     /// Either `debug`, `info`, `warning`, `error` or `off`
     pub log_level: LogLevel,
+    /// Default User-Agent for HTTP resource downloads.
+    pub global_ua: Option<String>,
     /// DNS client/server settings
     pub dns: DNS,
     /// Profile settings
@@ -1029,6 +1031,9 @@ pub struct HttpRuleProviderDef {
     /// Local cache path for the downloaded rule set.
     /// Derived from the URL's MD5 hash when absent.
     pub path: Option<String>,
+    /// HTTP request headers. Explicit values override `global-ua`.
+    #[serde(default)]
+    pub header: HashMap<String, crate::config::internal::proxy::StringList>,
     /// Rule set file format. Defaults to `yaml` when absent.
     pub format: Option<RuleSetFormat>,
     /// Inline rules embedded directly in the config (alias: `payload`).

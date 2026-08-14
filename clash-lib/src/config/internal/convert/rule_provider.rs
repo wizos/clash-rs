@@ -30,6 +30,7 @@ pub(super) fn convert(
                         interval: h.interval,
                         behavior: h.behavior,
                         path,
+                        header: h.header,
                         format: h.format,
                         inline_rules: h.inline_rules,
                     })

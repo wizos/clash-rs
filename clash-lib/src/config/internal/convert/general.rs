@@ -2,6 +2,7 @@ use std::net::IpAddr;
 
 use crate::{
     app::net::Interface,
+    common::http::DEFAULT_USER_AGENT,
     config::{
         config::{BindAddress, Controller, General},
         def,
@@ -62,6 +63,18 @@ pub(super) fn convert(c: &def::Config) -> Result<General, crate::Error> {
             .map(|_| "GEOSITE.dat".to_owned())
     });
 
+    let global_ua = c
+        .global_ua
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_USER_AGENT)
+        .parse()
+        .map_err(|error| {
+            crate::Error::InvalidConfig(format!(
+                "invalid global-ua HTTP header value: {error}"
+            ))
+        })?;
+
     Ok(General {
         authentication: c.authentication.clone(),
         controller: Controller {
@@ -74,6 +87,7 @@ pub(super) fn convert(c: &def::Config) -> Result<General, crate::Error> {
         },
         mode: c.mode,
         log_level: c.log_level,
+        global_ua,
         ipv6: c.ipv6,
         interface: c.interface.as_ref().map(|iface| {
             if let Ok(addr) = iface.parse::<IpAddr>() {

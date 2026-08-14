@@ -28,6 +28,9 @@ pub trait ProxyProvider: Provider {
     async fn healthcheck(&self);
     fn start_healthcheck(&self) {}
     fn register_healthcheck(&self, _url: &str, _interval: u64) {}
+    fn is_fallback(&self) -> bool {
+        false
+    }
 }
 
 struct ProxyFilter {
