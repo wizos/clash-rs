@@ -70,18 +70,12 @@ impl TryFrom<&OutboundVmess> for Handler {
                 .clone()
                 .filter(|network| !matches!(network.as_str(), "" | "tcp"))
                 .map(|x| match x.as_str() {
-                    "ws" => s
-                        .ws_opts
-                        .as_ref()
-                        .map(|x| {
-                            let client: WsClient = (x, &s.common_opts)
-                                .try_into()
-                                .expect("invalid ws options");
-                            Box::new(client) as _
-                        })
-                        .ok_or(Error::InvalidConfig(
-                            "ws_opts is required for ws".to_owned(),
-                        )),
+                    "ws" => {
+                        let client: WsClient = (s.ws_opts.as_ref(), &s.common_opts)
+                            .try_into()
+                            .expect("invalid ws options");
+                        Ok(Box::new(client) as _)
+                    }
                     "http" => s
                         .http_opts
                         .as_ref()

@@ -306,18 +306,12 @@ impl TryFrom<&OutboundVless> for Handler {
                 .clone()
                 .map(|x| match x.as_str() {
                     "" | "tcp" | "raw" => Ok(None),
-                    "ws" => s
-                        .ws_opts
-                        .as_ref()
-                        .map(|x| {
-                            let client: WsClient = (x, &s.common_opts)
-                                .try_into()
-                                .expect("invalid ws options");
-                            Some(Box::new(client) as _)
-                        })
-                        .ok_or(Error::InvalidConfig(
-                            "ws_opts is required for ws".to_owned(),
-                        )),
+                    "ws" => {
+                        let client: WsClient = (s.ws_opts.as_ref(), &s.common_opts)
+                            .try_into()
+                            .expect("invalid ws options");
+                        Ok(Some(Box::new(client) as _))
+                    }
                     "http" => s
                         .http_opts
                         .as_ref()
@@ -604,6 +598,25 @@ mod tests {
             handler.is_ok(),
             "VLess handler without network field should parse successfully"
         );
+    }
+
+    #[test]
+    fn test_vless_websocket_defaults_missing_options() {
+        crate::setup_default_crypto_provider();
+        let config = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "test-ws".to_string(),
+                server: "example.com".to_string(),
+                port: 443,
+                ..Default::default()
+            },
+            uuid: "test-uuid".to_string(),
+            network: Some("ws".to_string()),
+            ws_opts: None,
+            ..Default::default()
+        };
+
+        assert!(Handler::try_from(&config).is_ok());
     }
 
     #[test]

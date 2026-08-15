@@ -59,6 +59,17 @@ impl TryFrom<(&WsOpt, &CommonConfigOptions)> for WsClient {
     }
 }
 
+impl TryFrom<(Option<&WsOpt>, &CommonConfigOptions)> for WsClient {
+    type Error = std::io::Error;
+
+    fn try_from(
+        (options, common): (Option<&WsOpt>, &CommonConfigOptions),
+    ) -> Result<Self, Self::Error> {
+        let default = WsOpt::default();
+        (options.unwrap_or(&default), common).try_into()
+    }
+}
+
 impl From<(&HttpOpt, &CommonConfigOptions)> for HttpConfig {
     fn from((options, common): (&HttpOpt, &CommonConfigOptions)) -> Self {
         Self {
