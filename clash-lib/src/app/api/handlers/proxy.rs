@@ -109,6 +109,7 @@ async fn update_proxy(
             Ok(_) => {
                 let cache_store = state.cache_store;
                 cache_store.set_selected(proxy.name(), &payload.name).await;
+                outbound_manager.clear_route_caches().await;
                 (
                     StatusCode::ACCEPTED,
                     axum::response::Json(json!({

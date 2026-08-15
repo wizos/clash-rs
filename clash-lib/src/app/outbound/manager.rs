@@ -48,7 +48,7 @@ use crate::{
         AnyOutboundHandler, anytls,
         direct::{self},
         dns as dns_outbound, fallback, gost_relay,
-        group::smart,
+        group::{route_race, smart},
         http, hysteria, hysteria2, loadbalance, reject, relay,
         selector::{self, ThreadSafeSelectorControl},
         snell, socks, trojan, trusttunnel, urltest,
@@ -120,6 +120,8 @@ impl OutboundManager {
         cache_store: ThreadSafeCacheFile,
         cwd: String,
         fw_mark: Option<u32>,
+        failover_race_delay: Duration,
+        route_race_delay: Duration,
         registry: OutboundHandlerRegistry,
         rule_dispatch: Arc<RuleDispatch>,
     ) -> Result<Self, Error> {
@@ -150,6 +152,8 @@ impl OutboundManager {
             outbound_groups,
             proxy_names,
             cache_store,
+            failover_race_delay,
+            route_race_delay,
         )
         .await?;
 
@@ -330,6 +334,12 @@ impl OutboundManager {
     pub fn start_healthchecks(&self) {
         for provider in self.proxy_providers.values() {
             provider.start_healthcheck();
+        }
+    }
+
+    pub async fn clear_route_caches(&self) {
+        for handler in self.registry.read().await.values() {
+            handler.clear_route_cache();
         }
     }
 
@@ -814,14 +824,22 @@ impl OutboundManager {
         outbound_groups: Vec<OutboundGroupProtocol>,
         proxy_names: Vec<String>,
         cache_store: ThreadSafeCacheFile,
+        failover_race_delay: Duration,
+        route_race_delay: Duration,
     ) -> Result<(), Error> {
         handlers.extend(outbounds.into_iter().map(|h| {
             let name = h.name().to_owned();
             (name, h)
         }));
 
-        self.load_group_outbounds(handlers, outbound_groups, cache_store.clone())
-            .await?;
+        self.load_group_outbounds(
+            handlers,
+            outbound_groups,
+            cache_store.clone(),
+            failover_race_delay,
+            route_race_delay,
+        )
+        .await?;
 
         // insert GLOBAL
         let mut g = vec![];
@@ -869,6 +887,7 @@ impl OutboundManager {
                     icon: None,
                     ..Default::default()
                 },
+                ..Default::default()
             },
             providers,
             stored_selection,
@@ -889,6 +908,8 @@ impl OutboundManager {
         handlers: &mut HashMap<String, AnyOutboundHandler>,
         outbound_groups: Vec<OutboundGroupProtocol>,
         cache_store: ThreadSafeCacheFile,
+        failover_race_delay: Duration,
+        route_race_delay: Duration,
     ) -> Result<(), Error> {
         // Sort outbound groups to ensure dependencies are resolved
         let mut outbound_groups = outbound_groups;
@@ -1103,6 +1124,8 @@ impl OutboundManager {
                                 url: Some(proto.url.clone()),
                                 connector: None,
                             },
+                            failover_race: proto.selection.failover_race,
+                            race_delay: Some(failover_race_delay),
                             ..Default::default()
                         },
                         proto.tolerance.unwrap_or_default(),
@@ -1144,6 +1167,8 @@ impl OutboundManager {
                                 url: Some(proto.url.clone()),
                                 connector: None,
                             },
+                            failover_race: proto.selection.failover_race,
+                            race_delay: Some(failover_race_delay),
                             ..Default::default()
                         },
                         providers,
@@ -1277,6 +1302,35 @@ impl OutboundManager {
                     );
                 }
             }
+
+            let Some(route_race_name) = outbound_group.route_race() else {
+                continue;
+            };
+            let name = outbound_group.name();
+            let primary = handlers.get(name).cloned().ok_or_else(|| {
+                Error::InvalidConfig(format!(
+                    "proxy group `{name}` was not loaded before route-race"
+                ))
+            })?;
+            let route_race = handlers.get(route_race_name).cloned().ok_or_else(|| {
+                Error::InvalidConfig(format!(
+                    "route-race `{route_race_name}` for proxy group `{name}` was not loaded"
+                ))
+            })?;
+            if route_race.support_dialer().is_some() {
+                return Err(Error::InvalidConfig(format!(
+                    "route-race `{route_race_name}` for proxy group `{name}` must not use dialer-proxy"
+                )));
+            }
+            handlers.insert(
+                name.to_owned(),
+                Arc::new(route_race::Handler::new(
+                    primary,
+                    route_race,
+                    route_race_delay,
+                    failover_race_delay,
+                )),
+            );
         }
 
         Ok(())

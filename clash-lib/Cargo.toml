@@ -123,6 +123,7 @@ ipnet = "2"
 regex = "1"
 byteorder = "1"
 lru_time_cache = "0.11"
+moka = { version = "0.12", features = ["future"] }
 uuid = { version = "1", features = ["v4", "v5", "fast-rng", "macro-diagnostics", "serde"] }
 network-interface = { version = "2" }
 base64 = "0.22"
@@ -273,7 +274,6 @@ tracing-test = "0.2"
 http-body-util = "0.1"
 reqwest = { version = "0.13", features = ["socks"] }
 sysinfo = { version = "0.39", features = ["network"]}
-moka = { version = "0.12", features = ["future"] }
 tuic-server = { tag = "v1.8.5", git = "https://github.com/Itsusinn/tuic.git" }
 
 [build-dependencies]

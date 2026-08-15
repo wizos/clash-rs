@@ -49,9 +49,15 @@ impl NetworkLinkState {
 }
 
 static NETWORK_LINK_STATE: AtomicU8 = AtomicU8::new(NetworkLinkState::Unknown as u8);
+static NETWORK_LINK_GENERATION: AtomicUsize = AtomicUsize::new(0);
 
 pub fn set_network_link_state(state: NetworkLinkState) {
     NETWORK_LINK_STATE.store(state as u8, Ordering::Release);
+    NETWORK_LINK_GENERATION.fetch_add(1, Ordering::AcqRel);
+}
+
+pub fn network_link_generation() -> usize {
+    NETWORK_LINK_GENERATION.load(Ordering::Acquire)
 }
 
 pub fn network_link_state() -> NetworkLinkState {

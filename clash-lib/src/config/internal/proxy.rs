@@ -1080,6 +1080,12 @@ pub enum OutboundGroupProtocol {
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct OutboundGroupSelection {
+    /// Optional static outbound that races the group for TCP connections.
+    #[serde(rename = "route-race")]
+    pub route_race: Option<String>,
+    /// Enables a two-path race inside url-test and fallback groups.
+    #[serde(rename = "failover-race", default)]
+    pub failover_race: bool,
     #[serde(rename = "include-all", default)]
     pub include_all: bool,
     #[serde(rename = "include-all-proxies", default)]
@@ -1096,6 +1102,8 @@ pub struct OutboundGroupSelection {
 impl Default for OutboundGroupSelection {
     fn default() -> Self {
         Self {
+            route_race: None,
+            failover_race: false,
             include_all: false,
             include_all_proxies: false,
             include_all_providers: false,
@@ -1209,6 +1217,15 @@ impl OutboundGroupProtocol {
             OutboundGroupProtocol::Smart(g) => &g.selection,
             OutboundGroupProtocol::Select(g) => &g.selection,
         }
+    }
+
+    pub fn route_race(&self) -> Option<&str> {
+        self.selection().route_race.as_deref()
+    }
+
+    pub fn failover_race(&self) -> bool {
+        matches!(self, Self::UrlTest(_) | Self::Fallback(_))
+            && self.selection().failover_race
     }
 
     pub fn expand_include_all(
@@ -2082,6 +2099,28 @@ mod proxy_group_defaults_tests {
             };
             assert_eq!(url, DEFAULT_LATENCY_TEST_URL);
             assert_eq!(interval, 0);
+        }
+    }
+
+    #[test]
+    fn parses_racing_options() {
+        let group: OutboundGroupProtocol = serde_yaml::from_str(
+            "type: url-test\nname: test\nproxies: [DIRECT]\nroute-race: DIRECT\nfailover-race: true\n",
+        )
+        .unwrap();
+
+        assert_eq!(group.route_race(), Some("DIRECT"));
+        assert!(group.failover_race());
+
+        for group_type in ["select", "load-balance", "smart", "relay"] {
+            let yaml = format!(
+                "type: {group_type}\nname: ignored\nproxies: [DIRECT]\nfailover-race: true\n"
+            );
+            let group: OutboundGroupProtocol = serde_yaml::from_str(&yaml).unwrap();
+            assert!(
+                !group.failover_race(),
+                "{group_type} must ignore failover-race"
+            );
         }
     }
 }

@@ -25,17 +25,30 @@ pub struct UserTraffic {
     pub download: u64,
 }
 
+#[derive(Default, Debug)]
+struct ProxyChainState {
+    names: Vec<String>,
+    race_type: String,
+}
+
 #[derive(Default, Clone, Debug)]
-pub struct ProxyChain(Arc<RwLock<Vec<String>>>);
+pub struct ProxyChain(Arc<RwLock<ProxyChainState>>);
 
 impl ProxyChain {
     pub async fn push(&self, s: String) {
-        let mut chain = self.0.write().await;
-        chain.push(s);
+        self.0.write().await.names.push(s);
     }
 
     pub async fn snapshot(&self) -> Vec<String> {
-        self.0.read().await.clone()
+        self.0.read().await.names.clone()
+    }
+
+    pub async fn set_race_type(&self, race_type: &str) {
+        self.0.write().await.race_type = race_type.to_owned();
+    }
+
+    pub async fn race_type(&self) -> String {
+        self.0.read().await.race_type.clone()
     }
 }
 
@@ -57,6 +70,8 @@ pub struct TrackerInfo {
     pub rule: String,
     #[serde(rename = "rulePayload")]
     pub rule_payload: String,
+    #[serde(rename = "raceType", skip_serializing_if = "String::is_empty")]
+    pub race_type: String,
 
     #[serde(skip)]
     pub proxy_chain_holder: ProxyChain,
@@ -462,6 +477,7 @@ impl Manager {
             proxy_chain: tracker.proxy_chain_holder.snapshot().await,
             rule: tracker.rule.clone(),
             rule_payload: tracker.rule_payload.clone(),
+            race_type: tracker.proxy_chain_holder.race_type().await,
             session: tracker.session_holder.as_map(),
             ..Default::default()
         }

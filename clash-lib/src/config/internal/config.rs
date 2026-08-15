@@ -10,7 +10,10 @@ use crate::{
     common::auth,
     config::{
         def::{self, LogLevel, RunMode},
-        internal::{proxy::OutboundProxy, rule::RuleType},
+        internal::{
+            proxy::{OutboundProxy, PROXY_COMPATIBLE, PROXY_REJECT},
+            rule::RuleType,
+        },
     },
 };
 use anyhow::anyhow;
@@ -106,6 +109,32 @@ impl Config {
                             group.name()
                         )));
                     }
+                }
+            }
+
+            if let Some(route_race) = group.route_race() {
+                if route_race.is_empty() {
+                    return Err(Error::InvalidConfig(format!(
+                        "route-race for proxy group `{}` cannot be empty",
+                        group.name()
+                    )));
+                }
+                let valid = self.proxies.get(route_race).is_some_and(|proxy| {
+                    matches!(
+                        proxy,
+                        OutboundProxy::ProxyServer(protocol)
+                            if !matches!(
+                                protocol,
+                                super::proxy::OutboundProxyProtocol::Reject(_)
+                                    | super::proxy::OutboundProxyProtocol::Dns(_)
+                            )
+                    )
+                });
+                if matches!(route_race, PROXY_COMPATIBLE | PROXY_REJECT) || !valid {
+                    return Err(Error::InvalidConfig(format!(
+                        "route-race `{route_race}` for proxy group `{}` must be a static outbound",
+                        group.name()
+                    )));
                 }
             }
         }
@@ -329,6 +358,8 @@ pub struct General {
 
     pub unified_delay: bool,
     pub tcp_concurrent: bool,
+    pub failover_race_delay: u32,
+    pub route_race_delay: u32,
     pub find_process_mode: crate::config::def::FindProcessMode,
     pub sniffer: Option<crate::config::def::SnifferConfig>,
 }
@@ -551,6 +582,44 @@ rules:
             error.contains("circular reference"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn validates_racing_options() {
+        let config = SourceConfig::Str(
+            r#"
+failover-race-delay: 250
+route-race-delay: 300
+proxy-groups:
+  - name: racing
+    type: url-test
+    proxies: [DIRECT]
+    route-race: DIRECT
+    failover-race: true
+rules:
+  - MATCH,racing
+"#
+            .to_owned(),
+        )
+        .try_parse()
+        .expect("supported racing options should validate");
+        assert_eq!(config.general.failover_race_delay, 250);
+        assert_eq!(config.general.route_race_delay, 300);
+
+        SourceConfig::Str(
+            r#"
+proxy-groups:
+  - name: balance
+    type: load-balance
+    proxies: [DIRECT]
+    failover-race: true
+rules:
+  - MATCH,balance
+"#
+            .to_owned(),
+        )
+        .try_parse()
+        .expect("unsupported failover-race fields should be ignored");
     }
 
     #[test]

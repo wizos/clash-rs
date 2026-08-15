@@ -616,6 +616,14 @@ pub struct Config {
     #[serde(default)]
     pub tcp_concurrent: bool,
 
+    /// Delay in milliseconds before starting an in-group failover challenger.
+    #[educe(Default = 100)]
+    pub failover_race_delay: u32,
+
+    /// Delay in milliseconds before starting a route-race challenger.
+    #[educe(Default = 100)]
+    pub route_race_delay: u32,
+
     /// Process name lookup mode (mihomo compatible)
     /// - "strict" (default): only find process name when a process-type rule
     ///   exists

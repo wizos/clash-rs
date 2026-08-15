@@ -9,6 +9,7 @@ use std::{
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     str::FromStr,
+    sync::Arc,
 };
 use tokio::io::{AsyncRead, AsyncReadExt};
 
@@ -441,6 +442,10 @@ pub struct Session {
     /// Domain obtained from TLS/HTTP/QUIC protocol sniffing. Domain rules use
     /// this in preference to the transport destination, matching Mihomo.
     pub sniff_host: String,
+    /// Shared coordination state for nested outbound racing on this connection.
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub race_context: Arc<crate::proxy::group::race::RaceContext>,
 }
 
 impl Session {
@@ -548,6 +553,7 @@ impl Default for Session {
             process: String::new(),
             process_path: String::new(),
             sniff_host: String::new(),
+            race_context: Arc::default(),
         }
     }
 }
@@ -622,6 +628,7 @@ impl Clone for Session {
             process: self.process.clone(),
             process_path: self.process_path.clone(),
             sniff_host: self.sniff_host.clone(),
+            race_context: self.race_context.clone(),
         }
     }
 }

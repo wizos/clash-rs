@@ -642,6 +642,7 @@ mod event_tests {
         let mut events = crate::app::events::subscribe();
         let (stream, _peer) = tokio::io::duplex(64);
         let stream: BoxedChainedStream = Box::new(ChainedStreamWrapper::new(stream));
+        stream.chain().set_race_type("group").await;
         let tracked = TrackedStream::new(
             stream,
             Manager::new(),
@@ -693,6 +694,7 @@ mod event_tests {
             .await
             .expect("connected activity was not emitted");
         assert_eq!(connected["data"]["revision"], 2);
+        assert_eq!(connected["data"]["raceType"], "group");
 
         drop(tracked);
         let closed =

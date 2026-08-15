@@ -1197,6 +1197,10 @@ async fn create_components(
             cache_store.clone(),
             cwd.to_string_lossy().to_string(),
             config.general.routing_mask,
+            std::time::Duration::from_millis(
+                config.general.failover_race_delay.into(),
+            ),
+            std::time::Duration::from_millis(config.general.route_race_delay.into()),
             outbound_registry.clone(),
             rule_dispatch.clone(),
         )

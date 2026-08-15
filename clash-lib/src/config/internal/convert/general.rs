@@ -125,6 +125,8 @@ pub(super) fn convert(c: &def::Config) -> Result<General, crate::Error> {
         bind_address,
         unified_delay: c.unified_delay,
         tcp_concurrent: c.tcp_concurrent,
+        failover_race_delay: c.failover_race_delay,
+        route_race_delay: c.route_race_delay,
         find_process_mode: c.find_process_mode,
         sniffer: c.sniffer.clone(),
     })

@@ -292,6 +292,8 @@ pub trait OutboundHandler: Sync + Send + Unpin + DialWithConnector + Debug {
     fn try_as_plain_handler(&self) -> Option<&dyn PlainProxyAPIResponse> {
         None
     }
+
+    fn clear_route_cache(&self) {}
 }
 pub type AnyOutboundHandler = Arc<dyn OutboundHandler>;
 
