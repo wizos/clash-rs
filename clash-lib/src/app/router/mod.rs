@@ -433,23 +433,25 @@ pub fn map_rule_type(
             country_code,
             no_resolve,
             is_src,
-        } => Box::new(rules::geoip::GeoIP {
+        } => Box::new(rules::geoip::GeoIP::new(
             target,
             country_code,
             no_resolve,
             is_src,
-            mmdb: mmdb.clone(),
-        }),
+            mmdb.clone(),
+            geodata.as_ref(),
+        )),
         RuleType::SrcGeoIP {
             target,
             country_code,
-        } => Box::new(rules::geoip::GeoIP {
+        } => Box::new(rules::geoip::GeoIP::new(
             target,
             country_code,
-            no_resolve: true,
-            is_src: true,
-            mmdb: mmdb.clone(),
-        }),
+            true,
+            true,
+            mmdb.clone(),
+            geodata.as_ref(),
+        )),
         RuleType::IpAsn {
             target,
             asn,
@@ -734,8 +736,11 @@ mod tests {
         let client = new_http_client(real_resolver.clone(), None).unwrap();
 
         let geodata = GeoData::new(
-            temp_dir.path().join("geodata.geodata"),
-            DEFAULT_GEOSITE_DOWNLOAD_URL.to_string(),
+            Some((
+                temp_dir.path().join("geodata.geodata"),
+                DEFAULT_GEOSITE_DOWNLOAD_URL.to_string(),
+            )),
+            None,
             client,
         )
         .await

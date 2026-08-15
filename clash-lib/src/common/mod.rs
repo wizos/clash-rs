@@ -1,4 +1,5 @@
 pub mod auth;
+pub(crate) mod cidr_trie;
 pub mod crypto;
 pub mod dashboard;
 pub mod defer;

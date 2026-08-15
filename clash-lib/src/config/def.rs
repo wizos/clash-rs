@@ -529,6 +529,12 @@ pub struct Config {
     pub mmdb: Option<String>,
     /// Country database download url
     pub mmdb_download_url: Option<String>,
+    /// Use protobuf GeoIP.dat for GEOIP rules instead of MMDB.
+    pub geodata_mode: bool,
+    /// GeoIP.dat path relative to the $CWD
+    pub geoip: Option<String>,
+    /// GeoIP.dat download url
+    pub geoip_download_url: Option<String>,
     /// Optional ASN database path relative to the working dir
     pub asn_mmdb: Option<String>,
     /// Optional ASN database download url

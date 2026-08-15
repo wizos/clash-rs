@@ -321,6 +321,7 @@ impl EnhancedResolver {
                 filters.push(Box::new(GeoIPFilter::new(
                     &cfg.fallback_filter.geo_ip_code,
                     mmdb,
+                    geodata.clone(),
                 )) as Box<dyn FallbackIPFilter>);
 
                 if let Some(ipcidr) = &cfg.fallback_filter.ip_cidr {

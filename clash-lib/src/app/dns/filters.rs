@@ -3,7 +3,10 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use crate::common::{mmdb::MmdbLookup, trie};
+use crate::{
+    app::dns::PendingGeoData,
+    common::{mmdb::MmdbLookup, trie},
+};
 
 pub trait FallbackIPFilter: Sync + Send {
     fn apply(&self, ip: &net::IpAddr) -> bool;
@@ -14,16 +17,27 @@ pub trait FallbackIPFilter: Sync + Send {
 /// ready, so that any MMDB download can use proxy groups if needed.
 pub type PendingMmdb = Arc<OnceLock<MmdbLookup>>;
 
-pub struct GeoIPFilter(String, Option<PendingMmdb>);
+pub struct GeoIPFilter(String, Option<PendingMmdb>, Option<PendingGeoData>);
 
 impl GeoIPFilter {
-    pub fn new(code: &str, mmdb: Option<PendingMmdb>) -> Self {
-        Self(code.to_owned(), mmdb)
+    pub fn new(
+        code: &str,
+        mmdb: Option<PendingMmdb>,
+        geodata: Option<PendingGeoData>,
+    ) -> Self {
+        Self(code.to_owned(), mmdb, geodata)
     }
 }
 
 impl FallbackIPFilter for GeoIPFilter {
     fn apply(&self, ip: &net::IpAddr) -> bool {
+        if let Some(geodata) = self.2.as_ref().and_then(|pending| pending.get())
+            && geodata.has_geoip()
+        {
+            return !geodata
+                .get_ip(&self.0)
+                .is_some_and(|matcher| matcher.contains(*ip));
+        }
         // When the OnceLock is not yet populated (e.g. during startup before the
         // MMDB is loaded) `lock.get()` returns `None`, making this return `true`
         // — the permissive default that lets all IPs through to the fallback
@@ -73,5 +87,40 @@ impl DomainFilter {
 impl FallbackDomainFilter for DomainFilter {
     fn apply(&self, domain: &str) -> bool {
         self.0.search(domain).is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use prost::Message;
+
+    use super::*;
+    use crate::common::geodata::{GeoData, GeoDataLookup, geodata_proto};
+
+    #[tokio::test]
+    async fn geoip_dat_drives_fallback_filter_after_loader_is_ready() {
+        let bytes = geodata_proto::GeoIpList {
+            entry: vec![geodata_proto::GeoIp {
+                country_code: "CN".to_owned(),
+                cidr: vec![geodata_proto::Cidr {
+                    ip: vec![1, 2, 3, 0],
+                    prefix: 24,
+                }],
+                reverse_match: false,
+            }],
+        }
+        .encode_to_vec();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("geoip.dat");
+        std::fs::write(&path, bytes).unwrap();
+        let pending: PendingGeoData = Arc::new(OnceLock::new());
+        let filter = GeoIPFilter::new("CN", None, Some(pending.clone()));
+
+        assert!(filter.apply(&"1.2.3.4".parse().unwrap()));
+        let geodata = Arc::new(GeoData::from_files(None, Some(path)).await.unwrap())
+            as GeoDataLookup;
+        assert!(pending.set(geodata).is_ok());
+        assert!(!filter.apply(&"1.2.3.4".parse().unwrap()));
+        assert!(filter.apply(&"8.8.8.8".parse().unwrap()));
     }
 }

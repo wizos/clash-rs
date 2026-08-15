@@ -17,29 +17,38 @@ pub(super) fn convert(c: &def::Config) -> Result<General, crate::Error> {
     };
 
     // Merge geox-url nested values with flat fields (nested takes precedence)
-    let (mmdb_download_url, asn_mmdb_download_url, geosite_download_url) =
-        if let Some(ref geox) = c.geox_url {
-            (
-                geox.mmdb
-                    .as_deref()
-                    .or(c.mmdb_download_url.as_deref())
-                    .map(String::from),
-                geox.asn
-                    .as_deref()
-                    .or(c.asn_mmdb_download_url.as_deref())
-                    .map(String::from),
-                geox.geosite
-                    .as_deref()
-                    .or(c.geosite_download_url.as_deref())
-                    .map(String::from),
-            )
-        } else {
-            (
-                c.mmdb_download_url.clone(),
-                c.asn_mmdb_download_url.clone(),
-                c.geosite_download_url.clone(),
-            )
-        };
+    let (
+        mmdb_download_url,
+        geoip_download_url,
+        asn_mmdb_download_url,
+        geosite_download_url,
+    ) = if let Some(ref geox) = c.geox_url {
+        (
+            geox.mmdb
+                .as_deref()
+                .or(c.mmdb_download_url.as_deref())
+                .map(String::from),
+            geox.geoip
+                .as_deref()
+                .or(c.geoip_download_url.as_deref())
+                .map(String::from),
+            geox.asn
+                .as_deref()
+                .or(c.asn_mmdb_download_url.as_deref())
+                .map(String::from),
+            geox.geosite
+                .as_deref()
+                .or(c.geosite_download_url.as_deref())
+                .map(String::from),
+        )
+    } else {
+        (
+            c.mmdb_download_url.clone(),
+            c.geoip_download_url.clone(),
+            c.asn_mmdb_download_url.clone(),
+            c.geosite_download_url.clone(),
+        )
+    };
 
     // Merge external-controller-cors nested values with flat cors-allow-origins
     let cors_allow_origins = c
@@ -52,6 +61,14 @@ pub(super) fn convert(c: &def::Config) -> Result<General, crate::Error> {
             .as_ref()
             .map(|_| "Country.mmdb".to_owned())
     });
+    let geoip = c
+        .geodata_mode
+        .then(|| {
+            c.geoip.clone().or_else(|| {
+                geoip_download_url.as_ref().map(|_| "GeoIP.dat".to_owned())
+            })
+        })
+        .flatten();
     let asn_mmdb = c.asn_mmdb.clone().or_else(|| {
         asn_mmdb_download_url
             .as_ref()
@@ -99,6 +116,8 @@ pub(super) fn convert(c: &def::Config) -> Result<General, crate::Error> {
         routing_mask: c.routing_mark,
         mmdb,
         mmdb_download_url,
+        geoip,
+        geoip_download_url,
         asn_mmdb,
         asn_mmdb_download_url,
         geosite,

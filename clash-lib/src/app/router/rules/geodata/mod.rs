@@ -152,7 +152,7 @@ mod tests {
         let out_path = dir.path().join("geosite.dat");
         download(DEFAULT_GEOSITE_DOWNLOAD_URL, &out_path, &client).await?;
 
-        let loader = GeoData::from_file(&out_path).await?;
+        let loader = GeoData::from_files(Some(out_path), None).await?;
 
         let suites = [
             TestSuite {

@@ -319,6 +319,8 @@ pub struct General {
     pub routing_mask: Option<u32>,
     pub mmdb: Option<String>,
     pub mmdb_download_url: Option<String>,
+    pub geoip: Option<String>,
+    pub geoip_download_url: Option<String>,
     pub asn_mmdb: Option<String>,
     pub asn_mmdb_download_url: Option<String>,
 
@@ -806,8 +808,10 @@ rules:
             r#"
 geox-url:
   mmdb: https://example.com/Country.mmdb
+  geoip: https://example.com/GeoIP.dat
   asn: https://example.com/ASN.mmdb
   geosite: https://example.com/GEOSITE.dat
+geodata-mode: true
 rules:
   - MATCH,DIRECT
 "#
@@ -817,6 +821,7 @@ rules:
         .unwrap();
 
         assert_eq!(config.general.mmdb.as_deref(), Some("Country.mmdb"));
+        assert_eq!(config.general.geoip.as_deref(), Some("GeoIP.dat"));
         assert_eq!(config.general.asn_mmdb.as_deref(), Some("ASN.mmdb"));
         assert_eq!(config.general.geosite.as_deref(), Some("GEOSITE.dat"));
     }

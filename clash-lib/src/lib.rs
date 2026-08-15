@@ -17,7 +17,9 @@ use crate::{
     },
     common::{
         auth, dashboard,
-        geodata::{DEFAULT_GEOSITE_DOWNLOAD_URL, GeoDataLookup},
+        geodata::{
+            DEFAULT_GEOIP_DOWNLOAD_URL, DEFAULT_GEOSITE_DOWNLOAD_URL, GeoDataLookup,
+        },
         http::new_http_client,
         mmdb::{
             self, DEFAULT_ASN_MMDB_DOWNLOAD_URL, DEFAULT_COUNTRY_MMDB_DOWNLOAD_URL,
@@ -1144,6 +1146,8 @@ async fn create_components(
     // registry when downloading the file.
     let country_mmdb_file = config.general.mmdb;
     let country_mmdb_download_url = config.general.mmdb_download_url;
+    let geoip_file = config.general.geoip;
+    let geoip_download_url = config.general.geoip_download_url;
     let geosite_file = config.general.geosite;
     let geosite_download_url = config.general.geosite_download_url;
 
@@ -1151,9 +1155,11 @@ async fn create_components(
     // It starts empty and is populated once the MMDB is loaded below.
     let pending_country_mmdb: Option<dns::PendingMmdb> = country_mmdb_file
         .as_ref()
+        .filter(|_| geoip_file.is_none())
         .map(|_| Arc::new(OnceLock::new()));
-    let pending_geodata: Option<dns::PendingGeoData> =
-        geosite_file.as_ref().map(|_| Arc::new(OnceLock::new()));
+    let pending_geodata: Option<dns::PendingGeoData> = (geosite_file.is_some()
+        || geoip_file.is_some())
+    .then(|| Arc::new(OnceLock::new()));
 
     // When `dns.respect-rules` is true, share a `RuleDispatch` between the
     // resolver and the (later-built) router + outbound manager. The DNS
@@ -1238,17 +1244,23 @@ async fn create_components(
         None
     };
 
-    debug!("initializing geosite");
-    let geodata = if let Some(geosite_file) = geosite_file {
-        let geodata = Arc::new(
-            geodata::GeoData::new(
-                cwd.join(&geosite_file),
-                geosite_download_url
-                    .unwrap_or(DEFAULT_GEOSITE_DOWNLOAD_URL.to_string()),
-                client.clone(),
-            )
-            .await?,
-        ) as GeoDataLookup;
+    debug!("initializing geodata");
+    let geosite = geosite_file.map(|file| {
+        (
+            cwd.join(file),
+            geosite_download_url.unwrap_or(DEFAULT_GEOSITE_DOWNLOAD_URL.to_string()),
+        )
+    });
+    let geoip = geoip_file.map(|file| {
+        (
+            cwd.join(file),
+            geoip_download_url.unwrap_or(DEFAULT_GEOIP_DOWNLOAD_URL.to_string()),
+        )
+    });
+    let geodata = if geosite.is_some() || geoip.is_some() {
+        let geodata =
+            Arc::new(geodata::GeoData::new(geosite, geoip, client.clone()).await?)
+                as GeoDataLookup;
         if let Some(pending) = &pending_geodata {
             if pending.set(geodata.clone()).is_err() {
                 warn!(
