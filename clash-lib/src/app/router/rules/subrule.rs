@@ -3,7 +3,10 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use crate::{app::router::rules::RuleMatcher, session::Session};
+use crate::{
+    app::router::rules::{RuleDependencies, RuleMatcher},
+    session::Session,
+};
 
 pub type SubRuleRegistry = Arc<OnceLock<HashMap<String, Vec<Box<dyn RuleMatcher>>>>>;
 
@@ -79,5 +82,21 @@ impl RuleMatcher for SubRule {
             .is_some_and(|rules| {
                 rules.iter().any(|rule| rule.should_resolve_process())
             })
+    }
+
+    fn collect_dependencies(&self, dependencies: &mut RuleDependencies) {
+        self.condition.collect_dependencies(dependencies);
+        if !dependencies.visited_sub_rules.insert(self.name.clone()) {
+            return;
+        }
+        if let Some(rules) = self
+            .registry
+            .get()
+            .and_then(|registry| registry.get(&self.name))
+        {
+            for rule in rules {
+                rule.collect_dependencies(dependencies);
+            }
+        }
     }
 }

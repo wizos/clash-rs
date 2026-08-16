@@ -17,7 +17,7 @@ use crate::{
 };
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{
         Arc,
@@ -46,7 +46,14 @@ pub struct Router {
     country_mmdb: Option<MmdbLookup>,
     asn_mmdb: Option<MmdbLookup>,
     rule_providers: HashMap<String, ThreadSafeRuleProvider>,
+    rule_data_plan: RuleDataPlan,
     rule_providers_started: AtomicBool,
+}
+
+#[derive(Default)]
+struct RuleDataPlan {
+    reachable_sub_rules: HashSet<String>,
+    required_rule_providers: HashSet<String>,
 }
 
 pub type ArcRouter = Arc<Router>;
@@ -70,6 +77,10 @@ impl Router {
         cwd: String,
         rule_dispatch: Arc<RuleDispatch>,
     ) -> Self {
+        let mut rule_data_plan = RuleDataPlan {
+            reachable_sub_rules: reachable_sub_rules(&rules, &sub_rules),
+            ..Default::default()
+        };
         let mut rule_provider_registry = HashMap::new();
 
         Self::load_rule_providers(
@@ -86,7 +97,7 @@ impl Router {
         .ok();
 
         let sub_rule_registry = rules::subrule::SubRuleRegistry::default();
-        let rules = rules
+        let rules: Vec<Box<dyn RuleMatcher>> = rules
             .into_iter()
             .map(|r| {
                 map_rule_type(
@@ -101,6 +112,7 @@ impl Router {
             .collect();
         let converted_sub_rules = sub_rules
             .into_iter()
+            .filter(|(name, _)| rule_data_plan.reachable_sub_rules.contains(name))
             .map(|(name, rules)| {
                 let rules = rules
                     .into_iter()
@@ -124,6 +136,18 @@ impl Router {
                 unreachable!("new sub-rule registry was already set")
             });
 
+        let mut dependencies = rules::RuleDependencies::default();
+        for rule in &rules {
+            rule.collect_dependencies(&mut dependencies);
+        }
+        rule_data_plan.required_rule_providers = dependencies.rule_providers;
+        info!(
+            reachable_sub_rules = rule_data_plan.reachable_sub_rules.len(),
+            required_rule_providers = rule_data_plan.required_rule_providers.len(),
+            defined_rule_providers = rule_provider_registry.len(),
+            "built rule data plan"
+        );
+
         Self {
             rules,
             dns_resolver,
@@ -131,6 +155,7 @@ impl Router {
             country_mmdb,
             asn_mmdb,
             rule_providers: rule_provider_registry,
+            rule_data_plan,
             rule_providers_started: AtomicBool::new(false),
         }
     }
@@ -139,7 +164,12 @@ impl Router {
         &self.rule_providers
     }
 
-    /// this mutates the session, attaching resolved IP and ASN
+    #[cfg(test)]
+    fn required_rule_provider_names(&self) -> &HashSet<String> {
+        &self.rule_data_plan.required_rule_providers
+    }
+
+    /// this mutates the session, attaching resolved IP and display geo metadata
     pub async fn match_route(
         &self,
         sess: &mut Session,
@@ -165,23 +195,21 @@ impl Router {
                 sess_resolved = true;
             }
 
-            // Lookup geo information with guard clause
-            if let Some(ip) = sess.resolved_ip.or(sess.destination.ip()) {
-                Self::populate_geo_for_ip(
-                    ip,
-                    &self.country_mmdb,
-                    &self.asn_mmdb,
-                    sess,
-                );
-            }
-
             if let Some(target) = r.route_target(sess) {
                 info!("matched {} to target {}[{}]", &sess, target, r.type_name());
+                self.populate_display_geo(sess);
                 return (target, Some(r));
             }
         }
 
+        self.populate_display_geo(sess);
         (MATCH, None)
+    }
+
+    fn populate_display_geo(&self, sess: &mut Session) {
+        if let Some(ip) = sess.resolved_ip.or(sess.destination.ip()) {
+            Self::populate_geo_for_ip(ip, &self.country_mmdb, &self.asn_mmdb, sess);
+        }
     }
 
     /// Look up country code and ASN for an IP address.
@@ -337,7 +365,10 @@ impl Router {
         if self.rule_providers_started.swap(true, Ordering::AcqRel) {
             return;
         }
-        for p in self.rule_providers.values() {
+        for name in &self.rule_data_plan.required_rule_providers {
+            let Some(p) = self.rule_providers.get(name) else {
+                continue;
+            };
             let p = p.clone();
             tokio::spawn(async move {
                 info!("initializing rule provider {}", p.name());
@@ -361,6 +392,39 @@ impl Router {
     pub fn get_all_rules(&self) -> &Vec<Box<dyn RuleMatcher>> {
         &self.rules
     }
+}
+
+fn reachable_sub_rules(
+    rules: &[RuleType],
+    sub_rules: &HashMap<String, Vec<RuleType>>,
+) -> HashSet<String> {
+    fn visit_rule(
+        rule: &RuleType,
+        sub_rules: &HashMap<String, Vec<RuleType>>,
+        reachable: &mut HashSet<String>,
+    ) {
+        if let RuleType::SubRule {
+            condition,
+            sub_rule,
+            ..
+        } = rule
+        {
+            visit_rule(condition, sub_rules, reachable);
+            if reachable.insert(sub_rule.clone())
+                && let Some(rules) = sub_rules.get(sub_rule)
+            {
+                for rule in rules {
+                    visit_rule(rule, sub_rules, reachable);
+                }
+            }
+        }
+    }
+
+    let mut reachable = HashSet::new();
+    for rule in rules {
+        visit_rule(rule, sub_rules, &mut reachable);
+    }
+    reachable
 }
 
 pub fn map_rule_type(
@@ -685,18 +749,28 @@ pub fn map_rule_type(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use anyhow::Ok;
+    use std::{
+        collections::{HashMap, HashSet},
+        sync::Arc,
+    };
 
     use crate::{
-        app::dns::{MockClashResolver, RuleDispatch, SystemResolver},
+        app::{
+            dns::{MockClashResolver, RuleDispatch, SystemResolver},
+            remote_content_manager::providers::rule_provider::RuleSetBehavior,
+        },
         common::{
             geodata::{DEFAULT_GEOSITE_DOWNLOAD_URL, GeoData},
             http::new_http_client,
-            mmdb::{DEFAULT_COUNTRY_MMDB_DOWNLOAD_URL, Mmdb},
+            mmdb::{
+                DEFAULT_COUNTRY_MMDB_DOWNLOAD_URL, Mmdb, MmdbLookupCountry,
+                MockMmdbLookupTrait,
+            },
         },
-        config::internal::rule::RuleType,
+        config::internal::{
+            config::{InlineRuleProvider, RuleProviderDef},
+            rule::RuleType,
+        },
         session::Session,
         tests::initialize,
     };
@@ -929,9 +1003,116 @@ mod tests {
             ),
             ..Default::default()
         };
-        assert_eq!(router.match_route(&mut session).await.0, "DIRECT");
+        let (target, matched_rule) = router.match_route(&mut session).await;
+        assert_eq!(target, "DIRECT");
+        assert_eq!(matched_rule.unwrap().payload(), "(NETWORK,TCP)");
 
         session.network = crate::session::Network::Udp;
         assert_eq!(router.match_route(&mut session).await.0, "MATCH");
+    }
+
+    #[tokio::test]
+    async fn only_reachable_sub_rules_and_rule_providers_enter_the_data_plan() {
+        let mut resolver = MockClashResolver::new();
+        resolver.expect_resolve().returning(|_, _| Ok(None));
+        let providers = ["main", "nested", "unused"]
+            .map(|name| {
+                (
+                    name.to_owned(),
+                    RuleProviderDef::Inline(InlineRuleProvider {
+                        path: String::new(),
+                        behavior: RuleSetBehavior::Domain,
+                        inline_rules: vec!["example.com".to_owned()],
+                    }),
+                )
+            })
+            .into_iter()
+            .collect();
+        let sub_rules = HashMap::from([
+            (
+                "reachable".to_owned(),
+                vec![RuleType::RuleSet {
+                    rule_set: "nested".to_owned(),
+                    target: "DIRECT".to_owned(),
+                }],
+            ),
+            (
+                "unreachable".to_owned(),
+                vec![RuleType::RuleSet {
+                    rule_set: "unused".to_owned(),
+                    target: "REJECT".to_owned(),
+                }],
+            ),
+        ]);
+        let router = super::Router::new(
+            vec![
+                RuleType::RuleSet {
+                    rule_set: "main".to_owned(),
+                    target: "DIRECT".to_owned(),
+                },
+                RuleType::SubRule {
+                    condition: Box::new(RuleType::Network {
+                        network: crate::session::Network::Tcp,
+                        target: String::new(),
+                    }),
+                    payload: "(NETWORK,TCP)".to_owned(),
+                    sub_rule: "reachable".to_owned(),
+                },
+            ],
+            sub_rules,
+            providers,
+            Arc::new(resolver),
+            None,
+            None,
+            None,
+            std::env::temp_dir().to_string_lossy().into_owned(),
+            RuleDispatch::new(),
+        )
+        .await;
+
+        assert_eq!(router.get_rule_providers().len(), 3);
+        assert_eq!(
+            router.required_rule_provider_names(),
+            &HashSet::from(["main".to_owned(), "nested".to_owned()]),
+        );
+    }
+
+    #[tokio::test]
+    async fn display_geo_lookup_runs_once_after_route_selection() {
+        let mut resolver = MockClashResolver::new();
+        resolver.expect_resolve().returning(|_, _| Ok(None));
+        let mut country = MockMmdbLookupTrait::new();
+        country.expect_lookup_country().times(1).returning(|_| {
+            Ok(MmdbLookupCountry {
+                country_code: "CN".to_owned(),
+            })
+        });
+        let router = super::Router::new(
+            vec![
+                RuleType::Domain {
+                    domain: "first.example".to_owned(),
+                    target: "REJECT".to_owned(),
+                },
+                RuleType::Match {
+                    target: "DIRECT".to_owned(),
+                },
+            ],
+            Default::default(),
+            Default::default(),
+            Arc::new(resolver),
+            Some(Arc::new(country)),
+            None,
+            None,
+            std::env::temp_dir().to_string_lossy().into_owned(),
+            RuleDispatch::new(),
+        )
+        .await;
+        let mut session = Session {
+            destination: "203.0.113.1:443".parse().unwrap(),
+            ..Default::default()
+        };
+
+        assert_eq!(router.match_route(&mut session).await.0, "DIRECT");
+        assert_eq!(session.country.as_deref(), Some("CN"));
     }
 }

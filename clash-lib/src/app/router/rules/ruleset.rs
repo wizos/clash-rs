@@ -1,7 +1,7 @@
 use crate::{
     app::{
         remote_content_manager::providers::rule_provider::ThreadSafeRuleProvider,
-        router::rules::RuleMatcher,
+        router::rules::{RuleDependencies, RuleMatcher},
     },
     session::Session,
 };
@@ -56,5 +56,9 @@ impl RuleMatcher for RuleSet {
 
     fn should_resolve_process(&self) -> bool {
         self.rule_provider.should_resolve_process()
+    }
+
+    fn collect_dependencies(&self, dependencies: &mut RuleDependencies) {
+        dependencies.rule_providers.insert(self.rule_set.clone());
     }
 }

@@ -48,6 +48,22 @@ impl RuleExpression {
             RuleExpression::Not(expression) => expression.should_resolve_process(),
         }
     }
+
+    fn collect_dependencies(&self, dependencies: &mut super::RuleDependencies) {
+        match self {
+            RuleExpression::Rule(matcher) => {
+                matcher.collect_dependencies(dependencies)
+            }
+            RuleExpression::And(expressions) | RuleExpression::Or(expressions) => {
+                for expression in expressions {
+                    expression.collect_dependencies(dependencies);
+                }
+            }
+            RuleExpression::Not(expression) => {
+                expression.collect_dependencies(dependencies)
+            }
+        }
+    }
 }
 
 pub struct CompositeRule {
@@ -323,6 +339,10 @@ impl RuleMatcher for CompositeRule {
 
     fn should_resolve_process(&self) -> bool {
         self.expression.should_resolve_process()
+    }
+
+    fn collect_dependencies(&self, dependencies: &mut super::RuleDependencies) {
+        self.expression.collect_dependencies(dependencies);
     }
 }
 

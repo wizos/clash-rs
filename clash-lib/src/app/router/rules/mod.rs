@@ -1,4 +1,7 @@
-use std::{collections::HashMap, fmt::Display};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::Display,
+};
 
 use erased_serde::Serialize;
 
@@ -56,6 +59,8 @@ pub trait RuleMatcher: Send + Sync + Unpin + Display {
         0
     }
 
+    fn collect_dependencies(&self, _dependencies: &mut RuleDependencies) {}
+
     fn as_map(&self) -> HashMap<String, Box<dyn Serialize + Send>> {
         let mut m: HashMap<String, Box<dyn Serialize + Send>> = HashMap::new();
         m.insert("type".to_string(), Box::new(self.type_name().to_owned()));
@@ -64,4 +69,11 @@ pub trait RuleMatcher: Send + Sync + Unpin + Display {
         m.insert("size".to_string(), Box::new(self.size()));
         m
     }
+}
+
+#[derive(Default)]
+#[doc(hidden)]
+pub struct RuleDependencies {
+    pub rule_providers: HashSet<String>,
+    pub visited_sub_rules: HashSet<String>,
 }
