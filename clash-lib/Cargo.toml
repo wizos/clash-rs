@@ -215,7 +215,7 @@ shadowsocks = { version = "1.24", optional = true, features = ["aead-cipher-2022
 mieru = { git = "https://github.com/zerodenet/zero.git", rev = "ac653ff95a62020b7814a8fca380a4bed937f5c0", features = ["crypto"], optional = true }
 zero-core = { git = "https://github.com/zerodenet/zero.git", rev = "ac653ff95a62020b7814a8fca380a4bed937f5c0", optional = true }
 zero-traits = { git = "https://github.com/zerodenet/zero.git", rev = "ac653ff95a62020b7814a8fca380a4bed937f5c0", optional = true }
-maxminddb = "0.29"
+maxminddb = { version = "0.29", features = ["mmap"] }
 public-suffix = "0.1"
 murmur3 = "0.5"
 

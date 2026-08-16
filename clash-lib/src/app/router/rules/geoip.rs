@@ -70,11 +70,7 @@ impl RuleMatcher for GeoIP {
                 GeoIpDatabase::Dat(Some(matcher)) => matcher.contains(ip),
                 GeoIpDatabase::Dat(None) => false,
                 GeoIpDatabase::Mmdb(Some(mmdb)) => {
-                    mmdb.lookup_country(ip).is_ok_and(|country| {
-                        country
-                            .country_code
-                            .eq_ignore_ascii_case(&self.country_code)
-                    })
+                    mmdb.matches_geoip(ip, &self.country_code).unwrap_or(false)
                 }
                 GeoIpDatabase::Mmdb(None) => false,
             }

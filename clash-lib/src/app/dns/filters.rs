@@ -46,11 +46,7 @@ impl FallbackIPFilter for GeoIPFilter {
             .1
             .as_ref()
             .and_then(|lock| lock.get())
-            .is_some_and(|mmdb| {
-                mmdb.lookup_country(*ip)
-                    .map(|x| x.country_code)
-                    .is_ok_and(|x| x == self.0)
-            })
+            .is_some_and(|mmdb| mmdb.matches_geoip(*ip, &self.0).unwrap_or(false))
     }
 }
 

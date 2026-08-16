@@ -572,6 +572,10 @@ pub fn setup_default_crypto_provider() {
     });
 }
 
+pub fn lookup_country_code(ip: std::net::IpAddr) -> Option<String> {
+    common::mmdb::active_country_code(ip)
+}
+
 pub async fn start(
     config: InternalConfig,
     cwd: String,
@@ -649,6 +653,7 @@ async fn start_runtime(
     }
 
     components.start_all(start_inbounds).await?;
+    common::mmdb::set_active_country_mmdb(components.country_mmdb.clone());
 
     let (runtime_controller_tx, mut runtime_controller_rx) =
         mpsc::unbounded_channel();
@@ -688,6 +693,7 @@ async fn start_runtime(
                 RuntimeEvent::Shutdown | RuntimeEvent::Reload(None) => {
                     api_listener.shutdown();
                     components.stop_all().await;
+                    common::mmdb::set_active_country_mmdb(None);
                     api_listener.join().await.ok();
                     break;
                 }
@@ -767,6 +773,9 @@ async fn start_runtime(
                 state.reload_phase = "failed".to_owned();
                 continue;
             }
+            common::mmdb::set_active_country_mmdb(
+                new_components.country_mmdb.clone(),
+            );
             if let Err(error) = app::logging::set_log_level(log_level) {
                 error!("failed to apply reloaded log level: {error}");
             }
@@ -863,6 +872,7 @@ struct RuntimeComponents {
     dns_resolver: ThreadSafeDNSResolver,
     outbound_manager: Arc<OutboundManager>,
     router: Arc<Router>,
+    country_mmdb: Option<MmdbLookup>,
     dispatcher: Arc<Dispatcher>,
     statistics_manager: Arc<StatisticsManager>,
 
@@ -1305,7 +1315,7 @@ async fn create_components(
             config.sub_rules,
             config.rule_providers,
             dns_resolver.clone(),
-            country_mmdb,
+            country_mmdb.clone(),
             asn_mmdb,
             geodata,
             cwd.to_string_lossy().to_string(),
@@ -1387,6 +1397,7 @@ async fn create_components(
         dns_resolver,
         outbound_manager,
         router,
+        country_mmdb,
         dispatcher,
         statistics_manager,
         inbound_manager,

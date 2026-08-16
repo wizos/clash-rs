@@ -4894,6 +4894,7 @@ dependencies = [
  "ipnetwork",
  "log",
  "memchr",
+ "memmap2",
  "serde",
  "thiserror 2.0.18",
 ]
