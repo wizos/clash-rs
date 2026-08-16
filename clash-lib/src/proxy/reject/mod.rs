@@ -12,7 +12,24 @@ use erased_serde::Serialize as ErasedSerialize;
 use serde::Serialize;
 use std::{collections::HashMap, io};
 
-use super::{ConnectorType, DialWithConnector, OutboundType, PlainProxyAPIResponse};
+use super::{
+    ConnectorType, DialWithConnector, OutboundType, PlainProxyAPIResponse,
+    utils::RemoteConnector,
+};
+
+#[derive(Debug, thiserror::Error)]
+#[error("REJECT")]
+struct RejectError;
+
+fn rejection<T>() -> io::Result<T> {
+    Err(io::Error::other(RejectError))
+}
+
+pub(crate) fn is_reject_error(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|source| source.downcast_ref::<RejectError>().is_some())
+}
 
 #[derive(Serialize)]
 pub struct Handler {
@@ -54,7 +71,7 @@ impl OutboundHandler for Handler {
         #[allow(unused_variables)] sess: &Session,
         #[allow(unused_variables)] _resolver: ThreadSafeDNSResolver,
     ) -> io::Result<BoxedChainedStream> {
-        Err(io::Error::other("REJECT"))
+        rejection()
     }
 
     async fn connect_datagram(
@@ -62,7 +79,25 @@ impl OutboundHandler for Handler {
         #[allow(unused_variables)] sess: &Session,
         #[allow(unused_variables)] _resolver: ThreadSafeDNSResolver,
     ) -> io::Result<BoxedChainedDatagram> {
-        Err(io::Error::other("REJECT"))
+        rejection()
+    }
+
+    async fn connect_stream_with_connector(
+        &self,
+        _sess: &Session,
+        _resolver: ThreadSafeDNSResolver,
+        _connector: &dyn RemoteConnector,
+    ) -> io::Result<BoxedChainedStream> {
+        rejection()
+    }
+
+    async fn connect_datagram_with_connector(
+        &self,
+        _sess: &Session,
+        _resolver: ThreadSafeDNSResolver,
+        _connector: &dyn RemoteConnector,
+    ) -> io::Result<BoxedChainedDatagram> {
+        rejection()
     }
 
     async fn support_connector(&self) -> ConnectorType {
@@ -78,5 +113,18 @@ impl OutboundHandler for Handler {
 impl PlainProxyAPIResponse for Handler {
     async fn as_map(&self) -> HashMap<String, Box<dyn ErasedSerialize + Send>> {
         HashMap::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identifies_structured_reject_errors() {
+        let error = rejection::<()>().unwrap_err();
+        assert!(is_reject_error(&error));
+        assert_eq!(error.to_string(), PROXY_REJECT);
+        assert!(!is_reject_error(&io::Error::other(PROXY_REJECT)));
     }
 }

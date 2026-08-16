@@ -9,10 +9,11 @@ use crate::{
     common::io::copy_bidirectional,
     config::{
         def::RunMode,
-        internal::proxy::{PROXY_DIRECT, PROXY_GLOBAL, PROXY_REJECT},
+        internal::proxy::{PROXY_DIRECT, PROXY_GLOBAL},
     },
     proxy::{
-        AnyInboundDatagram, ClientStream, datagram::UdpPacket, utils::ToCanonical,
+        AnyInboundDatagram, ClientStream, datagram::UdpPacket,
+        reject::is_reject_error, utils::ToCanonical,
     },
     session::{Session, SocksAddr},
 };
@@ -299,11 +300,9 @@ impl Dispatcher {
                 }
             }
             Err(err) => {
-                let status = if outbound_name == PROXY_REJECT {
-                    "rejected"
-                } else {
-                    "failed"
-                };
+                let rejected = is_reject_error(&err);
+                let status = if rejected { "rejected" } else { "failed" };
+                let error = err.to_string();
                 Manager::emit_activity_for_session(
                     activity_id,
                     activity_start,
@@ -315,12 +314,14 @@ impl Dispatcher {
                     2,
                     status,
                     "connect",
-                    &err.to_string(),
+                    &error,
                 );
-                warn!(
-                    "failed to establish remote connection {}, error: {}",
-                    sess, err
-                );
+                if !rejected {
+                    warn!(
+                        "failed to establish remote connection {}, error: {}",
+                        sess, err
+                    );
+                }
                 if let Err(e) = lhs.shutdown().await {
                     warn!("error closing local connection {}: {}", sess, e)
                 }
@@ -581,11 +582,10 @@ impl Dispatcher {
                         {
                             Ok(v) => v,
                             Err(err) => {
-                                let status = if outbound_name == PROXY_REJECT {
-                                    "rejected"
-                                } else {
-                                    "failed"
-                                };
+                                let rejected = is_reject_error(&err);
+                                let status =
+                                    if rejected { "rejected" } else { "failed" };
+                                let error = err.to_string();
                                 Manager::emit_activity_for_session(
                                     activity_id,
                                     activity_start,
@@ -597,9 +597,11 @@ impl Dispatcher {
                                     2,
                                     status,
                                     "connect",
-                                    &err.to_string(),
+                                    &error,
                                 );
-                                error!("failed to connect outbound: {}", err);
+                                if !rejected {
+                                    error!("failed to connect outbound: {}", err);
+                                }
                                 continue;
                             }
                         };
