@@ -23,8 +23,8 @@ use crate::{
         router::{RuleMatcher, map_rule_type},
     },
     common::{
-        errors::map_io_error, geodata::GeoDataLookup, mmdb::MmdbLookup,
-        succinct_set, trie,
+        errors::map_io_error, geodata::GeoDataLookup, ip_range_set::IpRangeSet,
+        mmdb::MmdbLookup, succinct_set, trie,
     },
     config::internal::rule::RuleType,
     session::Session,
@@ -78,8 +78,29 @@ impl Display for RuleSetBehavior {
 pub enum RuleContent {
     // the left will converted into a right
     Domain(succinct_set::DomainSet),
-    Ipcidr(Box<CidrTrie>),
+    Ipcidr(IpCidrContent),
     Classical(Vec<Box<dyn RuleMatcher>>),
+}
+
+pub enum IpCidrContent {
+    Trie(Box<CidrTrie>),
+    Ranges(IpRangeSet),
+}
+
+impl IpCidrContent {
+    fn len(&self) -> usize {
+        match self {
+            Self::Trie(trie) => trie.len(),
+            Self::Ranges(ranges) => ranges.len(),
+        }
+    }
+
+    fn contains(&self, ip: IpAddr) -> bool {
+        match self {
+            Self::Trie(trie) => trie.contains(ip),
+            Self::Ranges(ranges) => ranges.contains(ip),
+        }
+    }
 }
 
 impl RuleContent {
@@ -170,9 +191,9 @@ impl RuleProviderImpl {
                 RuleSetBehavior::Domain => {
                     RuleContent::Domain(succinct_set::DomainSet::default())
                 }
-                RuleSetBehavior::Ipcidr => {
-                    RuleContent::Ipcidr(Box::new(CidrTrie::new()))
-                }
+                RuleSetBehavior::Ipcidr => RuleContent::Ipcidr(IpCidrContent::Trie(
+                    Box::new(CidrTrie::new()),
+                )),
                 RuleSetBehavior::Classical => RuleContent::Classical(vec![]),
             },
         }));
@@ -313,7 +334,7 @@ impl RuleProvider for RuleProviderImpl {
                 RuleContent::Domain(set) => {
                     sess.rule_host().is_some_and(|host| set.has(host))
                 }
-                RuleContent::Ipcidr(trie) => trie.contains(
+                RuleContent::Ipcidr(matcher) => matcher.contains(
                     sess.destination
                         .ip()
                         .unwrap_or(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))),
@@ -505,9 +526,9 @@ fn make_rules(
             let s = make_domain_rules(rules)?;
             Ok(RuleContent::Domain(s.into()))
         }
-        RuleSetBehavior::Ipcidr => {
-            Ok(RuleContent::Ipcidr(Box::new(make_ip_cidr_rules(rules)?)))
-        }
+        RuleSetBehavior::Ipcidr => Ok(RuleContent::Ipcidr(IpCidrContent::Trie(
+            Box::new(make_ip_cidr_rules(rules)?),
+        ))),
         RuleSetBehavior::Classical => Ok(RuleContent::Classical(
             make_classical_rules(rules, country_mmdb, asn_mmdb, geodata)?,
         )),
