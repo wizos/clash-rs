@@ -35,6 +35,8 @@ use std::{
 use tokio::sync::RwLock;
 use tracing::{debug, error, instrument, trace, warn};
 
+const DNS_RESPONSE_CACHE_CAPACITY: u64 = 1024;
+
 type InflightDnsQuery = Arc<tokio::sync::OnceCell<Result<op::Message, String>>>;
 
 struct InflightDnsGuard<'a> {
@@ -336,7 +338,7 @@ impl EnhancedResolver {
                 None
             },
             lru_cache: Some(RwLock::new(hickory_resolver::ResponseCache::new(
-                1024,
+                DNS_RESPONSE_CACHE_CAPACITY,
                 hickory_resolver::TtlConfig::default(),
             ))),
             policy: has_domain_policy.then_some(domain_policy),
@@ -860,7 +862,7 @@ impl ClashResolver for EnhancedResolver {
     async fn flush_cache(&self) {
         if let Some(cache) = &self.lru_cache {
             *cache.write().await = hickory_resolver::ResponseCache::new(
-                4096,
+                DNS_RESPONSE_CACHE_CAPACITY,
                 hickory_resolver::TtlConfig::default(),
             );
         }
