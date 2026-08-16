@@ -22,7 +22,6 @@ pub(crate) mod geodata_proto {
 pub struct GeoData {
     geosite_path: Option<PathBuf>,
     geoip_path: Option<PathBuf>,
-    site_cache: Mutex<HashMap<String, geodata_proto::GeoSite>>,
     ip_cache: Mutex<HashMap<String, Arc<CidrTrie>>>,
 }
 
@@ -44,20 +43,8 @@ pub trait GeoDataLookupTrait {
 impl GeoDataLookupTrait for GeoData {
     fn get(&self, list: &str) -> Option<geodata_proto::GeoSite> {
         let path = self.geosite_path.as_ref()?;
-        let key = list.to_ascii_lowercase();
-        let mut cache = self
-            .site_cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(site) = cache.get(&key) {
-            return Some(site.clone());
-        }
-
         match load_site(path, list) {
-            Ok(Some(site)) => {
-                cache.insert(key, site.clone());
-                Some(site)
-            }
+            Ok(Some(site)) => Some(site),
             Ok(None) => None,
             Err(error) => {
                 warn!("failed to load geosite list {list}: {error}");
@@ -108,7 +95,6 @@ impl GeoData {
         Ok(Self {
             geosite_path,
             geoip_path,
-            site_cache: Mutex::new(HashMap::new()),
             ip_cache: Mutex::new(HashMap::new()),
         })
     }
@@ -124,7 +110,6 @@ impl GeoData {
         Ok(Self {
             geosite_path,
             geoip_path,
-            site_cache: Mutex::new(HashMap::new()),
             ip_cache: Mutex::new(HashMap::new()),
         })
     }
@@ -307,7 +292,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn loads_only_requested_site_and_caches_it() {
+    async fn loads_only_requested_site_without_retaining_raw_protobuf() {
         let site = geodata_proto::GeoSite {
             country_code: "CN".to_owned(),
             domain: vec![geodata_proto::Domain {
@@ -329,7 +314,7 @@ mod tests {
 
         assert_eq!(loader.get("cn"), Some(site.clone()));
         std::fs::remove_file(path).unwrap();
-        assert_eq!(loader.get("CN"), Some(site));
+        assert_eq!(loader.get("CN"), None);
     }
 
     #[tokio::test]

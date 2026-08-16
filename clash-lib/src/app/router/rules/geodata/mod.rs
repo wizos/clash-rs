@@ -1,5 +1,9 @@
 use crate::{Error, app::router::RuleMatcher, session::Session};
-use std::fmt::{Display, Formatter};
+use std::{
+    collections::HashMap,
+    fmt::{Display, Formatter},
+    sync::{Arc, Mutex, OnceLock, Weak},
+};
 
 use crate::{
     app::router::rules::geodata::{
@@ -44,8 +48,16 @@ fn parse(country_code: &str) -> Option<(bool, String, Box<dyn AttrMatcher>)> {
 pub struct GeoSiteMatcher {
     pub country_code: String,
     pub target: String,
-    pub matcher: Box<dyn DomainGroupMatcher>,
+    pub matcher: Arc<dyn DomainGroupMatcher>,
 }
+
+type MatcherCacheKey = (usize, String);
+struct MatcherCacheEntry {
+    _loader: Weak<dyn crate::common::geodata::GeoDataLookupTrait + Send + Sync>,
+    matcher: Weak<dyn DomainGroupMatcher>,
+}
+type MatcherCache = HashMap<MatcherCacheKey, MatcherCacheEntry>;
+static MATCHER_CACHE: OnceLock<Mutex<MatcherCache>> = OnceLock::new();
 
 impl GeoSiteMatcher {
     pub fn new(
@@ -57,23 +69,60 @@ impl GeoSiteMatcher {
             parse(&country_code).ok_or(Error::InvalidConfig(
                 "invalid geosite matcher, country code is empty".to_owned(),
             ))?;
-        let list = loader
-            .ok_or(Error::InvalidConfig(
-                "GeoDataLookup is not available. Maybe config.geosite is not set?"
-                    .to_owned(),
-            ))?
-            .get(&code)
-            .ok_or(Error::InvalidConfig(format!(
-                "geosite matcher, country code {code} not found"
-            )))?;
+        let loader = loader.ok_or(Error::InvalidConfig(
+            "GeoDataLookup is not available. Maybe config.geosite is not set?"
+                .to_owned(),
+        ))?;
+        let cache_key = (
+            Arc::as_ptr(loader) as *const () as usize,
+            country_code.trim().to_ascii_lowercase(),
+        );
+        if let Some(matcher) = MATCHER_CACHE
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&cache_key)
+            .and_then(|entry| entry.matcher.upgrade())
+        {
+            return Ok(Self {
+                country_code,
+                target,
+                matcher,
+            });
+        }
+        let list = loader.get(&code).ok_or(Error::InvalidConfig(format!(
+            "geosite matcher, country code {code} not found"
+        )))?;
         let domains = list
             .domain
             .into_iter()
             .filter(|domain| attr_matcher.matches(domain))
             .collect::<Vec<_>>();
 
-        let matcher_group: Box<dyn DomainGroupMatcher> =
-            Box::new(SuccinctMatcherGroup::try_new(domains, not)?);
+        let matcher_group = Arc::new(SuccinctMatcherGroup::try_new(domains, not)?)
+            as Arc<dyn DomainGroupMatcher>;
+        let matcher_group = {
+            let mut cache = MATCHER_CACHE
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            cache.retain(|_, entry| entry.matcher.strong_count() > 0);
+            if let Some(existing) = cache
+                .get(&cache_key)
+                .and_then(|entry| entry.matcher.upgrade())
+            {
+                existing
+            } else {
+                cache.insert(
+                    cache_key,
+                    MatcherCacheEntry {
+                        _loader: Arc::downgrade(loader),
+                        matcher: Arc::downgrade(&matcher_group),
+                    },
+                );
+                matcher_group
+            }
+        };
         Ok(Self {
             country_code,
             target,
@@ -113,7 +162,10 @@ impl RuleMatcher for GeoSiteMatcher {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use super::*;
     use crate::{
@@ -135,6 +187,45 @@ mod tests {
     struct TestSuite<'a> {
         country_code: &'a str,
         expected_results: Vec<(&'a str, bool)>,
+    }
+
+    struct CountingGeoData {
+        loads: AtomicUsize,
+    }
+
+    impl GeoDataLookupTrait for CountingGeoData {
+        fn get(
+            &self,
+            country: &str,
+        ) -> Option<crate::common::geodata::geodata_proto::GeoSite> {
+            self.loads.fetch_add(1, Ordering::Relaxed);
+            (country == "test").then(|| crate::common::geodata::geodata_proto::GeoSite {
+                country_code: "TEST".to_owned(),
+                domain: vec![crate::common::geodata::geodata_proto::Domain {
+                    r#type: crate::common::geodata::geodata_proto::domain::Type::Domain.into(),
+                    value: "example.com".to_owned(),
+                    attribute: vec![],
+                }],
+            })
+        }
+    }
+
+    #[test]
+    fn shares_compiled_matcher_and_drops_raw_geosite() {
+        let concrete = Arc::new(CountingGeoData {
+            loads: AtomicUsize::new(0),
+        });
+        let loader = concrete.clone() as GeoDataLookup;
+        let first =
+            GeoSiteMatcher::new("TEST".to_owned(), "A".to_owned(), Some(&loader))
+                .unwrap();
+        let second =
+            GeoSiteMatcher::new("test".to_owned(), "B".to_owned(), Some(&loader))
+                .unwrap();
+
+        assert_eq!(concrete.loads.load(Ordering::Relaxed), 1);
+        assert!(Arc::ptr_eq(&first.matcher, &second.matcher));
+        assert!(first.matches_domain("www.example.com"));
     }
 
     #[tokio::test]
