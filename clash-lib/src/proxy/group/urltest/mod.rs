@@ -1,7 +1,11 @@
-use std::{io, sync::atomic::AtomicU16, time::Duration};
+use std::{
+    io,
+    sync::{Arc, atomic::AtomicU16},
+    time::Duration,
+};
 
 use async_trait::async_trait;
-use tracing::{info, trace};
+use tracing::trace;
 
 use crate::{
     Error,
@@ -40,9 +44,9 @@ pub struct Handler {
 
     providers: Vec<ArcProxyProvider>,
     proxy_manager: ProxyManager,
-    fastest_proxy_index: AtomicU16,
+    fastest_proxy_index: Arc<AtomicU16>,
     selected: tokio::sync::RwLock<Option<String>>,
-    failover: FailoverState,
+    failover: Arc<FailoverState>,
 }
 
 impl std::fmt::Debug for Handler {
@@ -66,9 +70,9 @@ impl Handler {
             tolerance,
             providers,
             proxy_manager,
-            fastest_proxy_index: AtomicU16::new(0),
+            fastest_proxy_index: Arc::new(AtomicU16::new(0)),
             selected: tokio::sync::RwLock::new(None),
-            failover: FailoverState::new(failover_race),
+            failover: Arc::new(FailoverState::new(failover_race)),
         }
     }
 
@@ -206,32 +210,6 @@ impl Handler {
         sess.race_context.failover_is_owned_by(&plan, self.name())
     }
 
-    async fn promote(&self, from: &str, winner: &str, epoch: usize) -> bool {
-        let _guard = self.failover.lock().await;
-        if self.failover.epoch() != epoch {
-            return false;
-        }
-        if let Some(index) = self
-            .get_proxies(false)
-            .await
-            .iter()
-            .position(|proxy| proxy.name() == winner)
-        {
-            self.fastest_proxy_index
-                .store(index as u16, std::sync::atomic::Ordering::Relaxed);
-        }
-        self.failover.advance();
-        self.failover
-            .record(from.to_owned(), winner.to_owned())
-            .await;
-        info!(
-            group = self.name(),
-            from, winner, "failover race promoted proxy"
-        );
-        crate::app::events::emit_app("healthcheck", ());
-        true
-    }
-
     async fn connect_stream_race(
         &self,
         sess: &Session,
@@ -266,7 +244,38 @@ impl Handler {
             &challenger_leaf,
             sess,
         );
-        let (winner, stream) = race::connect_group_stream(
+        let failover = self.failover.clone();
+        let fastest_proxy_index = self.fastest_proxy_index.clone();
+        let providers = self.providers.clone();
+        let group = self.name().to_owned();
+        let from = primary.name().to_owned();
+        let winner = challenger.name().to_owned();
+        let callbacks = race::group_callbacks(
+            primary.clone(),
+            challenger.clone(),
+            self.proxy_manager.clone(),
+            self.test_url().to_owned(),
+            move || {
+                tokio::spawn(async move {
+                    let winner_index = get_proxies_from_providers(&providers, false)
+                        .await
+                        .iter()
+                        .position(|proxy| proxy.name() == winner)
+                        .map(|index| index as u16);
+                    failover
+                        .promote(&group, from, winner, epoch, || {
+                            if let Some(index) = winner_index {
+                                fastest_proxy_index.store(
+                                    index,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                            }
+                        })
+                        .await;
+                });
+            },
+        );
+        race::connect_group_stream(
             primary.clone(),
             challenger.clone(),
             sess,
@@ -276,12 +285,9 @@ impl Handler {
             self.test_url(),
             self.opts.race_delay.unwrap_or(race::RACE_DELAY),
             key,
+            callbacks,
         )
-        .await?;
-        if winner == race::Winner::Challenger {
-            self.promote(primary.name(), challenger.name(), epoch).await;
-        }
-        Ok(stream)
+        .await
     }
 }
 
@@ -525,6 +531,7 @@ mod tests {
         },
         session::Session,
     };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
     async fn empty_provider_uses_compatible_fallback() {
@@ -584,14 +591,17 @@ mod tests {
         failed.expect_name().return_const("failed".to_owned());
         failed
             .expect_connect_stream()
-            .times(1)
+            .times(2)
             .returning(|_, _| Err(std::io::Error::other("dial failed")));
         let failed: crate::proxy::AnyOutboundHandler = Arc::new(failed);
 
         let mut next = MockDummyOutboundHandler::new();
         next.expect_name().return_const("next".to_owned());
         next.expect_connect_stream().times(1).returning(|_, _| {
-            let (stream, _) = tokio::io::duplex(64);
+            let (stream, mut peer) = tokio::io::duplex(64);
+            tokio::spawn(async move {
+                peer.write_all(b"ok").await.unwrap();
+            });
             Ok(Box::new(ChainedStreamWrapper::new(stream)))
         });
         let next: crate::proxy::AnyOutboundHandler = Arc::new(next);
@@ -621,9 +631,14 @@ mod tests {
             destination: "urltest-race.test:443".parse().unwrap(),
             ..Default::default()
         };
-        let stream = handler.connect_stream(&sess, resolver).await.unwrap();
+        let mut stream = handler.connect_stream(&sess, resolver).await.unwrap();
+        let mut response = [0; 2];
+        stream.read_exact(&mut response).await.unwrap();
+        tokio::task::yield_now().await;
         assert_eq!(
-            stream.chain().race_type().await,
+            crate::app::dispatcher::ChainedStream::chain(stream.as_ref())
+                .race_type()
+                .await,
             crate::proxy::group::race::GROUP_RACE_TYPE,
         );
         assert_eq!(handler.current().await, "<none>");

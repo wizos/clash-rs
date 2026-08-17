@@ -103,10 +103,11 @@ impl Handler {
         resolver: ThreadSafeDNSResolver,
         first: Winner,
         trigger: Pin<Box<dyn Future<Output = ()> + Send>>,
-    ) -> io::Result<(Winner, BoxedChainedStream)> {
-        let (first_handler, second_handler, second) = match first {
-            Winner::Primary => (&self.primary, &self.route, Winner::Route),
-            Winner::Route => (&self.route, &self.primary, Winner::Primary),
+        callbacks: race::RaceCallbacks,
+    ) -> io::Result<BoxedChainedStream> {
+        let (first_handler, second_handler) = match first {
+            Winner::Primary => (&self.primary, &self.route),
+            Winner::Route => (&self.route, &self.primary),
         };
         let second_leaf = race::effective_leaf_name(second_handler.clone()).await;
         let key = race::shared_key(
@@ -114,21 +115,26 @@ impl Handler {
             &second_leaf,
             sess,
         );
-        let (winner, stream) = race::staggered_with_trigger(
-            first_handler.connect_stream(sess, resolver.clone()),
-            || second_handler.connect_stream(sess, resolver),
+        let first_handler = first_handler.clone();
+        let second_handler = second_handler.clone();
+        let first_sess = sess.clone();
+        let second_sess = sess.clone();
+        let first_resolver = resolver.clone();
+        race::staggered_until_first_io(
+            async move {
+                first_handler
+                    .connect_stream(&first_sess, first_resolver)
+                    .await
+            },
+            move || async move {
+                second_handler.connect_stream(&second_sess, resolver).await
+            },
             trigger,
             key,
             || {},
+            callbacks,
         )
-        .await?;
-        Ok((
-            match winner {
-                race::Winner::Primary => first,
-                race::Winner::Challenger => second,
-            },
-            stream,
-        ))
+        .await
     }
 }
 
@@ -194,20 +200,37 @@ impl OutboundHandler for Handler {
             }
             Winner::Primary => Box::pin(tokio::time::sleep(self.delay)),
         };
-        let (winner, stream) = self.race(sess, resolver, first, trigger).await?;
-        self.winners.insert(key, winner).await;
-        if winner == Winner::Route {
-            stream.chain().set_race_type(race::ROUTE_RACE_TYPE).await;
-            stream.append_to_chain(self.name()).await;
-            if cached != Some(Winner::Route) {
-                info!(
-                    group = self.name(),
-                    winner = self.route.name(),
-                    "route race selected the alternate path"
-                );
-            }
-        }
-        Ok(stream)
+        let second = match first {
+            Winner::Primary => Winner::Route,
+            Winner::Route => Winner::Primary,
+        };
+        let winners = self.winners.clone();
+        let group = self.name().to_owned();
+        let route = self.route.name().to_owned();
+        let callbacks = race::RaceCallbacks::new(
+            move |race_winner, chain| {
+                let winner = match race_winner {
+                    race::Winner::Primary => first,
+                    race::Winner::Challenger => second,
+                };
+                tokio::spawn(async move {
+                    winners.insert(key, winner).await;
+                    if winner == Winner::Route {
+                        chain.set_race_type(race::ROUTE_RACE_TYPE).await;
+                        chain.push(group.clone()).await;
+                        if cached != Some(Winner::Route) {
+                            info!(
+                                group,
+                                winner = route,
+                                "route race selected the alternate path"
+                            );
+                        }
+                    }
+                });
+            },
+            |_| {},
+        );
+        self.race(sess, resolver, first, trigger, callbacks).await
     }
 
     async fn connect_datagram(
@@ -339,6 +362,7 @@ mod tests {
             utils::test_utils::noop::NoopResolver,
         },
     };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
     async fn route_winner_is_visible_in_chain() {
@@ -351,7 +375,10 @@ mod tests {
         let mut route = MockDummyOutboundHandler::new();
         route.expect_name().return_const("DIRECT".to_owned());
         route.expect_connect_stream().returning(|_, _| {
-            let (stream, _) = tokio::io::duplex(64);
+            let (stream, mut peer) = tokio::io::duplex(64);
+            tokio::spawn(async move {
+                peer.write_all(b"ok").await.unwrap();
+            });
             let stream = ChainedStreamWrapper::new(stream);
             futures::executor::block_on(stream.append_to_chain("DIRECT"));
             Ok(Box::new(stream) as BoxedChainedStream)
@@ -363,15 +390,70 @@ mod tests {
             race::RACE_DELAY,
         );
 
-        let stream = handler
+        let mut stream = handler
             .connect_stream(
                 &Session::default(),
                 Arc::new(crate::proxy::utils::test_utils::noop::NoopResolver),
             )
             .await
             .unwrap();
-        assert_eq!(stream.chain().snapshot().await, ["DIRECT", "GROUP"]);
-        assert_eq!(stream.chain().race_type().await, race::ROUTE_RACE_TYPE,);
+        let mut response = [0; 2];
+        stream.read_exact(&mut response).await.unwrap();
+        tokio::task::yield_now().await;
+        let chain = ChainedStream::chain(stream.as_ref());
+        assert_eq!(chain.snapshot().await, ["DIRECT", "GROUP"]);
+        assert_eq!(chain.race_type().await, race::ROUTE_RACE_TYPE,);
+    }
+
+    #[tokio::test]
+    async fn route_without_response_is_not_cached_as_healthy() {
+        let mut primary = MockDummyOutboundHandler::new();
+        primary.expect_name().return_const("GROUP".to_owned());
+        primary
+            .expect_connect_stream()
+            .returning(|_, _| Err(io::Error::other("blocked")));
+
+        let mut route = MockDummyOutboundHandler::new();
+        route.expect_name().return_const("DIRECT".to_owned());
+        route.expect_connect_stream().returning(|_, _| {
+            let (stream, peer) = tokio::io::duplex(64);
+            tokio::spawn(async move {
+                std::future::pending::<()>().await;
+                drop(peer);
+            });
+            Ok(Box::new(ChainedStreamWrapper::new(stream)))
+        });
+        let handler = Handler::new(
+            Arc::new(primary),
+            Arc::new(route),
+            Duration::ZERO,
+            Duration::ZERO,
+        );
+        let sess = Session {
+            destination: "no-response.test:443".parse().unwrap(),
+            ..Default::default()
+        };
+
+        let mut stream = handler
+            .connect_stream(&sess, Arc::new(NoopResolver))
+            .await
+            .unwrap();
+        stream.write_all(b"request").await.unwrap();
+        tokio::task::yield_now().await;
+
+        assert!(
+            handler
+                .winners
+                .get(&handler.cache_key(&sess))
+                .await
+                .is_none()
+        );
+        assert!(
+            ChainedStream::chain(stream.as_ref())
+                .race_type()
+                .await
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -453,7 +535,10 @@ mod tests {
             .expect_connect_stream()
             .times(1)
             .returning(|_, _| {
-                let (stream, _) = tokio::io::duplex(64);
+                let (stream, mut peer) = tokio::io::duplex(64);
+                tokio::spawn(async move {
+                    peer.write_all(b"ok").await.unwrap();
+                });
                 Ok(Box::new(ChainedStreamWrapper::new(stream)))
             });
         let handler = Handler::new(
@@ -467,9 +552,15 @@ mod tests {
             ..Default::default()
         };
 
-        let stream = handler.connect_stream(&sess, Arc::new(NoopResolver)).await;
+        let mut stream = handler
+            .connect_stream(&sess, Arc::new(NoopResolver))
+            .await
+            .unwrap();
+        let mut response = [0; 2];
+        stream.read_exact(&mut response).await.unwrap();
+        tokio::task::yield_now().await;
         assert_eq!(
-            stream.unwrap().chain().race_type().await,
+            ChainedStream::chain(stream.as_ref()).race_type().await,
             race::ROUTE_RACE_TYPE,
         );
     }
@@ -487,7 +578,10 @@ mod tests {
         let mut shared = MockDummyOutboundHandler::new();
         shared.expect_name().return_const("DIRECT".to_owned());
         shared.expect_connect_stream().times(1).returning(|_, _| {
-            let (stream, _) = tokio::io::duplex(64);
+            let (stream, mut peer) = tokio::io::duplex(64);
+            tokio::spawn(async move {
+                peer.write_all(b"ok").await.unwrap();
+            });
             Ok(Box::new(ChainedStreamWrapper::new(stream)))
         });
         let shared: AnyOutboundHandler = Arc::new(shared);
@@ -524,7 +618,13 @@ mod tests {
             ..Default::default()
         };
 
-        let stream = handler.connect_stream(&sess, resolver).await.unwrap();
-        assert_eq!(stream.chain().race_type().await, race::ROUTE_RACE_TYPE);
+        let mut stream = handler.connect_stream(&sess, resolver).await.unwrap();
+        let mut response = [0; 2];
+        stream.read_exact(&mut response).await.unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(
+            ChainedStream::chain(stream.as_ref()).race_type().await,
+            race::ROUTE_RACE_TYPE,
+        );
     }
 }

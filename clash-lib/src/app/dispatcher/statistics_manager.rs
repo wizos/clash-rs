@@ -43,6 +43,13 @@ impl ProxyChain {
         self.0.read().await.names.clone()
     }
 
+    pub async fn replace_prefix(&self, old_len: usize, mut names: Vec<String>) {
+        let mut state = self.0.write().await;
+        let old_len = old_len.min(state.names.len());
+        names.extend(state.names.drain(old_len..));
+        state.names = names;
+    }
+
     pub async fn set_race_type(&self, race_type: &str) {
         self.0.write().await.race_type = race_type.to_owned();
     }
