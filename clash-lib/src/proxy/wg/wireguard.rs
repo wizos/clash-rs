@@ -224,9 +224,7 @@ impl WireguardTunnel {
                 .await
             {
                 Some(item) => item,
-                None => {
-                    continue;
-                }
+                None => break,
             };
 
             let mut peer = self.peer.lock().await;
@@ -431,5 +429,102 @@ fn trace_ip_packet(message: &str, packet: &[u8]) {
             ),
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
+    use futures::{Sink, Stream};
+
+    use super::*;
+
+    struct ClosedDatagram {
+        ended: bool,
+    }
+
+    impl Stream for ClosedDatagram {
+        type Item = UdpPacket;
+
+        fn poll_next(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Self::Item>> {
+            if self.ended {
+                Poll::Pending
+            } else {
+                self.ended = true;
+                Poll::Ready(None)
+            }
+        }
+    }
+
+    impl Sink<UdpPacket> for ClosedDatagram {
+        type Error = io::Error;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(
+            self: Pin<&mut Self>,
+            _item: UdpPacket,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn receiving_stops_when_the_datagram_stream_closes() {
+        let datagram: AnyOutboundDatagram =
+            Box::new(ClosedDatagram { ended: false });
+        let (tx, rx) = datagram.split();
+        let (packet_writer, _packets) = tokio::sync::mpsc::channel(1);
+        let (_packet_sender, packet_reader) = tokio::sync::mpsc::channel(1);
+        let tunnel = WireguardTunnel {
+            source_peer_ip: Ipv4Addr::UNSPECIFIED,
+            source_peer_ipv6: None,
+            peer: Arc::new(Mutex::new(Tunn::new(
+                StaticSecret::from([1; 32]),
+                PublicKey::from([2; 32]),
+                None,
+                None,
+                0,
+                None,
+            ))),
+            endpoint: "127.0.0.1:1".parse().unwrap(),
+            allowed_ips: Vec::new(),
+            reserved_bits: [0; 3],
+            tx: Mutex::new(tx),
+            rx: Mutex::new(rx),
+            packet_writer,
+            packet_reader: Arc::new(Mutex::new(packet_reader)),
+        };
+
+        tokio::time::timeout(Duration::from_millis(100), tunnel.start_receiving())
+            .await
+            .expect("closed receive stream must terminate");
     }
 }

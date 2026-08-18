@@ -27,6 +27,7 @@ pub struct Fetcher<U, P> {
     vehicle: ThreadSafeProviderVehicle,
     ticker_interval: Duration,
     inner: Arc<RwLock<Inner>>,
+    update_lock: Arc<tokio::sync::Mutex<()>>,
     parser: Arc<P>,
     pub on_update: Option<Arc<U>>,
     /// Aborts the polling and file-watch tasks on drop so config reloads don't
@@ -62,6 +63,7 @@ where
                 updated_at: SystemTime::UNIX_EPOCH,
                 hash: [0; 16],
             })),
+            update_lock: Default::default(),
             parser: Arc::new(parser),
             on_update: on_update.map(|f| Arc::new(f)),
             cancel_token: CancellationToken::new(),
@@ -89,6 +91,7 @@ where
     }
 
     pub async fn side_update(&self, content: &[u8]) -> anyhow::Result<(T, bool)> {
+        let _update_guard = self.update_lock.lock().await;
         let parsed = (self.parser)(content)?;
         let hash: [u8; 16] = utils::md5(content)[..16]
             .try_into()
@@ -110,10 +113,13 @@ where
             fs::copy(error.file.path(), path)?;
         }
 
-        let mut inner = self.inner.write().await;
-        let same = inner.hash == hash;
-        inner.hash = hash;
-        inner.updated_at = SystemTime::now();
+        let same = {
+            let mut inner = self.inner.write().await;
+            let same = inner.hash == hash;
+            inner.hash = hash;
+            inner.updated_at = SystemTime::now();
+            same
+        };
         Ok((parsed, same))
     }
 
@@ -123,17 +129,15 @@ where
 
         let vehicle_path = self.vehicle.path().to_owned();
 
-        let mut inner = self.inner.write().await;
-
         let content = match metadata(&vehicle_path) {
             Ok(meta) => {
                 let content = fs::read(&vehicle_path)?;
                 is_local = true;
-                inner.updated_at = meta.modified()?;
+                let updated_at = meta.modified()?;
                 immediately_update = SystemTime::now()
-                    .duration_since(inner.updated_at)
-                    .expect("wrong system clock")
-                    > self.interval;
+                    .duration_since(updated_at)
+                    .map_or(true, |age| age > self.interval);
+                self.inner.write().await.updated_at = updated_at;
                 content
             }
             Err(_) => self.vehicle.read().await?,
@@ -162,11 +166,9 @@ where
             fs::write(self.vehicle.path(), &content)?;
         }
 
-        inner.hash = utils::md5(&content)[..16]
+        self.inner.write().await.hash = utils::md5(&content)[..16]
             .try_into()
             .expect("md5 must be 16 bytes");
-
-        drop(inner);
 
         if !self.ticker_interval.is_zero() {
             self.pull_loop(
@@ -182,6 +184,7 @@ where
     pub async fn update(&self) -> anyhow::Result<(T, bool)> {
         Fetcher::<U, P>::update_inner(
             self.inner.clone(),
+            self.update_lock.clone(),
             self.vehicle.clone(),
             self.parser.clone(),
         )
@@ -190,10 +193,11 @@ where
 
     async fn update_inner(
         inner: Arc<RwLock<Inner>>,
+        update_lock: Arc<tokio::sync::Mutex<()>>,
         vehicle: ThreadSafeProviderVehicle,
         parser: Arc<P>,
     ) -> anyhow::Result<(T, bool)> {
-        let mut this = inner.write().await;
+        let _update_guard = update_lock.lock().await;
         let content = vehicle.read().await?;
         let proxies = parser(&content)?;
 
@@ -202,14 +206,14 @@ where
             .try_into()
             .expect("md5 must be 16 bytes");
 
-        if hash == this.hash {
-            this.updated_at = now;
+        if hash == inner.read().await.hash {
             // Only bump the mtime of an http cache file (for the staleness
             // check). Doing it to a watched `File` vehicle would re-trigger the
             // watcher in an endless read→touch→event loop.
             if vehicle.typ() != ProviderVehicleType::File {
                 filetime::set_file_times(vehicle.path(), now.into(), now.into())?;
             }
+            inner.write().await.updated_at = now;
             return Ok((proxies, true));
         }
 
@@ -224,8 +228,11 @@ where
             fs::write(vehicle.path(), &content)?;
         }
 
-        this.hash = hash;
-        this.updated_at = now;
+        {
+            let mut this = inner.write().await;
+            this.hash = hash;
+            this.updated_at = now;
+        }
 
         Ok((proxies, false))
     }
@@ -239,13 +246,16 @@ where
     /// Shared by the polling loop and the file watcher so they can't diverge.
     async fn run_update(
         inner: Arc<RwLock<Inner>>,
+        update_lock: Arc<tokio::sync::Mutex<()>>,
         vehicle: ThreadSafeProviderVehicle,
         parser: Arc<P>,
         on_update: Option<Arc<U>>,
         name: &str,
     ) {
         let (elm, same) =
-            match Fetcher::<U, P>::update_inner(inner, vehicle, parser).await {
+            match Fetcher::<U, P>::update_inner(inner, update_lock, vehicle, parser)
+                .await
+            {
                 Ok(result) => result,
                 Err(e) => {
                     warn!("{} update failed: {}", name, e);
@@ -289,6 +299,7 @@ where
         let watch_name = file_path.file_name().map(ToOwned::to_owned);
 
         let inner = self.inner.clone();
+        let update_lock = self.update_lock.clone();
         let vehicle = self.vehicle.clone();
         let parser = self.parser.clone();
         let on_update = self.on_update.clone();
@@ -352,6 +363,7 @@ where
 
                         Fetcher::<U, P>::run_update(
                             inner.clone(),
+                            update_lock.clone(),
                             vehicle.clone(),
                             parser.clone(),
                             on_update.clone(),
@@ -372,6 +384,7 @@ where
         mut ticker: tokio::time::Interval,
     ) {
         let inner = self.inner.clone();
+        let update_lock = self.update_lock.clone();
         let vehicle = self.vehicle.clone();
         let parser = self.parser.clone();
         let on_update = self.on_update.clone();
@@ -383,6 +396,7 @@ where
             let run = |()| {
                 Fetcher::<U, P>::run_update(
                     inner.clone(),
+                    update_lock.clone(),
                     vehicle.clone(),
                     parser.clone(),
                     on_update.clone(),
@@ -409,6 +423,7 @@ where
 #[cfg(test)]
 mod tests {
     use std::{
+        io,
         path::Path,
         sync::{
             Arc,
@@ -417,14 +432,61 @@ mod tests {
         time::Duration,
     };
 
+    use async_trait::async_trait;
     use futures::future::BoxFuture;
-    use tokio::time::sleep;
+    use tokio::{sync::Notify, time::sleep};
 
     use crate::app::remote_content_manager::providers::{
-        MockProviderVehicle, ProviderVehicleType,
+        MockProviderVehicle, ProviderVehicle, ProviderVehicleType,
     };
 
     use super::Fetcher;
+
+    struct WaitingVehicle {
+        path: String,
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl ProviderVehicle for WaitingVehicle {
+        async fn read(&self) -> io::Result<Vec<u8>> {
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(b"provider".to_vec())
+        }
+
+        fn path(&self) -> &str {
+            &self.path
+        }
+
+        fn typ(&self) -> ProviderVehicleType {
+            ProviderVehicleType::Http
+        }
+    }
+
+    fn waiting_fetcher(
+        path: String,
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+    ) -> Arc<
+        Fetcher<
+            fn(Vec<u8>) -> BoxFuture<'static, ()>,
+            fn(&[u8]) -> anyhow::Result<Vec<u8>>,
+        >,
+    > {
+        Arc::new(Fetcher::new(
+            "waiting".to_owned(),
+            Duration::ZERO,
+            Arc::new(WaitingVehicle {
+                path,
+                started,
+                release,
+            }),
+            |content: &[u8]| Ok(content.to_vec()),
+            None,
+        ))
+    }
 
     #[tokio::test]
     async fn test_fetcher() {
@@ -557,5 +619,55 @@ mod tests {
         assert_eq!(std::fs::read(&cache).unwrap(), b"new-valid");
 
         std::fs::remove_file(cache).unwrap();
+    }
+
+    #[tokio::test]
+    async fn initial_network_read_does_not_hold_state_lock() {
+        let path = std::env::temp_dir()
+            .join(format!("waiting-initial-{}", uuid::Uuid::new_v4()));
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let fetcher = waiting_fetcher(
+            path.to_string_lossy().into_owned(),
+            started.clone(),
+            release.clone(),
+        );
+        let task = tokio::spawn({
+            let fetcher = fetcher.clone();
+            async move { fetcher.initial().await }
+        });
+
+        started.notified().await;
+        tokio::time::timeout(Duration::from_millis(100), fetcher.updated_at())
+            .await
+            .expect("state read should not wait for provider I/O");
+        release.notify_one();
+        task.await.unwrap().unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn update_network_read_does_not_hold_state_lock() {
+        let path = std::env::temp_dir()
+            .join(format!("waiting-update-{}", uuid::Uuid::new_v4()));
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let fetcher = waiting_fetcher(
+            path.to_string_lossy().into_owned(),
+            started.clone(),
+            release.clone(),
+        );
+        let task = tokio::spawn({
+            let fetcher = fetcher.clone();
+            async move { fetcher.update().await }
+        });
+
+        started.notified().await;
+        tokio::time::timeout(Duration::from_millis(100), fetcher.updated_at())
+            .await
+            .expect("state read should not wait for provider I/O");
+        release.notify_one();
+        task.await.unwrap().unwrap();
+        std::fs::remove_file(path).unwrap();
     }
 }

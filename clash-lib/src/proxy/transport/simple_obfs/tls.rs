@@ -5,7 +5,6 @@ use byteorder::{BigEndian, ByteOrder, WriteBytesExt};
 use bytes::BufMut;
 use chrono::Utc;
 use std::{
-    borrow::Cow,
     io,
     pin::Pin,
     task::{Context, Poll, ready},
@@ -102,8 +101,12 @@ impl AsyncWrite for TLSObfs {
         let end = CHUNK_SIZE.min(buf.len());
         let chunk = &buf[..end];
         this.write_buf = if this.first_request {
+            let hello = match make_client_hello_msg(chunk, &this.server) {
+                Ok(hello) => hello,
+                Err(error) => return Poll::Ready(Err(error)),
+            };
             this.first_request = false;
-            make_client_hello_msg(chunk, &this.server).into_owned()
+            hello
         } else {
             let mut v = Vec::with_capacity(5 + chunk.len());
             v.extend_from_slice(&[0x17, 0x03, 0x03]);
@@ -252,24 +255,61 @@ impl AsyncRead for TLSObfs {
     }
 }
 
-fn make_client_hello_msg<'a>(data: &[u8], server: &str) -> Cow<'a, [u8]> {
+fn make_client_hello_msg(data: &[u8], server: &str) -> io::Result<Vec<u8>> {
     let random_bytes = rand::random::<[u8; 28]>();
     let session_id = rand::random::<[u8; 32]>();
+
+    let encoded_len = |base: usize| {
+        base.checked_add(data.len())
+            .and_then(|length| length.checked_add(server.len()))
+            .and_then(|length| u16::try_from(length).ok())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "simple-obfs TLS ClientHello is too large",
+                )
+            })
+    };
+    let record_len = encoded_len(212)?;
+    let handshake_len = encoded_len(208)?;
+    let extension_len = encoded_len(79)?;
+    let ticket_len = u16::try_from(data.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "simple-obfs TLS session ticket is too large",
+        )
+    })?;
+    let server_len = u16::try_from(server.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "simple-obfs TLS host is too large",
+        )
+    })?;
+    let server_extension_len = server_len.checked_add(5).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "simple-obfs TLS host is too large",
+        )
+    })?;
+    let server_list_len = server_len.checked_add(3).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "simple-obfs TLS host is too large",
+        )
+    })?;
 
     let mut buf: Vec<u8> = Vec::new();
 
     // handshake, TLS 1.0 version, length
     buf.put_u8(22);
     buf.put_slice(&[0x03, 0x01]);
-    let length: u16 = (212 + data.len() + server.len()) as u16;
-    buf.put_u8((length >> 8) as u8);
-    buf.put_u8((length & 0xff) as u8);
+    buf.put_u8((record_len >> 8) as u8);
+    buf.put_u8((record_len & 0xff) as u8);
 
     // clientHello, length, TLS 1.2 version
     buf.put_u8(1);
     buf.put_u8(0);
-    buf.write_u16::<BigEndian>((208 + data.len() + server.len()) as u16)
-        .unwrap();
+    buf.write_u16::<BigEndian>(handshake_len).unwrap();
     buf.put_slice(&[0x03, 0x03]);
 
     // random with timestamp, sid len, sid
@@ -293,22 +333,19 @@ fn make_client_hello_msg<'a>(data: &[u8], server: &str) -> Cow<'a, [u8]> {
     buf.put_slice(&[0x01, 0x00]);
 
     // extension length
-    buf.write_u16::<BigEndian>((79 + data.len() + server.len()) as u16)
-        .unwrap();
+    buf.write_u16::<BigEndian>(extension_len).unwrap();
 
     // session ticket
     buf.put_slice(&[0x00, 0x23]);
-    buf.write_u16::<BigEndian>(data.len() as u16).unwrap();
+    buf.write_u16::<BigEndian>(ticket_len).unwrap();
     buf.put_slice(data);
 
     // server name
     buf.put_slice(&[0x00, 0x00]);
-    buf.write_u16::<BigEndian>((server.len() + 5) as u16)
-        .unwrap();
-    buf.write_u16::<BigEndian>((server.len() + 3) as u16)
-        .unwrap();
+    buf.write_u16::<BigEndian>(server_extension_len).unwrap();
+    buf.write_u16::<BigEndian>(server_list_len).unwrap();
     buf.put_u8(0);
-    buf.write_u16::<BigEndian>(server.len() as u16).unwrap();
+    buf.write_u16::<BigEndian>(server_len).unwrap();
     buf.put_slice(server.as_bytes());
 
     // ec_point
@@ -332,7 +369,7 @@ fn make_client_hello_msg<'a>(data: &[u8], server: &str) -> Cow<'a, [u8]> {
 
     // extended master secret
     buf.put_slice(&[0x00, 0x17, 0x00, 0x00]);
-    Cow::Owned(buf)
+    Ok(buf)
 }
 
 impl TLSObfs {
@@ -359,5 +396,20 @@ impl TLSObfs {
 impl From<TLSObfs> for AnyStream {
     fn from(obfs: TLSObfs) -> Self {
         Box::new(obfs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use super::make_client_hello_msg;
+
+    #[test]
+    fn rejects_host_that_does_not_fit_client_hello_lengths() {
+        let host = "a".repeat(u16::MAX as usize);
+        let error = make_client_hello_msg(&[], &host).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 }

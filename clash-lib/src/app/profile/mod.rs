@@ -1,6 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 use tracing::{error, trace, warn};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -18,7 +19,18 @@ struct Db {
 }
 
 #[derive(Clone)]
-pub struct ThreadSafeCacheFile(Arc<tokio::sync::RwLock<CacheFile>>);
+pub struct ThreadSafeCacheFile(Arc<CacheFileOwner>);
+
+struct CacheFileOwner {
+    store: Arc<tokio::sync::RwLock<CacheFile>>,
+    cancel_token: CancellationToken,
+}
+
+impl Drop for CacheFileOwner {
+    fn drop(&mut self) {
+        self.cancel_token.cancel();
+    }
+}
 
 impl ThreadSafeCacheFile {
     pub fn new(path: &str, store_selected: bool) -> Self {
@@ -29,12 +41,17 @@ impl ThreadSafeCacheFile {
 
         let path = path.to_string();
         let store_clone = store.clone();
+        let cancel_token = CancellationToken::new();
 
         if store_selected {
+            let task_cancel_token = cancel_token.clone();
             tokio::spawn(async move {
                 let store = store_clone;
                 loop {
-                    tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                    tokio::select! {
+                        _ = task_cancel_token.cancelled() => break,
+                        _ = tokio::time::sleep(tokio::time::Duration::from_secs(10)) => {}
+                    }
                     let r = store.read().await;
                     let db = r.db.clone();
                     drop(r);
@@ -59,18 +76,21 @@ impl ThreadSafeCacheFile {
             });
         }
 
-        Self(store)
+        Self(Arc::new(CacheFileOwner {
+            store,
+            cancel_token,
+        }))
     }
 
     pub async fn set_selected(&self, group: &str, server: &str) {
-        let mut g = self.0.write().await;
+        let mut g = self.0.store.write().await;
         if g.store_selected() {
             g.set_selected(group, server);
         }
     }
 
     pub async fn get_selected(&self, group: &str) -> Option<String> {
-        let g = self.0.read().await;
+        let g = self.0.store.read().await;
         if g.store_selected() {
             g.db.selected.get(group).cloned()
         } else {
@@ -80,7 +100,7 @@ impl ThreadSafeCacheFile {
 
     #[allow(dead_code)]
     pub async fn get_selected_map(&self) -> HashMap<String, String> {
-        let g = self.0.read().await;
+        let g = self.0.store.read().await;
         if g.store_selected() {
             g.get_selected_map()
         } else {
@@ -89,23 +109,23 @@ impl ThreadSafeCacheFile {
     }
 
     pub async fn set_ip_to_host(&self, ip: &str, host: &str) {
-        self.0.write().await.set_ip_to_host(ip, host);
+        self.0.store.write().await.set_ip_to_host(ip, host);
     }
 
     pub async fn set_host_to_ip(&self, host: &str, ip: &str) {
-        self.0.write().await.set_host_to_ip(host, ip);
+        self.0.store.write().await.set_host_to_ip(host, ip);
     }
 
     pub async fn get_fake_ip(&self, ip_or_host: &str) -> Option<String> {
-        self.0.read().await.get_fake_ip(ip_or_host)
+        self.0.store.read().await.get_fake_ip(ip_or_host)
     }
 
     pub async fn delete_fake_ip_pair(&self, ip: &str, host: &str) {
-        self.0.write().await.delete_fake_ip_pair(ip, host);
+        self.0.store.write().await.delete_fake_ip_pair(ip, host);
     }
 
     pub async fn clear_fake_ip(&self) {
-        self.0.write().await.clear_fake_ip();
+        self.0.store.write().await.clear_fake_ip();
     }
 
     /// Store smart proxy group statistics
@@ -114,7 +134,7 @@ impl ThreadSafeCacheFile {
         group_name: &str,
         stats: crate::proxy::group::smart::state::SmartStateData,
     ) {
-        let mut g = self.0.write().await;
+        let mut g = self.0.store.write().await;
         g.set_smart_stats(group_name, stats);
     }
 
@@ -123,7 +143,7 @@ impl ThreadSafeCacheFile {
         &self,
         group_name: &str,
     ) -> Option<crate::proxy::group::smart::state::SmartStateData> {
-        let g = self.0.read().await;
+        let g = self.0.store.read().await;
         g.get_smart_stats(group_name)
     }
 }
@@ -221,5 +241,24 @@ impl CacheFile {
         group_name: &str,
     ) -> Option<crate::proxy::group::smart::state::SmartStateData> {
         self.db.smart_stats.get(group_name).cloned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ThreadSafeCacheFile;
+
+    #[tokio::test]
+    async fn flush_task_is_cancelled_when_the_last_owner_is_dropped() {
+        let path = std::env::temp_dir()
+            .join(format!("viaport-cache-owner-{}", uuid::Uuid::new_v4()));
+        let cache = ThreadSafeCacheFile::new(path.to_string_lossy().as_ref(), true);
+        let clone = cache.clone();
+        let cancel_token = cache.0.cancel_token.clone();
+
+        drop(cache);
+        assert!(!cancel_token.is_cancelled());
+        drop(clone);
+        assert!(cancel_token.is_cancelled());
     }
 }

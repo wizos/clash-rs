@@ -843,6 +843,8 @@ pub struct OutboundTuic {
     pub reduce_rtt: Option<bool>,
     /// millis
     pub request_timeout: Option<u64>,
+    /// millis
+    pub idle_timeout: Option<u64>,
     pub udp_relay_mode: Option<String>,
     pub congestion_controller: Option<String>,
     /// bytes
@@ -899,6 +901,8 @@ pub struct OutboundShadowQuic {
     /// keep alive interval in milliseconds
     /// 0 means disable keep alive, should be smaller than 30_000(idle time)
     pub keep_alive_interval: Option<u32>,
+    /// Whether to detect QUIC path black holes.
+    pub blackhole_detection: Option<bool>,
     /// Generalized Segmentation Offload for QUIC udp connection, default to
     /// true.
     pub gso: Option<bool>,

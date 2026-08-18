@@ -15,6 +15,10 @@ use super::{
     codec::{Defragger, HysUdpPacket},
 };
 
+fn packet_id(sequence: u32) -> u16 {
+    sequence as u16
+}
+
 pub struct UdpSession {
     pub incoming: tokio::sync::mpsc::Sender<UdpPacket>,
     pub local_addr: SocksAddr,
@@ -70,7 +74,7 @@ impl HysteriaDatagramOutbound {
             while let Some(next_send) = send_rx.recv().await {
                 let pkt_id =
                     next_pkt_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let pkt_id = (pkt_id % u16::MAX as u32) as u16;
+                let pkt_id = packet_id(pkt_id);
                 tracing::trace!(
                     "HysteriaDatagramOutbound: sending packet for session {}, \
                      pkt_id={}, dst={:?}",
@@ -104,6 +108,17 @@ impl HysteriaDatagramOutbound {
             send_tx: tokio_util::sync::PollSender::new(send_tx),
             recv_rx,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::packet_id;
+
+    #[test]
+    fn packet_id_uses_all_u16_values_before_wrapping() {
+        assert_eq!(packet_id(u16::MAX as u32), u16::MAX);
+        assert_eq!(packet_id(u16::MAX as u32 + 1), 0);
     }
 }
 

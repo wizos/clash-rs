@@ -45,22 +45,12 @@ pub struct FakeDns {
 
 impl FakeDns {
     pub fn new(opt: Opts) -> Result<Self, Error> {
-        let ip = match opt.ipnet.network() {
-            net::IpAddr::V4(ip) => ip,
-            _ => unreachable!("fakeip range must be valid ipv4 subnet"),
-        };
-        let min = Self::ip_to_uint(&ip) + 2;
-        let prefix_len = opt.ipnet.prefix_len();
-        let max_prefix_len = opt.ipnet.max_prefix_len();
-        debug_assert_eq!(max_prefix_len, 32, "v4 subnet");
-        let total = (1 << (max_prefix_len - prefix_len)) - 2;
-
-        let max = min + total - 1;
+        let (gateway, min, max) = Self::allocatable_bounds(opt.ipnet)?;
 
         Ok(Self {
             max,
             min,
-            gateway: min - 1,
+            gateway,
             offset: 0,
             skipped_hostnames: opt.skipped_hostnames,
             ipnet: opt.ipnet,
@@ -68,8 +58,47 @@ impl FakeDns {
         })
     }
 
+    pub(crate) fn validate_ipnet(ipnet: ipnet::IpNet) -> Result<(), Error> {
+        Self::allocatable_bounds(ipnet).map(|_| ())
+    }
+
+    fn allocatable_bounds(ipnet: ipnet::IpNet) -> Result<(u32, u32, u32), Error> {
+        let ipnet::IpNet::V4(ipnet) = ipnet else {
+            return Err(Error::InvalidConfig(
+                "fake ip range must be IPv4".to_owned(),
+            ));
+        };
+        let network = Self::ip_to_uint(&ipnet.network());
+        let host_bits = 32 - ipnet.prefix_len();
+        let host_mask = match host_bits {
+            32 => u32::MAX,
+            bits => (1u32 << bits) - 1,
+        };
+        let last = network | host_mask;
+        let gateway = network.checked_add(1).ok_or_else(|| {
+            Error::InvalidConfig("fake ip range has no gateway address".to_owned())
+        })?;
+        let min = network.checked_add(2).ok_or_else(|| {
+            Error::InvalidConfig(
+                "fake ip range has no allocatable addresses".to_owned(),
+            )
+        })?;
+        let max =
+            last.checked_sub(1)
+                .filter(|max| *max >= min)
+                .ok_or_else(|| {
+                    Error::InvalidConfig(
+                        "fake ip range has no allocatable addresses".to_owned(),
+                    )
+                })?;
+
+        Ok((gateway, min, max))
+    }
+
     pub async fn lookup(&mut self, host: &str) -> net::IpAddr {
-        if let Some(ip) = self.store.get_by_host(host).await {
+        if let Some(ip) = self.store.get_by_host(host).await
+            && self.contains_allocatable(ip)
+        {
             return ip;
         }
 
@@ -115,7 +144,7 @@ impl FakeDns {
         // prevents directed-broadcast addresses (e.g. 198.18.0.255 for the
         // /24 TUN subnet) that fall inside the wider fake-IP /16 range from
         // triggering a failed reverse-lookup in the dispatcher.
-        self.ipnet.contains(&ip) && self.store.exist(ip).await
+        self.contains_allocatable(ip) && self.store.exist(ip).await
     }
 
     #[allow(dead_code)]
@@ -134,27 +163,34 @@ impl FakeDns {
     }
 
     async fn get(&mut self, host: &str) -> net::IpAddr {
-        let current = self.offset;
+        let start = self.offset;
+        let victim = net::IpAddr::V4((self.min + start).into());
 
-        loop {
-            self.offset = (self.offset + 1) % (self.max - self.min);
+        let ip = loop {
+            let value = self.min + self.offset;
+            let candidate = net::IpAddr::V4(value.into());
+            self.offset = if value == self.max {
+                0
+            } else {
+                self.offset + 1
+            };
 
-            if self.offset == current {
-                self.offset = (self.offset + 1) % (self.max - self.min);
-                let ip = net::Ipv4Addr::from(self.min + self.offset - 1);
-                self.store.del_by_ip(std::net::IpAddr::V4(ip)).await;
-                break;
+            if !self.store.exist(candidate).await {
+                break candidate;
             }
-
-            let ip = net::Ipv4Addr::from(self.min + self.offset - 1);
-            if !self.store.exist(std::net::IpAddr::V4(ip)).await {
-                break;
+            if self.offset == start {
+                self.store.del_by_ip(victim).await;
+                self.offset = if self.min + start == self.max {
+                    0
+                } else {
+                    start + 1
+                };
+                break victim;
             }
-        }
+        };
 
-        let ip = net::Ipv4Addr::from(self.min + self.offset - 1);
-        self.store.put_by_ip(std::net::IpAddr::V4(ip), host).await;
-        std::net::IpAddr::V4(ip)
+        self.store.put_by_ip(ip, host).await;
+        ip
     }
 
     pub async fn flush(&mut self) {
@@ -165,6 +201,14 @@ impl FakeDns {
     fn ip_to_uint(ip: &net::Ipv4Addr) -> u32 {
         BigEndian::read_u32(&ip.octets())
     }
+
+    fn contains_allocatable(&self, ip: net::IpAddr) -> bool {
+        let net::IpAddr::V4(ip) = ip else {
+            return false;
+        };
+        self.ipnet.contains(&net::IpAddr::V4(ip))
+            && (self.min..=self.max).contains(&Self::ip_to_uint(&ip))
+    }
 }
 
 #[cfg(test)]
@@ -173,7 +217,7 @@ mod tests {
 
     use crate::{app::dns::fakeip::mem_store::InMemStore, common::trie};
 
-    use super::{FakeDns, Opts};
+    use super::{FakeDns, Opts, Store};
 
     #[tokio::test]
     async fn test_inmem_basic() {
@@ -229,6 +273,51 @@ mod tests {
         let next = pool.lookup("foo.com").await;
         assert_eq!(foo, baz);
         assert_eq!(next, bar);
+    }
+
+    #[tokio::test]
+    async fn ipv4_pool_excludes_network_gateway_and_broadcast() {
+        let mut pool = FakeDns::new(Opts {
+            ipnet: "192.0.2.0/29".parse().unwrap(),
+            skipped_hostnames: None,
+            store: Box::new(InMemStore::new(10)),
+        })
+        .unwrap();
+
+        let mut allocated = Vec::new();
+        for index in 0..5 {
+            allocated.push(pool.lookup(&format!("{index}.example")).await);
+        }
+        assert_eq!(
+            allocated,
+            [
+                "192.0.2.2".parse::<net::IpAddr>().unwrap(),
+                "192.0.2.3".parse::<net::IpAddr>().unwrap(),
+                "192.0.2.4".parse::<net::IpAddr>().unwrap(),
+                "192.0.2.5".parse::<net::IpAddr>().unwrap(),
+                "192.0.2.6".parse::<net::IpAddr>().unwrap(),
+            ],
+        );
+        assert_eq!(pool.lookup("wrapped.example").await, allocated[0]);
+    }
+
+    #[tokio::test]
+    async fn cached_reserved_address_is_not_reused() {
+        let mut store = InMemStore::new(10);
+        let gateway = "192.0.2.1".parse::<net::IpAddr>().unwrap();
+        store.put_by_ip(gateway, "example.com").await;
+        store.pub_by_host("example.com", gateway).await;
+        let mut pool = FakeDns::new(Opts {
+            ipnet: "192.0.2.0/29".parse().unwrap(),
+            skipped_hostnames: None,
+            store: Box::new(store),
+        })
+        .unwrap();
+
+        assert_eq!(
+            pool.lookup("example.com").await,
+            "192.0.2.2".parse::<net::IpAddr>().unwrap(),
+        );
     }
 
     #[tokio::test]

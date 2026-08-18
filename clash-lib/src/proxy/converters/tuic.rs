@@ -54,7 +54,7 @@ impl TryFrom<&OutboundTuic> for Handler {
             request_timeout: Duration::from_millis(
                 s.request_timeout.unwrap_or(4000),
             ),
-            idle_timeout: Duration::from_millis(s.request_timeout.unwrap_or(4000)),
+            idle_timeout: configured_idle_timeout(s),
             congestion_controller: s
                 .congestion_controller
                 .clone()
@@ -77,5 +77,37 @@ impl TryFrom<&OutboundTuic> for Handler {
             tls_key: s.tls_key.clone(),
             ech: super::utils::tls_ech_options(s.ech_opts.as_ref()),
         }))
+    }
+}
+
+fn configured_idle_timeout(s: &OutboundTuic) -> Duration {
+    Duration::from_millis(s.idle_timeout.unwrap_or(4000))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::{OutboundTuic, configured_idle_timeout};
+
+    #[test]
+    fn maps_idle_timeout_independently_from_request_timeout() {
+        let outbound: OutboundTuic = serde_yaml::from_str(
+            r#"
+name: tuic
+server: example.com
+port: 443
+uuid: 00000000-0000-0000-0000-000000000001
+password: secret
+request-timeout: 1200
+idle-timeout: 3400
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            configured_idle_timeout(&outbound),
+            Duration::from_millis(3400),
+        );
     }
 }

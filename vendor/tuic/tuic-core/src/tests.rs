@@ -586,7 +586,7 @@ mod model_tests {
         );
 
         let payload = vec![0u8; 100];
-        let fragments: Vec<_> = pkt.into_fragments(&payload).collect();
+        let fragments: Vec<_> = pkt.into_fragments(&payload).unwrap().collect();
 
         assert_eq!(fragments.len(), 1);
         let (header, data) = &fragments[0];
@@ -605,7 +605,7 @@ mod model_tests {
         );
 
         let payload = vec![0xAB; 200];
-        let fragments: Vec<_> = pkt.into_fragments(&payload).collect();
+        let fragments: Vec<_> = pkt.into_fragments(&payload).unwrap().collect();
 
         assert!(fragments.len() > 1);
 
@@ -941,7 +941,7 @@ mod model_tests {
         );
 
         let payload = vec![0xAB; 200];
-        let fragments = pkt.into_fragments(&payload);
+        let fragments = pkt.into_fragments(&payload).unwrap();
         let expected_len = fragments.len();
         let actual: Vec<_> = fragments.collect();
         assert_eq!(actual.len(), expected_len);
@@ -959,7 +959,7 @@ mod model_tests {
         // payload = 32 + 39 = 71 → remaining 39 exactly divisible by 39
         // Old: 1+39/39+1 = 3, New: 1+ceil(39/39) = 2
         let payload = vec![0xCD; 71];
-        let fragments: Vec<_> = pkt.into_fragments(&payload).collect();
+        let fragments: Vec<_> = pkt.into_fragments(&payload).unwrap().collect();
 
         assert_eq!(fragments.len(), 2);
         for (_, data) in &fragments {
@@ -969,21 +969,33 @@ mod model_tests {
         assert_eq!(total, 71);
     }
 
-    /// Verify that extremely large payloads clamp fragment count
-    /// to u8::MAX instead of silently overflowing.
+    /// Extremely large payloads must be rejected instead of truncated.
     #[test]
-    fn test_fragment_count_overflow_clamp() {
+    fn test_fragment_count_overflow_is_rejected() {
         let conn = Connection::<Vec<u8>>::new();
         let pkt = conn.send_packet(1, Address::None, 20);
         // Each frag = 20-11 = 9 bytes.
-        // payload = 10 + 256*9 = 2314 → 1+ceil(2305/9) = 258 → clamped to 255
+        // payload = 10 + 256*9 = 2314 → 1+ceil(2305/9) = 258 fragments
         let payload = vec![0xEE; 2314];
-        let fragments = pkt.into_fragments(&payload);
-        assert_eq!(fragments.len(), u8::MAX as usize);
+        assert!(pkt.into_fragments(&payload).is_err());
+    }
 
-        let collected: Vec<_> = fragments.collect();
-        assert_eq!(collected.len(), u8::MAX as usize);
-        let total: usize = collected.iter().map(|(_, d)| d.len()).sum();
-        assert_eq!(total, (u8::MAX as usize) * 9);
+    #[test]
+    fn test_packet_assembly_rejects_payload_length_mismatch() {
+        let conn = Connection::<Vec<u8>>::new();
+        let header = crate::Packet::new(
+            1,
+            0,
+            1,
+            0,
+            5,
+            Address::DomainAddress("test.com".to_string(), 53),
+        );
+
+        assert!(
+            conn.recv_packet_unrestricted(header)
+                .assemble(vec![1, 2])
+                .is_err()
+        );
     }
 }

@@ -1,6 +1,6 @@
 use std::{
     sync::{Arc, RwLock},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use quinn_proto::congestion::{Bbr, BbrConfig, Controller, ControllerFactory};
@@ -25,11 +25,27 @@ const MIN_ACKRATE: f64 = 0.8;
 const CONGESTION_WINDOW_MULTIPLIER: u64 = 2;
 const INITIAL_PACKET_SIZE_IPV4: u64 = 1252;
 
+fn congestion_window(bps: u64, rtt: Duration, ack_rate: f64) -> u64 {
+    (bps as f64 * rtt.as_secs_f64() * CONGESTION_WINDOW_MULTIPLIER as f64 / ack_rate)
+        as u64
+}
+
 #[derive(Copy, Clone)]
 struct SlotInfo {
     time: u64,
     lost: u64,
     ack: u64,
+}
+
+impl SlotInfo {
+    fn record(&mut self, time: u64, lost: u64, ack: u64) {
+        if self.time == time {
+            self.lost += lost;
+            self.ack += ack;
+        } else {
+            *self = Self { time, lost, ack };
+        }
+    }
 }
 
 pub struct Burtal {
@@ -41,7 +57,7 @@ pub struct Burtal {
     max_datagram_size: u64,
     last_send_time: Option<Instant>,
     budget_at_last_sent: u64,
-    rtt: u64,
+    rtt: Duration,
     in_flight: u64,
     #[allow(dead_code)]
     send_now: Instant,
@@ -61,9 +77,9 @@ impl Burtal {
                 lost: 0,
                 ack: 0,
             }; SLOT_COUNT as usize],
-            ack_rate: 0.0,
+            ack_rate: 1.0,
             bps,
-            rtt: 0,
+            rtt: Duration::ZERO,
             last_send_time: None,
             budget_at_last_sent: 0,
             in_flight: 0,
@@ -87,11 +103,10 @@ impl Controller for Burtal {
         if self.budget_at_last_sent >= self.max_datagram_size
             || self.last_send_time.is_none()
         {
-            if self.rtt == 0 {
+            if self.rtt.is_zero() {
                 return 10240;
             }
-            ((self.bps * self.rtt * CONGESTION_WINDOW_MULTIPLIER) as f64
-                / self.ack_rate) as u64
+            congestion_window(self.bps, self.rtt, self.ack_rate)
         } else {
             0
         }
@@ -143,17 +158,11 @@ impl Controller for Burtal {
         let current_lost_packet_num = self.sess.stats().path.lost_packets;
         let t = sent.elapsed().as_secs();
         let idx = (t % SLOT_COUNT) as usize;
-        if self.slots[idx].time != t {
-            self.slots[idx].time = t;
-            self.slots[idx].lost =
-                current_lost_packet_num - self.last_lost_packet_num;
-            self.slots[idx].ack = self.ack;
-        } else {
-            self.slots[idx].time = t;
-            self.slots[idx].lost +=
-                current_lost_packet_num - self.last_lost_packet_num;
-            self.ack += self.ack;
-        }
+        self.slots[idx].record(
+            t,
+            current_lost_packet_num - self.last_lost_packet_num,
+            self.ack,
+        );
 
         self.last_lost_packet_num = current_lost_packet_num;
         self.ack = 0;
@@ -185,7 +194,7 @@ impl Controller for Burtal {
         _app_limited: bool,
         rtt: &quinn_proto::RttEstimator,
     ) {
-        self.rtt = rtt.get().as_secs();
+        self.rtt = rtt.get();
         self.ack += 1;
     }
 
@@ -195,6 +204,29 @@ impl Controller for Burtal {
 
     fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
         unreachable!()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::{SlotInfo, congestion_window};
+
+    #[test]
+    fn congestion_vector_keeps_subsecond_rtt_and_accumulates_new_acks() {
+        assert_eq!(
+            congestion_window(100_000, Duration::from_millis(100), 1.0),
+            20_000
+        );
+
+        let mut slot = SlotInfo {
+            time: 1,
+            lost: 2,
+            ack: 3,
+        };
+        slot.record(1, 4, 5);
+        assert_eq!((slot.lost, slot.ack), (6, 8));
     }
 }
 

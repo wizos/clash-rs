@@ -132,7 +132,7 @@ impl<Side> Connection<Side> {
 
         let model = self.model.send_packet(assoc_id, addr, max_pkt_size);
 
-        for (header, frag) in model.into_fragments(pkt.as_ref()) {
+        for (header, frag) in model.into_fragments(pkt.as_ref())? {
             let mut buf = BytesMut::with_capacity(header.len() + frag.len());
             header.write(&mut buf);
             buf.put_slice(frag);
@@ -151,7 +151,7 @@ impl<Side> Connection<Side> {
     ) -> eyre::Result<()> {
         let model = self.model.send_packet(assoc_id, addr, u16::MAX as usize);
 
-        for (header, frag) in model.into_fragments(pkt.as_ref()) {
+        for (header, frag) in model.into_fragments(pkt.as_ref())? {
             let mut send = self.conn.open_uni().await?;
             header.async_marshal(&mut send).await?;
             send.write_all(frag).await?;
@@ -317,19 +317,15 @@ impl Connection<side::Client> {
             Header::Packet(pkt) => {
                 if let Some(inner_pkt) = self.model.recv_packet(pkt.clone()) {
                     let pos = dg.position() as usize;
-                    let mut buf = dg.into_inner();
-                    if (pos + inner_pkt.size() as usize) <= buf.len() {
-                        buf = buf.slice(pos..pos + inner_pkt.size() as usize);
-                        Ok(Task::Packet(Packet::new(
-                            inner_pkt,
-                            PacketSource::Native(buf),
-                        )))
-                    } else {
-                        Err(Error::PayloadLength(
-                            inner_pkt.size() as usize,
-                            buf.len() - pos,
-                        ))
-                    }
+                    let buf = packet_payload(
+                        dg.into_inner(),
+                        pos,
+                        inner_pkt.size() as usize,
+                    )?;
+                    Ok(Task::Packet(Packet::new(
+                        inner_pkt,
+                        PacketSource::Native(buf),
+                    )))
                 } else {
                     Err(Error::InvalidUdpSession(pkt.assoc_id(), pkt.pkt_id()))
                 }
@@ -438,7 +434,8 @@ impl Connection<side::Server> {
             Header::Packet(pkt) => {
                 let model = self.model.recv_packet_unrestricted(pkt);
                 let pos = dg.position() as usize;
-                let buf = dg.into_inner().slice(pos..pos + model.size() as usize);
+                let buf =
+                    packet_payload(dg.into_inner(), pos, model.size() as usize)?;
                 Ok(Task::Packet(Packet::new(model, PacketSource::Native(buf))))
             }
             Header::Dissociate(_) => {
@@ -449,6 +446,29 @@ impl Connection<side::Server> {
                 Ok(Task::Heartbeat)
             }
         }
+    }
+}
+
+fn packet_payload(buf: Bytes, pos: usize, size: usize) -> Result<Bytes, Error> {
+    let end = pos
+        .checked_add(size)
+        .filter(|end| *end <= buf.len())
+        .ok_or_else(|| Error::PayloadLength(size, buf.len().saturating_sub(pos)))?;
+    Ok(buf.slice(pos..end))
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+
+    use super::{Error, packet_payload};
+
+    #[test]
+    fn rejects_truncated_datagram_payload() {
+        assert!(matches!(
+            packet_payload(Bytes::from_static(b"header"), 2, 10),
+            Err(Error::PayloadLength(10, 4)),
+        ));
     }
 }
 

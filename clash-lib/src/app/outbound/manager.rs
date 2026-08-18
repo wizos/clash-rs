@@ -362,7 +362,17 @@ impl OutboundManager {
         if required.is_empty() {
             return Ok(());
         }
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let missing = required
+            .iter()
+            .filter(|name| !self.proxy_providers.contains_key(*name))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(Error::Operation(format!(
+                "required proxy provider unavailable: {}",
+                missing.join("; ")
+            )));
+        }
         let providers = {
             let mut started = self.started_proxy_providers.lock();
             self.proxy_providers
@@ -373,9 +383,8 @@ impl OutboundManager {
                 .map(|(_, provider)| provider.clone())
                 .collect::<Vec<_>>()
         };
-        for provider in providers {
-            let tx = tx.clone();
-            tokio::spawn(async move {
+        let results = futures::future::join_all(providers.into_iter().map(
+            |provider| async move {
                 let name = provider.name().to_owned();
                 info!("initializing proxy provider {name}");
                 let result = provider.initialize().await;
@@ -384,22 +393,26 @@ impl OutboundManager {
                 } else {
                     info!("initialized proxy provider {name}");
                 }
-                let _ = tx.send((name, result));
-            });
-        }
-        drop(tx);
+                (name, result)
+            },
+        ))
+        .await;
 
         let mut failures = Vec::new();
-        while let Some((name, result)) = rx.recv().await {
-            if !required.contains(&name) {
-                continue;
+        let mut failed_names = Vec::new();
+        for (name, result) in results {
+            if let Err(error) = result {
+                failures.push(format!("{name}: {error}"));
+                failed_names.push(name);
             }
-            match result {
-                Ok(()) => return Ok(()),
-                Err(error) => failures.push(format!("{name}: {error}")),
-            }
-            if failures.len() == required.len() {
-                break;
+        }
+        if failures.is_empty() {
+            return Ok(());
+        }
+        {
+            let mut started = self.started_proxy_providers.lock();
+            for name in failed_names {
+                started.remove(&name);
             }
         }
         Err(Error::Operation(format!(
@@ -810,6 +823,41 @@ mod tests {
 
         assert!(manager.get_provider_proxy("provider-proxy").await.is_some());
         assert!(manager.get_proxies().await.contains_key("provider-proxy"));
+    }
+
+    #[tokio::test]
+    async fn required_providers_all_finish_and_failures_can_retry() {
+        let mut ready = MockDummyProxyProvider::new();
+        ready.expect_name().return_const("ready".to_owned());
+        ready.expect_initialize().times(1).returning(|| Ok(()));
+
+        let mut failing = MockDummyProxyProvider::new();
+        failing.expect_name().return_const("failing".to_owned());
+        failing
+            .expect_initialize()
+            .times(2)
+            .returning(|| Err(std::io::Error::other("unavailable")));
+
+        let manager = OutboundManager {
+            registry: Arc::new(RwLock::new(HashMap::new())),
+            proxy_providers: HashMap::from([
+                ("ready".to_owned(), Arc::new(ready) as ArcProxyProvider),
+                ("failing".to_owned(), Arc::new(failing) as ArcProxyProvider),
+            ]),
+            proxy_manager: ProxyManager::new(
+                Arc::new(MockClashResolver::new()),
+                None,
+            ),
+            selector_control: HashMap::new(),
+            started_proxy_providers: Mutex::new(HashSet::new()),
+        };
+        let required = HashSet::from(["ready".to_owned(), "failing".to_owned()]);
+
+        assert!(manager.initialize_proxy_providers(&required).await.is_err());
+        assert!(manager.initialize_proxy_providers(&required).await.is_err());
+        let started = manager.started_proxy_providers.lock();
+        assert!(started.contains("ready"));
+        assert!(!started.contains("failing"));
     }
 }
 

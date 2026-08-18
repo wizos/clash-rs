@@ -93,6 +93,14 @@ pub struct Handler {
     proxy_manager: ProxyManager,
     /// Centralized state management
     smart_state: Arc<tokio::sync::Mutex<SmartState>>,
+    /// Periodic persistence belongs to this handler and must stop on reload.
+    persistence_task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Handler {
+    fn drop(&mut self) {
+        self.persistence_task.abort();
+    }
 }
 
 impl std::fmt::Debug for Handler {
@@ -149,19 +157,14 @@ impl Handler {
         });
         let smart_state = rx.recv().expect("Failed to receive smart state");
 
-        let handler = Self {
-            opts,
-            providers,
-            proxy_manager,
-            smart_state: Arc::new(tokio::sync::Mutex::new(smart_state)),
-        };
+        let smart_state = Arc::new(tokio::sync::Mutex::new(smart_state));
 
         // Set up periodic persistence for smart_stats
         let cache_store_clone = cache_store;
         let group_name_clone = group_name;
-        let state_clone = Arc::clone(&handler.smart_state);
+        let state_clone = Arc::clone(&smart_state);
 
-        tokio::spawn(async move {
+        let persistence_task = tokio::spawn(async move {
             let mut interval =
                 tokio::time::interval(tokio::time::Duration::from_secs(30));
             loop {
@@ -178,7 +181,13 @@ impl Handler {
             }
         });
 
-        handler
+        Self {
+            opts,
+            providers,
+            proxy_manager,
+            smart_state,
+            persistence_task,
+        }
     }
 
     /// Get all available proxies from providers
@@ -237,32 +246,35 @@ impl Handler {
                 SmartState::generate_session_id(sess)
             );
         }
+        let scoring_state =
+            SmartState::new_with_imported_data(Some(state_guard.export_data()));
 
-        // Drop the lock temporarily to call get_site_tuning
         drop(state_guard);
         let site_tuning = self.proxy_manager.get_site_tuning(&enhanced_sess).await;
-        let state_guard = self.smart_state.lock().await;
+
+        let measurements =
+            futures::future::join_all(proxies.into_iter().map(|proxy| async {
+                let name = proxy.name().to_string();
+                let (delay, packet_loss, rtt, alive) = tokio::join!(
+                    self.proxy_manager.last_delay(&name),
+                    self.proxy_manager.get_packet_loss(&name),
+                    self.proxy_manager.get_rtt(&name),
+                    self.proxy_manager.alive(&name),
+                );
+                (
+                    proxy,
+                    name,
+                    delay.map(|value| value.as_millis_f64()).unwrap_or(9999.0),
+                    packet_loss.unwrap_or(1.0),
+                    rtt.unwrap_or(9999.0),
+                    alive,
+                )
+            }))
+            .await;
 
         let mut candidates: Vec<(f64, AnyOutboundHandler, String)> = Vec::new();
 
-        for proxy in proxies {
-            let name = proxy.name().to_string();
-
-            // Get basic metrics from proxy manager
-            let delay = self
-                .proxy_manager
-                .last_delay(&name)
-                .await
-                .map(|d| d.as_millis_f64())
-                .unwrap_or(9999.0);
-            let packet_loss = self
-                .proxy_manager
-                .get_packet_loss(&name)
-                .await
-                .unwrap_or(1.0);
-            let rtt = self.proxy_manager.get_rtt(&name).await.unwrap_or(9999.0);
-            let alive = self.proxy_manager.alive(&name).await;
-
+        for (proxy, name, delay, packet_loss, rtt, alive) in measurements {
             debug!(
                 "{} proxy {} metrics - delay: {:.1}ms, loss: {:.1}%, rtt: {:.1}ms, \
                  alive: {}",
@@ -294,7 +306,7 @@ impl Handler {
             );
 
             // Get historical performance data
-            let site_stats = state_guard.get_site_stats(&name, &site).map(|s| {
+            let site_stats = scoring_state.get_site_stats(&name, &site).map(|s| {
                 (
                     s.get_delay_score(),
                     s.success_rate(),
@@ -304,7 +316,7 @@ impl Handler {
             });
 
             let ip_stats = dest_ip.as_ref().and_then(|ip| {
-                state_guard.get_site_stats(&name, ip).map(|s| {
+                scoring_state.get_site_stats(&name, ip).map(|s| {
                     (
                         s.get_delay_score(),
                         s.success_rate(),
@@ -349,7 +361,7 @@ impl Handler {
             }
 
             // Apply penalty scores
-            let penalty_score = state_guard
+            let penalty_score = scoring_state
                 .get_penalty(&name)
                 .map(|p| p.value())
                 .unwrap_or(0.0);
@@ -742,6 +754,110 @@ impl GroupProxyAPIResponse for Handler {
 
     fn icon(&self) -> Option<String> {
         self.opts.common_opts.icon.clone()
+    }
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::{Handler, HandlerOptions, SmartState};
+    use crate::{
+        app::{profile::ThreadSafeCacheFile, remote_content_manager::ProxyManager},
+        proxy::utils::test_utils::noop::NoopResolver,
+        session::Session,
+    };
+    use std::{sync::Arc, time::Duration};
+
+    #[tokio::test]
+    async fn metric_collection_does_not_hold_smart_state_lock() {
+        let handler = Handler {
+            opts: HandlerOptions {
+                name: "smart-lock-test".to_owned(),
+                ..Default::default()
+            },
+            providers: Vec::new(),
+            proxy_manager: ProxyManager::new(Arc::new(NoopResolver), None),
+            smart_state: Arc::new(tokio::sync::Mutex::new(SmartState::new())),
+            persistence_task: tokio::spawn(async {}),
+        };
+        let metrics_guard = handler.proxy_manager.lock_metrics_for_test().await;
+        let session = Session::default();
+        let selection = handler.pick_smart(&session);
+        tokio::pin!(selection);
+
+        tokio::select! {
+            _ = &mut selection => panic!("selection should be waiting for proxy metrics"),
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        let state_guard = tokio::time::timeout(
+            Duration::from_millis(100),
+            handler.smart_state.lock(),
+        )
+        .await
+        .expect("proxy metrics must be collected without the smart-state lock");
+
+        drop(metrics_guard);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut selection)
+                .await
+                .expect("snapshot scoring must not reacquire smart-state")
+                .is_some()
+        );
+        drop(state_guard);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn persistence_stops_after_last_handler_owner_is_dropped() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cache_path = temp_dir.path().join("smart-owner-cache.db");
+        let cache =
+            ThreadSafeCacheFile::new(cache_path.to_string_lossy().as_ref(), false);
+        let group_name = "smart-owner-test";
+        let handler = Arc::new(Handler::new_with_cache(
+            HandlerOptions {
+                name: group_name.to_owned(),
+                ..Default::default()
+            },
+            Vec::new(),
+            ProxyManager::new(Arc::new(NoopResolver), None),
+            cache.clone(),
+        ));
+        let remaining_owner = handler.clone();
+        let state = Arc::clone(&handler.smart_state);
+
+        tokio::task::yield_now().await;
+        drop(handler);
+        state
+            .lock()
+            .await
+            .site_stats
+            .insert("before-last-drop".to_owned(), Default::default());
+        tokio::time::advance(Duration::from_secs(30)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            cache
+                .get_smart_stats(group_name)
+                .await
+                .expect("live owner must keep persistence running")
+                .site_stats
+                .contains_key("before-last-drop")
+        );
+
+        drop(remaining_owner);
+        state
+            .lock()
+            .await
+            .site_stats
+            .insert("after-last-drop".to_owned(), Default::default());
+        tokio::time::advance(Duration::from_secs(30)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !cache
+                .get_smart_stats(group_name)
+                .await
+                .expect("the last persisted snapshot must remain available")
+                .site_stats
+                .contains_key("after-last-drop")
+        );
     }
 }
 

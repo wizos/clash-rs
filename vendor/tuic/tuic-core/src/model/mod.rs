@@ -35,7 +35,7 @@ pub use self::{
     connect::Connect,
     dissociate::Dissociate,
     heartbeat::Heartbeat,
-    packet::{Fragments, Packet},
+    packet::{FragmentError, Fragments, Packet},
 };
 
 /// An abstraction of a TUIC connection, with packet fragmentation management
@@ -449,7 +449,19 @@ where
         addr: Address,
         data: B,
     ) -> Result<Option<Assemblable<B>>, AssembleError> {
-        assert_eq!(data.as_ref().len(), size as usize);
+        if data.as_ref().len() != size as usize {
+            return Err(AssembleError::PayloadLength(
+                size as usize,
+                data.as_ref().len(),
+            ));
+        }
+
+        if frag_total != self.frag_total {
+            return Err(AssembleError::FragmentTotalMismatch(
+                self.frag_total,
+                frag_total,
+            ));
+        }
 
         if frag_id >= frag_total {
             return Err(AssembleError::InvalidFragmentId(frag_total, frag_id));
@@ -543,6 +555,10 @@ where
 /// An error that can occur when assembling a packet
 #[derive(Debug, Error)]
 pub enum AssembleError {
+    #[error("expecting payload length {0} but got {1}")]
+    PayloadLength(usize, usize),
+    #[error("expecting {0} fragments but got {1}")]
+    FragmentTotalMismatch(u8, u8),
     #[error("invalid fragment id {1} in total {0} fragments")]
     InvalidFragmentId(u8, u8),
     #[error("{0}")]

@@ -617,9 +617,11 @@ where
                     } else {
                         match this.aead_read_cipher {
                             Some(ref mut cipher) => {
+                                let data_len = aead_payload_len(
+                                    data_size,
+                                    cipher.security.overhead_len(),
+                                )?;
                                 cipher.decrypt_inplace(&mut this.read_buf)?;
-                                let data_len =
-                                    data_size - cipher.security.overhead_len();
                                 this.read_buf.truncate(data_len);
                                 this.read_state =
                                     ReadState::StreamFlushingData(data_len);
@@ -862,6 +864,15 @@ fn fnv1a32(data: &[u8]) -> u32 {
     hash
 }
 
+fn aead_payload_len(wire_size: usize, overhead: usize) -> std::io::Result<usize> {
+    wire_size.checked_sub(overhead).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "VMess AEAD chunk is shorter than its authentication tag",
+        )
+    })
+}
+
 fn hash_timestamp(timestamp: u64) -> [u8; 16] {
     use md5::Digest;
     let mut hasher = md5::Md5::new();
@@ -988,5 +999,13 @@ mod tests {
                 .unwrap();
         decrypt.decrypt_inplace(&mut encrypted).unwrap();
         assert_eq!(&encrypted[..2], &[0x12, 0x34]);
+    }
+
+    #[test]
+    fn short_aead_chunk_is_invalid_data() {
+        for wire_size in 1..16 {
+            let error = aead_payload_len(wire_size, 16).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        }
     }
 }

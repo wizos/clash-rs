@@ -105,15 +105,27 @@ impl TunRunner {
                 "fd" => {
                     let fd = u
                         .host()
-                        .expect("tun fd must be provided")
+                        .ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "invalid device id: {}. tun fd must be provided",
+                                cfg.device_id
+                            ))
+                        })?
                         .to_string()
                         .parse()
                         .map_err(|x| Error::InvalidConfig(format!("tun fd {x}")))?;
                     tun_init_config.fd = Some(fd);
                 }
                 "dev" => {
-                    let dev =
-                        u.host().expect("tun dev must be provided").to_string();
+                    let dev = u
+                        .host()
+                        .ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "invalid device id: {}. tun dev must be provided",
+                                cfg.device_id
+                            ))
+                        })?
+                        .to_string();
                     if cfg!(target_os = "macos") && !dev.starts_with("utun") {
                         return Err(Error::InvalidConfig(format!(
                             "invalid device id: {}. tun name must be utunX",
@@ -172,8 +184,12 @@ impl TunRunner {
                     use network_interface::NetworkInterfaceConfig;
                     use tun_rs::DeviceBuilder;
 
-                    let tun_name =
-                        tun_init_config.tun_name.expect("tun name must be provided");
+                    let tun_name = tun_init_config.tun_name.ok_or_else(|| {
+                        Error::InvalidConfig(format!(
+                            "invalid device id: {}. tun name must be provided",
+                            cfg.device_id
+                        ))
+                    })?;
                     let tun_exist = network_interface::NetworkInterface::show()
                         .map(|ifs| ifs.into_iter().any(|x| x.name == tun_name))
                         .unwrap_or_default();
@@ -324,6 +340,7 @@ impl TunRunner {
 #[cfg(all(test, target_family = "unix"))]
 mod fd_tests {
     use super::TunRunner;
+    use crate::{Error, config::config::TunConfig};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
     #[test]
@@ -335,6 +352,22 @@ mod fd_tests {
         assert_ne!(duplicate, original);
         drop(unsafe { OwnedFd::from_raw_fd(duplicate) });
         assert_ne!(unsafe { libc::fcntl(original, libc::F_GETFD) }, -1);
+    }
+
+    #[tokio::test]
+    async fn missing_tun_device_identifier_returns_config_error() {
+        for device_id in ["fd:path", "dev:path"] {
+            let config = TunConfig {
+                enable: true,
+                device_id: device_id.to_owned(),
+                ..Default::default()
+            };
+
+            assert!(matches!(
+                TunRunner::new_internal(&config).await,
+                Err(Error::InvalidConfig(_))
+            ));
+        }
     }
 }
 

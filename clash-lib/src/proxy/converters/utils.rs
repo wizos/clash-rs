@@ -111,7 +111,7 @@ impl TryFrom<(Option<String>, &GrpcOpt, &CommonConfigOptions)> for GrpcClient {
 }
 
 impl TryFrom<(&H2Opt, &CommonConfigOptions)> for H2Client {
-    type Error = InvalidUri;
+    type Error = Error;
 
     fn try_from(pair: (&H2Opt, &CommonConfigOptions)) -> Result<Self, Self::Error> {
         let (x, common) = pair;
@@ -120,13 +120,20 @@ impl TryFrom<(&H2Opt, &CommonConfigOptions)> for H2Client {
             .as_ref()
             .map(|x| x.to_owned())
             .unwrap_or(vec![common.server.to_owned()]);
+        if host.is_empty() {
+            return Err(Error::InvalidConfig(
+                "h2 host list must not be empty".to_owned(),
+            ));
+        }
         let path = x.path.as_ref().map(|x| x.to_owned()).unwrap_or_default();
 
         Ok(H2Client::new(
             host,
             std::collections::HashMap::new(),
             http::Method::GET,
-            path.try_into()?,
+            path.try_into().map_err(|error: InvalidUri| {
+                Error::InvalidConfig(format!("invalid h2 path: {error}"))
+            })?,
         ))
     }
 }
@@ -150,7 +157,7 @@ pub fn decode_short_id(hex_short_id: &str) -> Result<Vec<u8>, Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::tls_alpn_for_network;
+    use super::{CommonConfigOptions, H2Client, H2Opt, tls_alpn_for_network};
 
     #[test]
     fn websocket_requires_http_1_1_alpn() {
@@ -164,6 +171,18 @@ mod tests {
                 ]),
             ),
             Some(vec!["http/1.1".to_owned()]),
+        );
+    }
+
+    #[test]
+    fn h2_rejects_an_explicit_empty_host_list() {
+        let options = H2Opt {
+            host: Some(Vec::new()),
+            path: None,
+        };
+
+        assert!(
+            H2Client::try_from((&options, &CommonConfigOptions::default())).is_err()
         );
     }
 }

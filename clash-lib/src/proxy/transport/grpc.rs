@@ -129,6 +129,14 @@ impl Debug for GrpcStream {
     }
 }
 
+fn validate_frame_eof(payload_len: usize, buffered: usize) -> io::Result<()> {
+    if payload_len == 0 && buffered == 0 {
+        Ok(())
+    } else {
+        Err(Error::new(ErrorKind::UnexpectedEof, "truncated grpc frame"))
+    }
+}
+
 impl GrpcStream {
     pub fn new(
         init_ready: mpsc::Receiver<()>,
@@ -246,14 +254,36 @@ impl AsyncRead for GrpcStream {
                     )
             }
             _ => {
-                assert_eq!(self.payload_len, 0);
                 if recv.as_mut().unwrap().is_end_stream() {
-                    Poll::Ready(Ok(()))
+                    Poll::Ready(validate_frame_eof(
+                        self.payload_len,
+                        self.buffer.len(),
+                    ))
                 } else {
                     Poll::Pending
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::ErrorKind;
+
+    use super::validate_frame_eof;
+
+    #[test]
+    fn truncated_frame_eof_is_a_connection_error() {
+        assert_eq!(
+            validate_frame_eof(3, 0).unwrap_err().kind(),
+            ErrorKind::UnexpectedEof
+        );
+        assert_eq!(
+            validate_frame_eof(0, 3).unwrap_err().kind(),
+            ErrorKind::UnexpectedEof
+        );
+        assert!(validate_frame_eof(0, 0).is_ok());
     }
 }
 

@@ -224,6 +224,11 @@ impl ProxyManager {
         self.unified_delay.store(enabled, Ordering::Relaxed);
     }
 
+    #[cfg(test)]
+    pub(crate) async fn lock_metrics_for_test(&self) -> impl Send + '_ {
+        self.proxy_state.write().await
+    }
+
     pub async fn set_healthcheck_concurrency(
         &self,
         concurrency: usize,

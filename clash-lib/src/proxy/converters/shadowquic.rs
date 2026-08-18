@@ -45,7 +45,7 @@ impl TryFrom<&OutboundShadowQuic> for Handler {
                 keep_alive_interval: s
                     .keep_alive_interval
                     .unwrap_or(default_keep_alive_interval()),
-                blackhole_detection: default_blackhole_detection(),
+                blackhole_detection: configured_blackhole_detection(s),
 
                 protect_path: None,
                 socket_opt: Default::default(),
@@ -54,5 +54,28 @@ impl TryFrom<&OutboundShadowQuic> for Handler {
                 cipher_suite_preference: None,
             },
         ))
+    }
+}
+
+fn configured_blackhole_detection(s: &OutboundShadowQuic) -> bool {
+    s.blackhole_detection
+        .unwrap_or(default_blackhole_detection())
+}
+
+#[cfg(test)]
+mod tests {
+    use shadowquic::config::default_blackhole_detection;
+
+    use super::{OutboundShadowQuic, configured_blackhole_detection};
+
+    #[test]
+    fn preserves_configured_blackhole_detection() {
+        let requested = !default_blackhole_detection();
+        let outbound: OutboundShadowQuic = serde_yaml::from_str(&format!(
+            "name: shadowquic\nserver: example.com\nport: 443\npassword: secret\nusername: user\nserver-name: example.com\nblackhole-detection: {requested}\n",
+        ))
+        .unwrap();
+
+        assert_eq!(configured_blackhole_detection(&outbound), requested);
     }
 }

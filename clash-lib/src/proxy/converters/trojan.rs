@@ -122,21 +122,25 @@ impl TryFrom<&OutboundTrojan> for Handler {
                 .filter(|network| !matches!(network.as_str(), "" | "tcp"))
                 .map(|x| match x.as_str() {
                     "ws" => {
-                        let client: WsClient = (s.ws_opts.as_ref(), &s.common_opts)
-                            .try_into()
-                            .expect("invalid ws_opts");
+                        let client: WsClient =
+                            (s.ws_opts.as_ref(), &s.common_opts).try_into()?;
                         Ok(Box::new(client) as _)
                     }
                     "grpc" => s
                         .grpc_opts
                         .as_ref()
-                        .map(|x| {
+                        .map(|x| -> Result<Box<dyn Transport>, Error> {
                             let client: GrpcClient =
                                 (s.sni.clone(), x, &s.common_opts)
                                     .try_into()
-                                    .expect("invalid grpc_opts");
-                            Box::new(client) as _
+                                    .map_err(|error| {
+                                        Error::InvalidConfig(format!(
+                                            "invalid grpc_opts: {error}"
+                                        ))
+                                    })?;
+                            Ok(Box::new(client))
                         })
+                        .transpose()?
                         .ok_or(Error::InvalidConfig(
                             "grpc_opts is required for grpc".to_owned(),
                         )),
@@ -149,5 +153,35 @@ impl TryFrom<&OutboundTrojan> for Handler {
             ss_cipher,
         });
         Ok(h)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::internal::proxy::{CommonConfigOptions, GrpcOpt};
+
+    #[test]
+    fn invalid_grpc_uri_returns_config_error() {
+        crate::setup_default_crypto_provider();
+        let config = OutboundTrojan {
+            common_opts: CommonConfigOptions {
+                name: "trojan-grpc".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                ..Default::default()
+            },
+            password: "password".to_owned(),
+            network: Some("grpc".to_owned()),
+            grpc_opts: Some(GrpcOpt {
+                grpc_service_name: Some("invalid service".to_owned()),
+            }),
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            Handler::try_from(&config),
+            Err(Error::InvalidConfig(message)) if message.contains("invalid grpc_opts")
+        ));
     }
 }

@@ -23,6 +23,18 @@ pub type StrategyFn = Box<
         + Sync,
 >;
 
+fn require_proxies(mut strategy: StrategyFn) -> StrategyFn {
+    Box::new(move |proxies, sess| {
+        if proxies.is_empty() {
+            Box::pin(futures::future::err(std::io::Error::other(
+                "no proxy available",
+            )))
+        } else {
+            strategy(proxies, sess)
+        }
+    })
+}
+
 fn get_key(sess: &Session) -> String {
     match &sess.destination {
         crate::session::SocksAddr::Ip(addr) => addr.ip().to_string(),
@@ -56,16 +68,18 @@ fn jump_hash(key: u64, buckets: i32) -> i32 {
 
 pub fn strategy_rr() -> StrategyFn {
     let mut index = 0;
-    Box::new(move |proxies: Vec<AnyOutboundHandler>, _: &Session| {
-        let len = proxies.len();
-        index = (index + 1) % len;
-        Box::pin(futures::future::ok(proxies[index].clone()))
-    })
+    require_proxies(Box::new(
+        move |proxies: Vec<AnyOutboundHandler>, _: &Session| {
+            let len = proxies.len();
+            index = (index + 1) % len;
+            Box::pin(futures::future::ok(proxies[index].clone()))
+        },
+    ))
 }
 
 pub fn strategy_consistent_hashring() -> StrategyFn {
     let max_retry = 5;
-    Box::new(move |proxies, sess| {
+    require_proxies(Box::new(move |proxies, sess| {
         let key = murmur3_32(&mut Cursor::new(get_key(sess)), 0).unwrap() as u64;
         let buckets = proxies.len() as i32;
         for _ in 0..max_retry {
@@ -77,7 +91,7 @@ pub fn strategy_consistent_hashring() -> StrategyFn {
         Box::pin(futures::future::err(std::io::Error::other(
             "no proxy found",
         )))
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -99,7 +113,7 @@ pub fn strategy_sticky_session(proxy_manager: ProxyManager) -> StrategyFn {
             1024,
         );
     let lru_cache = Arc::new(Mutex::new(lru_cache));
-    Box::new(move |proxies, sess| {
+    require_proxies(Box::new(move |proxies, sess| {
         let key_str = get_key_src_and_dst(sess);
         let key = murmur3_32(&mut Cursor::new(&key_str), 0).unwrap() as u64;
         let proxy_manager_clone = proxy_manager.clone();
@@ -161,7 +175,7 @@ pub fn strategy_sticky_session(proxy_manager: ProxyManager) -> StrategyFn {
             }
             Err(std::io::Error::other("no proxy found"))
         })
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -185,6 +199,22 @@ mod tests {
                 $state
             );
         };
+    }
+
+    #[tokio::test]
+    async fn all_strategies_reject_an_empty_proxy_list() {
+        let resolver = Arc::new(NoopResolver);
+        let manager = ProxyManager::new(resolver, None);
+        let strategies = [
+            strategy_rr(),
+            strategy_consistent_hashring(),
+            strategy_sticky_session(manager),
+        ];
+
+        for mut strategy in strategies {
+            let error = strategy(Vec::new(), &Session::default()).await.unwrap_err();
+            assert_eq!(error.to_string(), "no proxy available");
+        }
     }
 
     #[tokio::test]

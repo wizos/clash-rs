@@ -4,6 +4,7 @@ use std::{
 };
 
 use parking_lot::Mutex;
+use thiserror::Error;
 
 use super::{
     Assemblable, AssembleError, UdpSessions,
@@ -42,7 +43,10 @@ impl<B> Packet<side::Tx, B> {
     }
 
     /// Fragment the payload into multiple packets
-    pub fn into_fragments<'a>(self, payload: &'a [u8]) -> Fragments<'a>
+    pub fn into_fragments<'a>(
+        self,
+        payload: &'a [u8],
+    ) -> Result<Fragments<'a>, FragmentError>
 where {
         let Side::Tx(tx) = self.inner else {
             unreachable!()
@@ -223,6 +227,19 @@ pub struct Fragments<'a> {
     payload: &'a [u8],
 }
 
+#[derive(Debug, Error)]
+pub enum FragmentError {
+    #[error(
+        "maximum packet size {max_pkt_size} is smaller than header {header_size}"
+    )]
+    PacketSizeTooSmall {
+        max_pkt_size: usize,
+        header_size: usize,
+    },
+    #[error("packet requires {0} fragments, maximum is 255")]
+    TooManyFragments(usize),
+}
+
 impl<'a> Fragments<'a> {
     fn new(
         assoc_id: u16,
@@ -230,14 +247,19 @@ impl<'a> Fragments<'a> {
         addr: Address,
         max_pkt_size: usize,
         payload: &'a [u8],
-    ) -> Self {
+    ) -> Result<Self, FragmentError> {
         let header_addr_ref = Header::Packet(PacketHeader::new(0, 0, 0, 0, 0, addr));
         let header_addr_none_ref =
             Header::Packet(PacketHeader::new(0, 0, 0, 0, 0, Address::None));
 
-        let first_frag_size = max_pkt_size - header_addr_ref.len();
-        let frag_size_addr_none = max_pkt_size - header_addr_none_ref.len();
-
+        let first_header_size = header_addr_ref.len();
+        let first_frag_size = max_pkt_size
+            .checked_sub(first_header_size)
+            .ok_or(FragmentError::PacketSizeTooSmall {
+                max_pkt_size,
+                header_size: first_header_size,
+            })?
+            .min(u16::MAX as usize);
         let Header::Packet(pkt) = header_addr_ref else {
             unreachable!()
         };
@@ -245,13 +267,23 @@ impl<'a> Fragments<'a> {
 
         let remaining = payload.len().saturating_sub(first_frag_size);
         let frag_total = if remaining > 0 {
-            let n = 1 + remaining.div_ceil(frag_size_addr_none);
-            n.min(u8::MAX as usize) as u8
+            let next_header_size = header_addr_none_ref.len();
+            let frag_size_addr_none = max_pkt_size
+                .checked_sub(next_header_size)
+                .filter(|size| *size > 0)
+                .ok_or(FragmentError::PacketSizeTooSmall {
+                    max_pkt_size,
+                    header_size: next_header_size,
+                })?
+                .min(u16::MAX as usize);
+            1 + remaining.div_ceil(frag_size_addr_none)
         } else {
-            1u8
+            1
         };
+        let frag_total = u8::try_from(frag_total)
+            .map_err(|_| FragmentError::TooManyFragments(frag_total))?;
 
-        Self {
+        Ok(Self {
             assoc_id,
             pkt_id,
             addr,
@@ -260,7 +292,7 @@ impl<'a> Fragments<'a> {
             next_frag_id: 0,
             next_frag_start: 0,
             payload,
-        }
+        })
     }
 }
 
@@ -272,7 +304,8 @@ impl<'a> Iterator for Fragments<'a> {
             let header_ref =
                 Header::Packet(PacketHeader::new(0, 0, 0, 0, 0, self.addr.take()));
 
-            let payload_size = self.max_pkt_size - header_ref.len();
+            let payload_size =
+                (self.max_pkt_size - header_ref.len()).min(u16::MAX as usize);
             let next_frag_end = (self.next_frag_start + payload_size)
                 .min(self.payload.as_ref().len());
 

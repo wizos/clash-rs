@@ -413,6 +413,14 @@ impl TryFrom<&crate::config::def::Config> for Config {
             .map(parse_edns_client_subnet)
             .transpose()?;
 
+        let fake_ip_range =
+            dc.fake_ip_range.parse::<ipnet::IpNet>().map_err(|_| {
+                Error::InvalidConfig(String::from("invalid fake ip range"))
+            })?;
+        if matches!(dc.enhanced_mode, DNSMode::FakeIp) {
+            super::fakeip::FakeDns::validate_ipnet(fake_ip_range)?;
+        }
+
         Ok(Self {
             enable: dc.enable,
             ipv6: c.ipv6 && dc.ipv6,
@@ -506,9 +514,7 @@ impl TryFrom<&crate::config::def::Config> for Config {
             enhance_mode: dc.enhanced_mode.clone(),
             default_nameserver,
             proxy_server_nameserver,
-            fake_ip_range: dc.fake_ip_range.parse::<ipnet::IpNet>().map_err(
-                |_| Error::InvalidConfig(String::from("invalid fake ip range")),
-            )?,
+            fake_ip_range,
             fake_ip_filter: dc.fake_ip_filter.clone(),
             store_fake_ip: c.profile.store_fake_ip,
             store_smart_stats: c.profile.store_smart_stats,
@@ -651,5 +657,35 @@ mod tests {
 
         assert_eq!(parsed["geosite:gfw"].len(), 1);
         assert_eq!(parsed["geosite:geolocation-!cn"].len(), 1);
+    }
+
+    #[test]
+    fn fake_ip_mode_rejects_a_range_without_allocatable_hosts() {
+        let mut config = crate::config::def::Config::default();
+        config.dns.enhanced_mode = DNSMode::FakeIp;
+        config.dns.fake_ip_range = "192.0.2.0/31".to_owned();
+
+        let result = Config::try_from(&config);
+
+        assert!(matches!(
+            result,
+            Err(Error::InvalidConfig(message))
+                if message == "fake ip range has no allocatable addresses"
+        ));
+    }
+
+    #[test]
+    fn fake_ip_mode_rejects_ipv6_before_resolver_construction() {
+        let mut config = crate::config::def::Config::default();
+        config.dns.enhanced_mode = DNSMode::FakeIp;
+        config.dns.fake_ip_range = "2001:db8::/64".to_owned();
+
+        let result = Config::try_from(&config);
+
+        assert!(matches!(
+            result,
+            Err(Error::InvalidConfig(message))
+                if message == "fake ip range must be IPv4"
+        ));
     }
 }

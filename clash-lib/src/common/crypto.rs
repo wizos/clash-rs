@@ -73,7 +73,7 @@ pub fn aes_gcm_encrypt(
         16 => {
             let cipher = aes_gcm::Aes128Gcm::new_from_slice(key)?;
             let nonce = aes_gcm::aead::Nonce::<aes_gcm::Aes128Gcm>::try_from(nonce)
-                .expect("invalid nonce length");
+                .map_err(|_| anyhow!("invalid nonce length: {}", nonce.len()))?;
             cipher.encrypt_in_place(
                 &nonce,
                 associated_data.unwrap_or_default(),
@@ -83,7 +83,7 @@ pub fn aes_gcm_encrypt(
         32 => {
             let cipher = aes_gcm::Aes256Gcm::new_from_slice(key)?;
             let nonce = aes_gcm::aead::Nonce::<aes_gcm::Aes256Gcm>::try_from(nonce)
-                .expect("invalid nonce length");
+                .map_err(|_| anyhow!("invalid nonce length: {}", nonce.len()))?;
             cipher.encrypt_in_place(
                 &nonce,
                 associated_data.unwrap_or_default(),
@@ -107,7 +107,7 @@ pub fn aes_gcm_decrypt(
         16 => {
             let cipher = aes_gcm::Aes128Gcm::new_from_slice(key)?;
             let nonce = aes_gcm::aead::Nonce::<aes_gcm::Aes128Gcm>::try_from(nonce)
-                .expect("invalid nonce length");
+                .map_err(|_| anyhow!("invalid nonce length: {}", nonce.len()))?;
             cipher.decrypt_in_place(
                 &nonce,
                 associated_data.unwrap_or_default(),
@@ -117,7 +117,7 @@ pub fn aes_gcm_decrypt(
         32 => {
             let cipher = aes_gcm::Aes256Gcm::new_from_slice(key)?;
             let nonce = aes_gcm::aead::Nonce::<aes_gcm::Aes256Gcm>::try_from(nonce)
-                .expect("invalid nonce length");
+                .map_err(|_| anyhow!("invalid nonce length: {}", nonce.len()))?;
             cipher.decrypt_in_place(
                 &nonce,
                 associated_data.unwrap_or_default(),
@@ -176,12 +176,15 @@ impl AeadCipherHelper for aes_gcm::Aes128Gcm {
         aad: &[u8],
         buffer: &mut [u8],
     ) -> Result<(), aes_gcm::Error> {
+        if buffer.len() < AEAD_TAG_SIZE {
+            return Err(aes_gcm::Error);
+        }
         let nonce = aes_gcm::aead::Nonce::<Self>::try_from(nonce)
-            .expect("invalid nonce length");
+            .map_err(|_| aes_gcm::Error)?;
         let tag_pos = buffer.len() - AEAD_TAG_SIZE;
         let (msg, tag) = buffer.split_at_mut(tag_pos);
-        let tag =
-            aes_gcm::aead::Tag::<Self>::try_from(&*tag).expect("invalid tag length");
+        let tag = aes_gcm::aead::Tag::<Self>::try_from(&*tag)
+            .map_err(|_| aes_gcm::Error)?;
         self.decrypt_inout_detached(&nonce, aad, msg.into(), &tag)
     }
 }
@@ -213,12 +216,15 @@ impl AeadCipherHelper for aes_gcm::Aes256Gcm {
         aad: &[u8],
         buffer: &mut [u8],
     ) -> Result<(), aes_gcm::Error> {
+        if buffer.len() < AEAD_TAG_SIZE {
+            return Err(aes_gcm::Error);
+        }
         let nonce = aes_gcm::aead::Nonce::<Self>::try_from(nonce)
-            .expect("invalid nonce length");
+            .map_err(|_| aes_gcm::Error)?;
         let tag_pos = buffer.len() - AEAD_TAG_SIZE;
         let (msg, tag) = buffer.split_at_mut(tag_pos);
-        let tag =
-            aes_gcm::aead::Tag::<Self>::try_from(&*tag).expect("invalid tag length");
+        let tag = aes_gcm::aead::Tag::<Self>::try_from(&*tag)
+            .map_err(|_| aes_gcm::Error)?;
         self.decrypt_inout_detached(&nonce, aad, msg.into(), &tag)
     }
 }
@@ -252,6 +258,12 @@ impl AeadCipherHelper for chacha20poly1305::ChaCha20Poly1305 {
         buffer: &mut [u8],
     ) -> Result<(), aes_gcm::Error> {
         use chacha20poly1305::aead::AeadInPlace as _;
+        if buffer.len() < AEAD_TAG_SIZE {
+            return Err(aes_gcm::Error);
+        }
+        if nonce.len() != 12 {
+            return Err(aes_gcm::Error);
+        }
         let tag_pos = buffer.len() - AEAD_TAG_SIZE;
         let (msg, tag) = buffer.split_at_mut(tag_pos);
         self.decrypt_in_place_detached(
@@ -268,7 +280,7 @@ mod tests {
 
     use crate::common::{crypto::aes_gcm_decrypt, utils};
 
-    use super::{aes_cfb_encrypt, aes_gcm_encrypt};
+    use super::{AeadCipherHelper, aes_cfb_encrypt, aes_gcm_encrypt};
 
     #[test]
     fn test_aes_cfb_256() {
@@ -316,5 +328,44 @@ mod tests {
         let decrypted = aes_gcm_decrypt(key2, nonce, &encrypted, Some(ad));
 
         assert!(decrypted.is_err());
+    }
+
+    #[test]
+    fn invalid_gcm_nonce_returns_error() {
+        let key = [0; 16];
+        let invalid_nonce = [0; 11];
+
+        assert!(aes_gcm_encrypt(&key, &invalid_nonce, b"data", None).is_err());
+        assert!(aes_gcm_decrypt(&key, &invalid_nonce, &[0; 16], None).is_err());
+    }
+
+    #[test]
+    fn aead_decrypt_rejects_short_tag_and_invalid_nonce() {
+        let aes = <aes_gcm::Aes128Gcm as AeadCipherHelper>::new_with_slice(&[0; 16]);
+        let chacha =
+            <chacha20poly1305::ChaCha20Poly1305 as AeadCipherHelper>::new_with_slice(
+                &[0; 32],
+            );
+
+        for length in 0..16 {
+            let mut aes_buffer = vec![0; length];
+            assert!(
+                aes.decrypt_in_place_with_slice(&[0; 12], &[], &mut aes_buffer)
+                    .is_err()
+            );
+
+            let mut chacha_buffer = vec![0; length];
+            assert!(
+                chacha
+                    .decrypt_in_place_with_slice(&[0; 12], &[], &mut chacha_buffer,)
+                    .is_err()
+            );
+        }
+
+        let mut tagged_buffer = [0; 16];
+        assert!(
+            aes.decrypt_in_place_with_slice(&[0; 11], &[], &mut tagged_buffer)
+                .is_err()
+        );
     }
 }

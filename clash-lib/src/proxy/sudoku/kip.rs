@@ -48,7 +48,7 @@ pub(crate) const KIP_FEAT_ALL: u32 = KIP_FEAT_OPEN_TCP
 const USER_HASH_SIZE: usize = 8;
 const NONCE_SIZE: usize = 16;
 const PUB_SIZE: usize = 32;
-const KIP_MAX_PAYLOAD: usize = 64 * 1024;
+const KIP_MAX_PAYLOAD: usize = u16::MAX as usize;
 
 const ATYP_IPV4: u8 = 0x01;
 const ATYP_DOMAIN: u8 = 0x03;
@@ -66,10 +66,12 @@ where
     if payload.len() > KIP_MAX_PAYLOAD {
         bail!("sudoku/kip: payload too large: {}", payload.len());
     }
+    let payload_len =
+        u16::try_from(payload.len()).context("sudoku/kip: payload length")?;
     let mut hdr = [0u8; 6];
     hdr[..3].copy_from_slice(KIP_MAGIC);
     hdr[3] = typ;
-    hdr[4..].copy_from_slice(&(payload.len() as u16).to_be_bytes());
+    hdr[4..].copy_from_slice(&payload_len.to_be_bytes());
     w.write_all(&hdr)
         .await
         .context("sudoku/kip: write header")?;
@@ -325,6 +327,29 @@ mod tests {
     use std::net::SocketAddr;
 
     use super::*;
+
+    #[tokio::test]
+    async fn message_payload_respects_the_u16_wire_boundary() {
+        let payload = vec![0x5a; KIP_MAX_PAYLOAD];
+        let (mut writer, mut reader) = tokio::io::duplex(KIP_MAX_PAYLOAD + 6);
+        write_message(&mut writer, KIP_TYPE_OPEN_TCP, &payload)
+            .await
+            .unwrap();
+        let (typ, decoded) = read_message(&mut reader).await.unwrap();
+        assert_eq!(typ, KIP_TYPE_OPEN_TCP);
+        assert_eq!(decoded, payload);
+
+        let mut sink = tokio::io::sink();
+        assert!(
+            write_message(
+                &mut sink,
+                KIP_TYPE_OPEN_TCP,
+                &vec![0; KIP_MAX_PAYLOAD + 1]
+            )
+            .await
+            .is_err()
+        );
+    }
 
     #[test]
     fn encode_address_ipv4() {

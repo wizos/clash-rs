@@ -222,12 +222,13 @@ impl Auth for PublicKeyAuth {
         client: &mut Handle<Client>,
         username: &str,
     ) -> core::result::Result<AuthResult, russh::Error> {
+        let hash_alg = client.best_supported_rsa_hash().await?.flatten();
         client
             .authenticate_publickey(
                 username,
                 PrivateKeyWithHashAlg::new(
                     Arc::new(self.private_key.clone()),
-                    client.best_supported_rsa_hash().await.unwrap().flatten(),
+                    hash_alg,
                 ),
             )
             .await
